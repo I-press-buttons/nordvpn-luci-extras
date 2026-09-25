@@ -150,6 +150,10 @@ ok('clear_credentials removes the key', global.MOCK_UCI.network.nordvpn.private_
 	eq('delete_instance keeps the foreign peer', global.MOCK_UCI.network.wanpeer, wanpeer);
 }
 
+// clients: read-only picker source; always an array (empty off-device).
+ok('clients method present', type(m.clients.call) == 'function');
+ok('clients returns an array', type(m.clients.call().clients) == 'array');
+
 // instance lifecycle: create -> listed -> delete; main is protected
 ok('create_instance ok', m.create_instance.call({ args: { instance: 'extra' } }).ok == true);
 ok('create rejects duplicate', m.create_instance.call({ args: { instance: 'extra' } }).error != null);

@@ -18,6 +18,7 @@ const open_cmd = _common.open_cmd,
       FETCH_STATUS_FILE = _common.FETCH_STATUS_FILE,
       CACHE_LOCK_FILE = _common.CACHE_LOCK_FILE,
       relay_kind = _common.relay_kind,
+      clean_label = _common.clean_label,
       validate_hostname = _common.validate_hostname,
       validate_wg_key = _common.validate_wg_key,
       validate_country_code = _common.validate_country_code,
@@ -87,17 +88,6 @@ function read_fetch_status() {
 
 // ── Normalization ────────────────────────────────────────────────────
 
-// Display label from API data: drop markup and control characters, trim, cap
-// the length. The UI renders these as text anyway; this keeps a hostile or
-// garbled API response (or a tampered cache) inert in every other consumer.
-function clean_label(s, dflt) {
-	if (type(s) != 'string')
-		return dflt;
-	s = trim(replace(s, /[<>&"'`$\\[:cntrl:]]/g, ''));
-	if (length(s) > 64)
-		s = substr(s, 0, 64);
-	return (s != '') ? s : dflt;
-}
 
 function new_accumulator() {
 	return {

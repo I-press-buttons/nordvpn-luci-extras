@@ -58,6 +58,7 @@ var callApplyStatus = rpc.declare({ object: 'nordvpn', method: 'apply_status' })
 var callRefreshLocations = rpc.declare({ object: 'nordvpn', method: 'refresh_locations' });
 var callRotateNow = rpc.declare({ object: 'nordvpn', method: 'rotate_now', params: [ 'instance' ] });
 var callExternalIp = rpc.declare({ object: 'nordvpn', method: 'external_ip', params: [ 'instance' ] });
+var callClients = rpc.declare({ object: 'nordvpn', method: 'clients' });
 var callDisconnect = rpc.declare({ object: 'nordvpn', method: 'disconnect', params: [ 'instance' ] });
 var callClearCredentials = rpc.declare({ object: 'nordvpn', method: 'clear_credentials', params: [ 'instance' ] });
 var callCreateInstance = rpc.declare({ object: 'nordvpn', method: 'create_instance', params: [ 'instance' ] });
@@ -131,6 +132,24 @@ var STYLE = '' +
 	'.nv-srv-trigger{max-width:100%;overflow:hidden;text-overflow:ellipsis;text-align:left}' +
 	'.nv-srv-x{border:0;background:transparent;cursor:pointer;font:inherit;font-weight:700;color:inherit;padding:0 .2em;margin-left:.3em}' +
 	'.nv-dot{display:inline-block;width:.7em;height:.7em;border-radius:50%;flex:none}' +
+	// Per-device steering picker: collapsed by default, scrollable list.
+	'details.nv-devices>summary{cursor:pointer;padding:.2em 0}' +
+	'.nv-dev-tools{display:flex;flex-wrap:wrap;align-items:center;gap:.5em;margin:.45em 0}' +
+	'.nv-dev-tools .nv-dev-search{flex:1 1 14em;min-width:10em;width:auto}' +
+	'.nv-dev-list{max-height:22em;overflow-y:auto;border:1px solid var(--border-color-medium,#ccc);border-radius:.3em}' +
+	'.nv-dev-row{display:flex;align-items:center;gap:.6em;padding:.38em .6em;cursor:pointer;border-bottom:1px solid var(--border-color-low,rgba(0,0,0,.08))}' +
+	'.nv-dev-row:last-child{border-bottom:none}' +
+	'.nv-dev-row:hover{background:rgba(0,105,214,.08)}' +
+	'.nv-dev-row:focus-visible{outline:2px solid rgba(0,105,214,.6);outline-offset:-2px}' +
+	'.nv-dev-row.nv-dev-on{background:rgba(45,143,78,.16);box-shadow:inset 3px 0 0 #2d8f4e}' +
+	'.nv-dev-row.nv-dev-locked{opacity:.5;cursor:not-allowed}' +
+	'.nv-dev-row .box{font-weight:700;width:1.15em;text-align:center;flex:none}' +
+	'.nv-dev-info{display:flex;flex-wrap:wrap;gap:.1em .8em;min-width:0;flex:1}' +
+	'.nv-dev-name{font-weight:600}' +
+	'.nv-dev-meta{color:var(--text-color-medium,#666);font-size:.9em;overflow-wrap:anywhere}' +
+	'.nv-dev-online{background:#3c8c3c}' +
+	'.nv-dev-offline{background:var(--border-color-medium,#bbb)}' +
+	'.nv-dev-empty{padding:.6em;color:var(--text-color-medium,#666)}' +
 	'.nv-dot-lo{background:#3c8c3c}' +
 	'.nv-dot-mid{background:#c79100}' +
 	'.nv-dot-hi{background:#c0392b}' +
@@ -827,6 +846,8 @@ return view.extend({
 		this.autoRouting = null;
 		this.steerBoxes = {};
 		this.steerRow = null;
+		this.devRow = null;
+		this.devList = null;
 
 		// Read-only context: the interface and table this instance uses, so the
 		// firewall/routing wiring is visible right here — not only in Advanced.
@@ -893,6 +914,8 @@ return view.extend({
 				_('Or route only these networks through this instance — policy rules send their traffic into its routing table.'));
 			if (nets.length)
 				body.appendChild(this.steerRow);
+			this.devRow = this.buildDevicePicker();
+			body.appendChild(this.devRow);
 			this.ksRow = this.row(_('Kill switch'), [
 				E('label', { class: 'nv-check' }, [ this.ksBox, _('Block LAN internet access while the VPN is down') ])
 			]);
@@ -914,6 +937,231 @@ return view.extend({
 		]);
 	},
 
+	/* ---- per-device steering picker ------------------------------------ */
+
+	// 'AA-BB-CC-DD-EE-FF' / 'aabbccddeeff' / 'aa:bb:…' -> 'aa:bb:cc:dd:ee:ff',
+	// the form the backend stores; null when it is not a MAC.
+	normMac: function(s) {
+		var hex = String(s || '').toLowerCase().replace(/[:.-]/g, '');
+		if (!/^[0-9a-f]{12}$/.test(hex))
+			return null;
+		return hex.match(/../g).join(':');
+	},
+
+	// MAC -> name of another *enabled* instance already steering it. The
+	// backend gives a device to one tunnel only, so those rows are locked.
+	deviceOwners: function() {
+		var owners = {}, self = this;
+		uci.sections('nordvpn').forEach(function(sec) {
+			var name = sec['.name'];
+			if (name === self.instance || name === 'globals' || sec.enabled !== '1')
+				return;
+			var l = sec.source_device;
+			(Array.isArray(l) ? l : (l ? [ l ] : [])).forEach(function(m) {
+				m = self.normMac(m);
+				if (m && !owners[m])
+					owners[m] = name;
+			});
+		});
+		return owners;
+	},
+
+	buildDevicePicker: function() {
+		this.devSel = {};
+		var cur = uci.get('nordvpn', this.instance, 'source_device');
+		(Array.isArray(cur) ? cur : (cur ? [ cur ] : [])).forEach(L.bind(function(m) {
+			m = this.normMac(m);
+			if (m)
+				this.devSel[m] = true;
+		}, this));
+		this.devOwners = this.deviceOwners();
+
+		this.devSummary = E('summary', {});
+		this.devSearch = E('input', { type: 'search', class: 'cbi-input-text nv-dev-search',
+			placeholder: _('Search name, MAC or IP'), 'aria-label': _('Search devices'),
+			input: L.bind(this.renderDevices, this) });
+		this.devOnlySel = E('input', { type: 'checkbox', change: L.bind(this.renderDevices, this) });
+		this.devStatus = E('span', { class: 'nv-inline-note' });
+		this.devList = E('div', { class: 'nv-dev-list', role: 'listbox', 'aria-multiselectable': 'true' });
+		var refresh = E('button', { type: 'button', class: 'cbi-button', title: _('Reload the client list'),
+			click: L.bind(function(ev) { ev.preventDefault(); this.loadDevices(true); }, this) }, '↻');
+
+		this.devDetails = E('details', { class: 'nv-devices', toggle: L.bind(function() {
+			this._devOpen = this.devDetails.open;
+			if (this.devDetails.open)
+				this.loadDevices(false);
+		}, this) }, [
+			this.devSummary,
+			E('div', { class: 'nv-dev-tools' }, [
+				this.devSearch,
+				E('label', { class: 'nv-check' }, [ this.devOnlySel, _('Selected only') ]),
+				refresh,
+				this.devStatus
+			]),
+			this.devList
+		]);
+		// Keep the section open across form rebuilds (save, discard).
+		if (this._devOpen)
+			this.devDetails.open = true;
+		this.updateDevSummary();
+
+		return this.row(_('Steered devices'), [ this.devDetails ],
+			_('Or route individual devices through this instance, matched by MAC address so a new DHCP lease keeps them on the tunnel. A device choice takes precedence over its network.'));
+	},
+
+	// Fetch the client list once per page (↻ forces a reload).
+	loadDevices: function(force) {
+		if (this.clients && !force)
+			return this.renderDevices();
+		dom.content(this.devStatus, [ _('Loading…') ]);
+		return callClients().then(L.bind(function(res) {
+			this.clients = (res && Array.isArray(res.clients)) ? res.clients : [];
+			this.renderDevices();
+		}, this)).catch(L.bind(function(e) {
+			this.clients = null;
+			dom.content(this.devStatus, [ _('Could not load clients: %s').format(e) ]);
+		}, this));
+	},
+
+	steeredDevices: function() {
+		return Object.keys(this.devSel || {}).sort();
+	},
+
+	updateDevSummary: function() {
+		var n = this.steeredDevices().length;
+		dom.content(this.devSummary, [ n
+			? _('%d device(s) selected').format(n)
+			: _('No devices selected') ]);
+	},
+
+	// Case-insensitive match on name and IP; MACs match with or without
+	// separators ('AABB', 'aa:bb', 'aa-bb' all hit aa:bb:…).
+	deviceMatches: function(c, q) {
+		if (!q)
+			return true;
+		if ((c.name || '').toLowerCase().indexOf(q) >= 0)
+			return true;
+		if ((c.ips || []).some(function(ip) { return ip.toLowerCase().indexOf(q) >= 0; }))
+			return true;
+		if (c.mac.indexOf(q) >= 0)
+			return true;
+		var hex = q.replace(/[:.-]/g, '');
+		return /^[0-9a-f]+$/.test(hex) && c.mac.replace(/:/g, '').indexOf(hex) >= 0;
+	},
+
+	renderDevices: function() {
+		if (!this.devList)
+			return;
+		var q = (this.devSearch.value || '').trim().toLowerCase();
+		var onlySel = this.devOnlySel.checked;
+		var sel = this.devSel, owners = this.devOwners;
+
+		// Known clients plus selected MACs not currently seen, so a device that
+		// is offline (or gone) can still be deselected.
+		var rows = [], known = {};
+		(this.clients || []).forEach(function(c) {
+			known[c.mac] = true;
+			rows.push(c);
+		});
+		Object.keys(sel).forEach(function(m) {
+			if (!known[m])
+				rows.push({ mac: m, name: null, ips: [], network: null, online: false, notSeen: true });
+		});
+
+		var total = rows.length;
+		rows = rows.filter(L.bind(function(c) {
+			return (!onlySel || sel[c.mac]) && this.deviceMatches(c, q);
+		}, this));
+		rows.sort(function(a, b) {
+			if (!!sel[a.mac] !== !!sel[b.mac]) return sel[a.mac] ? -1 : 1;
+			if (!!a.online !== !!b.online) return a.online ? -1 : 1;
+			return (a.name || '\uffff' + a.mac).localeCompare(b.name || '\uffff' + b.mac, undefined,
+				{ numeric: true, sensitivity: 'base' });
+		});
+
+		var nodes = rows.map(L.bind(this.deviceRow, this));
+		// A typed MAC that is not in the list can be added by hand.
+		var typed = this.normMac(q);
+		if (typed && !known[typed] && !sel[typed])
+			nodes.push(E('div', { class: 'nv-dev-row', role: 'option', tabindex: '0',
+				click: L.bind(this.addTypedDevice, this, typed),
+				keydown: L.bind(function(ev) {
+					if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); this.addTypedDevice(typed); }
+				}, this) }, [
+				E('span', { class: 'box' }, '+'),
+				E('span', { class: 'nv-dev-name' }, _('Add %s').format(typed))
+			]));
+		if (!nodes.length)
+			nodes.push(E('div', { class: 'nv-dev-empty' }, this.clients
+				? _('No devices match.') : _('Client list not loaded.')));
+		dom.content(this.devList, nodes);
+		dom.content(this.devStatus, [ this.clients
+			? _('%d of %d shown').format(rows.length, total) : '' ]);
+	},
+
+	deviceRow: function(c) {
+		var on = !!this.devSel[c.mac];
+		var owner = this.devOwners[c.mac];
+		var locked = !!owner && !on;
+		var meta = [ c.mac ];
+		if ((c.ips || []).length)
+			meta.push(c.ips.join(', '));
+		if (c.network)
+			meta.push(c.network);
+		if (c.notSeen)
+			meta.push(_('not seen'));
+		if (owner)
+			meta.push(_('in %s').format(owner));
+		var row = E('div', {
+			class: 'nv-dev-row' + (on ? ' nv-dev-on' : '') + (locked ? ' nv-dev-locked' : ''),
+			role: 'option', 'aria-selected': on ? 'true' : 'false',
+			'aria-disabled': locked ? 'true' : null,
+			tabindex: locked ? null : '0',
+			title: locked ? _('Already routed through instance %s').format(owner) : null
+		}, [
+			E('span', { class: 'box' }, on ? '☑' : '☐'),
+			E('span', { class: 'nv-dot ' + (c.online ? 'nv-dev-online' : 'nv-dev-offline'),
+				title: c.online ? _('Online') : _('Offline') }),
+			E('span', { class: 'nv-dev-info' }, [
+				E('span', { class: 'nv-dev-name' }, c.name || _('(unnamed)')),
+				E('span', { class: 'nv-dev-meta' }, meta.join(' · '))
+			])
+		]);
+		if (!locked) {
+			row.addEventListener('click', L.bind(this.toggleDevice, this, c.mac, row));
+			row.addEventListener('keydown', L.bind(function(ev) {
+				if (ev.key === 'Enter' || ev.key === ' ') {
+					ev.preventDefault();
+					this.toggleDevice(c.mac, row);
+				}
+			}, this));
+		}
+		return row;
+	},
+
+	// Toggle in place (no re-sort), so the list does not jump under the
+	// pointer while working through it; the next search/open re-sorts.
+	toggleDevice: function(mac, row) {
+		if (this.devSel[mac])
+			delete this.devSel[mac];
+		else
+			this.devSel[mac] = true;
+		var on = !!this.devSel[mac];
+		row.classList.toggle('nv-dev-on', on);
+		row.setAttribute('aria-selected', on ? 'true' : 'false');
+		dom.content(row.firstChild, [ on ? '☑' : '☐' ]);
+		this.updateDevSummary();
+		this.onRoutingToggle();
+	},
+
+	addTypedDevice: function(mac) {
+		this.devSel[mac] = true;
+		this.devSearch.value = '';
+		this.updateDevSummary();
+		this.onRoutingToggle();
+		this.renderDevices();
+	},
+
 	steeredNetworks: function() {
 		var out = [];
 		for (var k in (this.steerBoxes || {}))
@@ -926,8 +1174,9 @@ return view.extend({
 		if (init !== true)
 			this.markDirty();
 		var auto = this.autoRouting && this.autoRouting.checked;
-		var on = auto || this.steeredNetworks().length > 0;
+		var on = auto || this.steeredNetworks().length > 0 || this.steeredDevices().length > 0;
 		if (this.steerRow) this.steerRow.classList.toggle('hidden', !!auto);
+		if (this.devRow) this.devRow.classList.toggle('hidden', !!auto);
 		if (this.ksRow) this.ksRow.classList.toggle('hidden', !on);
 		if (this.v6Row) this.v6Row.classList.toggle('hidden', !on);
 		if (this.dnsRow) this.dnsRow.classList.toggle('hidden', !on);
@@ -1827,14 +2076,22 @@ return view.extend({
 		if (this.autoRouting) {
 			var autoOn = this.autoRouting.checked;
 			var steered = autoOn ? [] : this.steeredNetworks();
+			var devices = autoOn ? [] : this.steeredDevices();
 			uci.set('nordvpn', inst, 'auto_routing', autoOn ? '1' : '0');
 			uci.set('nordvpn', inst, 'killswitch', (this.ksBox && this.ksBox.checked) ? '1' : '0');
 			uci.set('nordvpn', inst, 'block_ipv6', (this.v6Box && this.v6Box.checked) ? '1' : '0');
 			uci.set('nordvpn', inst, 'vpn_dns', (this.dnsSel && this.dnsSel.value) || 'off');
 			// Drop the legacy boolean so it cannot contradict the enum.
 			uci.unset('nordvpn', inst, 'use_vpn_dns');
-			if (steered.length) {
+			if (devices.length)
+				uci.set('nordvpn', inst, 'source_device', devices);
+			else
+				uci.unset('nordvpn', inst, 'source_device');
+			if (steered.length)
 				uci.set('nordvpn', inst, 'source_network', steered);
+			else
+				uci.unset('nordvpn', inst, 'source_network');
+			if (steered.length || devices.length) {
 				// Steering needs a routing table; default to the interface name.
 				var rtb = this.refs.routing_table ? (this.refs.routing_table.value || '').trim()
 					: (uci.get('nordvpn', inst, 'routing_table') || '');
@@ -1845,8 +2102,6 @@ return view.extend({
 					if (this.refs.routing_table)
 						this.refs.routing_table.value = ifn;
 				}
-			} else {
-				uci.unset('nordvpn', inst, 'source_network');
 			}
 		}
 

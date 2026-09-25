@@ -28,6 +28,7 @@ const rotate = _rotate.rotate,
       read_state = _rotate.read_state,
       last_attempt_ts = _rotate.last_attempt_ts;
 const next_rotation = require('nordvpn.service').next_rotation;
+const list_clients = require('nordvpn.clients').clients;
 const detect_routing = require('nordvpn.routing').detect;
 const _cache = require('nordvpn.cache');
 const read_cache = _cache.read_cache,
@@ -126,6 +127,14 @@ methods.servers = {
 			return { relays: pool_relays(cache, set, a.hop_mode) };
 		}
 		return { relays: city_relays(cache, a.country, a.city, a.hop_mode) };
+	}
+};
+
+// Known LAN clients (DHCP leases, static hosts, neighbour table) for the
+// per-device steering picker. Read-only; MACs/IPs validated, names sanitized.
+methods.clients = {
+	call: function() {
+		return { clients: list_clients(cursor()) };
 	}
 };
 

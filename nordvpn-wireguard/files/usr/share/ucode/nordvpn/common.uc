@@ -187,6 +187,35 @@ function validate_instance(n) {
 	return full_match(n, /^[A-Za-z0-9_]+$/) ? n : null;
 }
 
+// Client MAC address: 'aa:bb:cc:dd:ee:ff', '-' separators, or 12 bare hex
+// digits. Normalized to lowercase colon form, the form stored in UCI.
+function validate_mac(m) {
+	if (type(m) != 'string')
+		return null;
+	m = lc(m);
+	if (full_match(m, /^[0-9a-f]{12}$/)) {
+		let parts = [];
+		for (let i = 0; i < 12; i += 2)
+			push(parts, substr(m, i, 2));
+		return join(':', parts);
+	}
+	if (!full_match(m, /^[0-9a-f]{2}([:-][0-9a-f]{2}){5}$/))
+		return null;
+	return replace(m, /-/g, ':');
+}
+
+// Display label from untrusted data (API names, DHCP hostnames): drop markup
+// and control characters, trim, cap the length. The UI renders these as text
+// anyway; this keeps a hostile value inert in every other consumer.
+function clean_label(s, dflt) {
+	if (type(s) != 'string')
+		return dflt;
+	s = trim(replace(s, /[<>&"'`$\\[:cntrl:]]/g, ''));
+	if (length(s) > 64)
+		s = substr(s, 0, 64);
+	return (s != '') ? s : dflt;
+}
+
 // Empty (main table) or a table name/number. The name is also written into
 // /etc/iproute2/rt_tables, so keep it strict. The kernel's reserved 'local'
 // (255) and unspec (0) tables are refused: routing the tunnel's default into
@@ -310,6 +339,15 @@ function load_settings(uci, instance) {
 		push(source_networks, sn);
 	}
 
+	// `list source_device` — client MACs steered through this instance.
+	let sd = uci.get('nordvpn', name, 'source_device');
+	let source_devices = [];
+	for (let x in ((type(sd) == 'array') ? sd : (sd != null ? [ sd ] : []))) {
+		let mac = validate_mac(x);
+		if (mac && index(source_devices, mac) < 0)
+			push(source_devices, mac);
+	}
+
 	// `list locations` — the instance's location set: countries ('de') and/or
 	// cities ('de-berlin') that both the initial connect and the rotation pick
 	// from. Empty = the legacy country_code/city_code selection. A city code
@@ -337,6 +375,7 @@ function load_settings(uci, instance) {
 	return {
 		name: name,
 		source_networks: source_networks,
+		source_devices: source_devices,
 		locations: locations,
 		enabled: g('enabled', '0') == '1',
 		interface: validate_interface(g('interface', DEFAULT_INTERFACE)) || DEFAULT_INTERFACE,
@@ -513,6 +552,7 @@ return {
 	full_match, bounded_int, validate_interface, validate_token, validate_wg_key, validate_hostname,
 	validate_port, validate_hop_mode, validate_dns_mode, relay_kind, validate_rotation_mode, validate_interval, validate_time,
 	validate_country_code, validate_location_code, validate_instance, validate_routing_table, validate_dir,
+	validate_mac, clean_label,
 	managed_interface, load_settings, list_instances, globals_section, cache_file_path, iso_ts, redact, log,
 	atomic_write, acquire_lock, release_lock, sh_quote, open_cmd, run
 };

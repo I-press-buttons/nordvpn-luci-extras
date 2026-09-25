@@ -626,6 +626,7 @@ function delete_instance(uci, name) {
 	s.vpn_dns = 'off';
 	s.use_vpn_dns = false;
 	s.source_networks = [];
+	s.source_devices = [];
 	let routing = enforce_routing(uci, s);
 	if (routing.changed_firewall) {
 		uci.commit('firewall');

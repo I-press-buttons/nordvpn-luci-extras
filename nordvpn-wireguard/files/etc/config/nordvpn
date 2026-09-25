@@ -32,6 +32,10 @@ config instance 'main'
 	# country_code/city_code selection above is used.
 	# list locations 'de'
 	# list locations 'nl-amsterdam'
+	# Steering (instead of auto_routing): route only these networks and/or
+	# devices (by MAC) through this instance's routing table.
+	# list source_network 'media'
+	# list source_device 'aa:bb:cc:dd:ee:ff'
 	# Seconds to wait for a WireGuard handshake when verifying a server, and
 	# how many candidate servers a rotation may try before giving up.
 	option verify_timeout '8'
