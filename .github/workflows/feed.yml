@@ -4,9 +4,11 @@ name: Package feed
 # publishes them to GitHub Pages. Private keys live in repository secrets;
 # the matching public keys are committed under keys/.
 
+# DISABLED in this fork: it needs the upstream author's self-hosted runner and
+# signing-key secrets. Packages are installed from build.yml's artifacts
+# instead. To re-enable, restore the tag trigger, point runs-on at
+# ubuntu-latest, add your own keys, and drop the `if: false` below.
 on:
-  push:
-    tags: ["v*"]
   workflow_dispatch:
 
 jobs:
@@ -15,6 +17,7 @@ jobs:
     # Tag/dispatch only (no untrusted PRs) — build on the self-hosted NAS runner
     # to skip the GitHub queue. The SDK stays in the (clean-checked-out)
     # workspace, not the persistent cache, so the signing keys never linger.
+    if: false
     runs-on: [self-hosted, nordvpn-build]
     strategy:
       matrix:
