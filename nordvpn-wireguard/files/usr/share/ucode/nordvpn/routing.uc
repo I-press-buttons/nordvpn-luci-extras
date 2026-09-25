@@ -13,6 +13,7 @@ import { readfile } from 'fs';
 const _common = require('nordvpn.common');
 const run = _common.run,
       atomic_write = _common.atomic_write;
+const _clients = require('nordvpn.clients');
 
 const MARK = 'nordvpn_managed';
 const ROLE = 'nordvpn_role';
@@ -135,6 +136,9 @@ function find_managed(uci, sectype, role, iface) {
 // therefore maintains stamped bypass routes for every local IPv4 subnet.
 
 function ip4_to_int(a) {
+	// No newline: ucode's anchors are per-line (see common.full_match).
+	if (type(a) != 'string' || index(a, '\n') >= 0)
+		return null;
 	let m = match(a, /^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$/);
 	if (!m)
 		return null;
@@ -366,7 +370,7 @@ function reconcile_local_routes(uci, iface, table, desired) {
 // the instance's table with a stamped line (best effort). Numeric tables and
 // already-registered names need nothing.
 function ensure_rt_table(name) {
-	if (match(name, /^[0-9]+$/))
+	if (_common.full_match(name, /^[0-9]+$/))
 		return true;
 	let data = readfile(RT_TABLES) || '';
 	let used = {};
@@ -388,9 +392,50 @@ function ensure_rt_table(name) {
 	return false;
 }
 
+// Numeric id of a routing table (a number, a builtin name, or a name
+// registered in rt_tables), or null when it cannot be resolved.
+function rt_table_id(name) {
+	if (_common.full_match(name, /^[0-9]+$/))
+		return int(name);
+	let builtin = { main: 254, 'default': 253 };
+	if (builtin[name])
+		return builtin[name];
+	for (let line in split(readfile(RT_TABLES) || '', '\n')) {
+		let m = match(line, /^[ \t]*([0-9]+)[ \t]+([^ \t#]+)/);
+		if (m && m[2] == name)
+			return int(m[1]);
+	}
+	return null;
+}
+
+// Firewall mark ('value/mask') carrying an instance's steered-device packets:
+// the table id in the top byte. mwan3 (0x3f00) and pbr (0x00ff0000) use other
+// bits. Null when the id does not fit in one byte.
+const DEVICE_MARK_MASK = 0xff000000;
+function device_mark(table_id) {
+	if (type(table_id) != 'int' || table_id < 1 || table_id > 255)
+		return null;
+	return sprintf('0x%x/0x%x', table_id << 24, DEVICE_MARK_MASK);
+}
+
+// MAC -> owning instance. A device belongs to at most one tunnel: the first
+// enabled instance (list_instances order, 'main' first) that lists it.
+function device_owners(uci) {
+	let owners = {};
+	for (let n in _common.list_instances(uci)) {
+		let st = _common.load_settings(uci, n);
+		if (!st.enabled)
+			continue;
+		for (let mac in st.source_devices)
+			if (!owners[mac])
+				owners[mac] = n;
+	}
+	return owners;
+}
+
 // Remove ONLY a stamped rt_tables line for `name`; user entries are kept.
 function drop_rt_table(name) {
-	if (name == null || name == '' || match(name, /^[0-9]+$/))
+	if (name == null || name == '' || _common.full_match(name, /^[0-9]+$/))
 		return;
 	let data = readfile(RT_TABLES);
 	if (!data || index(data, MARK) < 0)
@@ -487,25 +532,29 @@ function available_networks(uci) {
 	return out;
 }
 
-// Stamped netifd rule sections (rule/rule6) of one instance and role.
-function find_managed_rules(uci, sectype, role, iface) {
+// Stamped sections of one instance and role in `config` ('network' rule/rule6
+// or 'firewall' rule). `key` names the option that identifies each one
+// (default 'in', the source network), returned as `net`.
+function find_managed_rules(uci, sectype, role, iface, key, config) {
 	let out = [];
-	uci.foreach('network', sectype, function(sec) {
+	uci.foreach(config || 'network', sectype, function(sec) {
 		if (sec[MARK] == '1' && sec[ROLE] == role && sec.nordvpn_iface == iface)
-			push(out, { section: sec['.name'], net: sec['in'] });
+			push(out, { section: sec['.name'], net: sec[key || 'in'] });
 	});
 	return out;
 }
 
-// Reconcile stamped netifd rules with the desired source-network list:
-// delete stamped rules for nets no longer wanted, create missing ones.
-// `mkopts(net)` returns the option map for a new rule. Returns true on change.
-function reconcile_rules(uci, sectype, role, iface, want_nets, mkopts) {
+// Reconcile stamped rules with the desired list of keys (source networks by
+// default; `key`/`config` as for find_managed_rules): delete stamped rules
+// whose key is no longer wanted, create missing ones. `mkopts(k)` returns the
+// option map for a new rule. Returns true on change.
+function reconcile_rules(uci, sectype, role, iface, want_nets, mkopts, key, config) {
+	config = config || 'network';
 	let changed = false;
-	let have = find_managed_rules(uci, sectype, role, iface);
+	let have = find_managed_rules(uci, sectype, role, iface, key, config);
 	for (let r in have) {
 		if (index(want_nets, r.net) < 0) {
-			uci.delete('network', r.section);
+			uci.delete(config, r.section);
 			changed = true;
 		}
 	}
@@ -515,13 +564,13 @@ function reconcile_rules(uci, sectype, role, iface, want_nets, mkopts) {
 			if (r.net == net)
 				present = true;
 		if (!present) {
-			let sec = uci.add('network', sectype);
+			let sec = uci.add(config, sectype);
 			let opts = mkopts(net);
 			for (let k in opts)
-				uci.set('network', sec, k, opts[k]);
-			uci.set('network', sec, MARK, '1');
-			uci.set('network', sec, ROLE, role);
-			uci.set('network', sec, 'nordvpn_iface', iface);
+				uci.set(config, sec, k, opts[k]);
+			uci.set(config, sec, MARK, '1');
+			uci.set(config, sec, ROLE, role);
+			uci.set(config, sec, 'nordvpn_iface', iface);
 			changed = true;
 		}
 	}
@@ -561,6 +610,24 @@ function reconcile_forwardings(uci, iface, dest_zone, want_srcs) {
 	return changed;
 }
 
+// Firewall zones of the networks the given MACs are currently seen on (the
+// neighbour table mapped through netifd). Empty off-device.
+function device_zones(uci, macs) {
+	let out = [];
+	let r = run([ 'ip', 'neigh', 'show' ]);
+	if (r.code != 0)
+		return out;
+	let dev2net = _clients.device_networks();
+	for (let n in _clients.parse_neigh(r.stdout)) {
+		if (index(macs, n.mac) < 0 || !dev2net[n.dev])
+			continue;
+		let z = find_zone_of(uci, dev2net[n.dev]);
+		if (z && !z.managed && index(out, z.name) < 0)
+			push(out, z.name);
+	}
+	return out;
+}
+
 // ── Detection (read-only) ────────────────────────────────────────────
 
 // Classify the routing situation for the UI and for enforce(). `runtime`
@@ -574,7 +641,7 @@ function detect(uci, s, runtime) {
 	let iface = s.interface;
 	let zone = find_zone_of(uci, iface);
 	let peer = find_peer(uci, iface);
-	let steering = length(s.source_networks || []) > 0;
+	let steering = length(s.source_networks || []) > 0 || length(s.source_devices || []) > 0;
 	// With steering active, extra user routes INSIDE the instance's table are
 	// legitimate companions (e.g. a media→LAN route); only routes referencing
 	// the interface itself signal a hand-built scheme. Without steering, a
@@ -594,6 +661,7 @@ function detect(uci, s, runtime) {
 		zone_managed: zone ? zone.managed : false,
 		user_routes: user_routes,
 		source_networks: s.source_networks || [],
+		source_devices: s.source_devices || [],
 		route_allowed_ips: peer ? (uci.get('network', peer, 'route_allowed_ips') == '1') : false,
 		killswitch: find_managed(uci, 'rule', 'killswitch') != null ||
 			length(find_managed_rules(uci, 'rule', 'steer_ks', iface)) > 0,
@@ -681,6 +749,57 @@ function enforce(uci, s) {
 	}))
 		cn = true;
 
+	// 1b'. Device steering: fw4 marks each selected MAC's packets (mangle
+	//      prerouting) and one mark rule per family sends them into the table,
+	//      with the same prohibit rules as networks. Priority 19000 sits above
+	//      the network lookups, so a device choice beats a network choice. A
+	//      MAC already owned by another instance is left to that instance.
+	let steer_devs = [];
+	let mark = null;
+	if (steer && length(s.source_devices || []) > 0) {
+		let owners = device_owners(uci);
+		for (let mac in s.source_devices) {
+			if (owners[mac] && s.name && owners[mac] != s.name)
+				push(notes, 'device ' + mac + ' is already steered by instance ' + owners[mac]);
+			else
+				push(steer_devs, mac);
+		}
+		mark = device_mark(rt_table_id(table));
+		if (!mark && length(steer_devs)) {
+			push(notes, 'device steering needs a routing table with an id of 1-255; ' + table + ' has none');
+			steer_devs = [];
+		}
+	}
+	let marks = (mark && length(steer_devs)) ? [ mark ] : [];
+	if (reconcile_rules(uci, 'rule', 'device_mark', iface, steer_devs, function(mac) {
+		return { name: 'NordVPN device ' + mac, src: '*', src_mac: mac, proto: 'all',
+			target: 'MARK', set_xmark: mark };
+	}, 'src_mac', 'firewall'))
+		cf = true;
+	// A table change moves the mark: rewrite MARK rules carrying a stale one.
+	if (length(marks))
+		uci.foreach('firewall', 'rule', function(sec) {
+			if (sec[MARK] == '1' && sec[ROLE] == 'device_mark' && sec.nordvpn_iface == iface &&
+			    sec.set_xmark != mark) {
+				uci.set('firewall', sec['.name'], 'set_xmark', mark);
+				cf = true;
+			}
+		});
+	// IPv4 only, like the network lookups: the tunnel carries no IPv6, which
+	// the dev_v6 prohibit below blocks instead when block_ipv6 is on.
+	if (reconcile_rules(uci, 'rule', 'dev_lookup', iface, marks, function(m) {
+		return { mark: m, lookup: table, priority: '19000' };
+	}, 'mark'))
+		cn = true;
+	if (reconcile_rules(uci, 'rule', 'dev_ks', iface, s.killswitch ? marks : [], function(m) {
+		return { mark: m, action: 'prohibit', priority: '21000' };
+	}, 'mark'))
+		cn = true;
+	if (reconcile_rules(uci, 'rule6', 'dev_v6', iface, s.block_ipv6 ? marks : [], function(m) {
+		return { mark: m, action: 'prohibit', priority: '21000' };
+	}, 'mark'))
+		cn = true;
+
 	// 1c. Bypass routes for local subnets, so the steered default does not
 	//     swallow LAN↔VLAN or LAN↔local-tunnel traffic. The nordvpn instances'
 	//     own interfaces are excluded (they share the fixed NordLynx range).
@@ -739,6 +858,16 @@ function enforce(uci, s) {
 						push(notes, 'network ' + net + ' is in no firewall zone; add a forwarding to the VPN zone manually');
 					else if (index(want_srcs, z.name) < 0)
 						push(want_srcs, z.name);
+				}
+				// Steered devices: the zones of the networks they were last
+				// seen on, and the LAN zone for devices currently offline.
+				if (length(steer_devs)) {
+					let seen = device_zones(uci, steer_devs);
+					if (det.lan_zone)
+						push(seen, det.lan_zone);
+					for (let zn in seen)
+						if (index(want_srcs, zn) < 0)
+							push(want_srcs, zn);
 				}
 			}
 			let filtered = [];
@@ -832,4 +961,5 @@ function enforce(uci, s) {
 	return { changed_network: cn, changed_firewall: cf, notes: notes };
 }
 
-return { detect, enforce, find_wan_zone, find_lan_zone, count_user_routes, recommend_mtu };
+return { detect, enforce, find_wan_zone, find_lan_zone, count_user_routes, recommend_mtu,
+	rt_table_id, device_mark, device_owners };

@@ -151,6 +151,8 @@ function rotate_inner(uci, instance) {
 		return { skipped: true, reason: 'fixed server configured' };
 
 	let iface = s.interface;
+	if (!_common.managed_interface(uci, iface))
+		return { error: 'interface ' + iface + ' is not managed by nordvpn' };
 	let cache = read_cache(cache_file_path(s));
 	if (!cache)
 		return { error: 'server list not available; refresh the cache first' };

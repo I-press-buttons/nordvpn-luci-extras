@@ -115,7 +115,8 @@ ok('rotate_now skipped with fixed server', m.rotate_now.call().skipped == true);
 global.MOCK_UCI = { nordvpn: { main: { '.type': 'settings', interface: 'nordvpn', enabled: '1',
 	routing_table: 'nvx', source_network: 'lan', cache_dir: cdir } },
 	network: {
-		nordvpn: { '.type': 'interface', private_key: KEY, auto: '1', nordvpn_managed_routing: '1' },
+		nordvpn: { '.type': 'interface', private_key: KEY, auto: '1', nordvpn_managed_routing: '1',
+			vpn_type: 'nordvpn' },
 		steerrule: { '.type': 'rule', 'in': 'lan', lookup: 'nvx',
 			nordvpn_managed: '1', nordvpn_role: 'steer_lookup', nordvpn_iface: 'nordvpn' }
 	}, firewall: {} };
@@ -125,6 +126,33 @@ eq('disconnect keeps the interface down', global.MOCK_UCI.network.nordvpn.auto, 
 ok('disconnect releases steering rules', global.MOCK_UCI.network.steerrule == null);
 ok('clear_credentials ok', m.clear_credentials.call({}).ok == true);
 ok('clear_credentials removes the key', global.MOCK_UCI.network.nordvpn.private_key == null);
+
+// The `interface` option is user-writable (LuCI ACL on the nordvpn config), so
+// no write method may touch a network interface the app does not own.
+{
+	let wan = { '.type': 'interface', proto: 'dhcp', device: 'eth1', auto: '1' };
+	let wanpeer = { '.type': 'wireguard_wan', interface: 'wan', public_key: 'x' };
+	global.MOCK_UCI = { nordvpn: { main: { '.type': 'instance', interface: 'wan', enabled: '1',
+		cache_dir: cdir } }, network: { wan: { ...wan }, wanpeer: { ...wanpeer } }, firewall: {} };
+	ok('set_credentials refuses a foreign interface',
+		index(m.set_credentials.call({ args: { token: sprintf('%064d', 1) } }).error || '', 'not managed') >= 0);
+	ok('apply refuses a foreign interface', index(m.apply.call().error || '', 'not managed') >= 0);
+	ok('rotate_now refuses a foreign interface', index(m.rotate_now.call().error || '', 'not managed') >= 0);
+	ok('disconnect refuses a foreign interface', index(m.disconnect.call({}).error || '', 'not managed') >= 0);
+	ok('clear_credentials refuses a foreign interface', index(m.clear_credentials.call({}).error || '', 'not managed') >= 0);
+	eq('foreign interface left untouched', global.MOCK_UCI.network.wan, wan);
+	eq('foreign enabled flag untouched', global.MOCK_UCI.nordvpn.main.enabled, '1');
+
+	global.MOCK_UCI.nordvpn.extra2 = { '.type': 'instance', interface: 'wan' };
+	ok('delete_instance still removes the section', m.delete_instance.call({ args: { instance: 'extra2' } }).ok == true);
+	ok('instance section gone', global.MOCK_UCI.nordvpn.extra2 == null);
+	eq('delete_instance keeps the foreign interface', global.MOCK_UCI.network.wan, wan);
+	eq('delete_instance keeps the foreign peer', global.MOCK_UCI.network.wanpeer, wanpeer);
+}
+
+// clients: read-only picker source; always an array (empty off-device).
+ok('clients method present', type(m.clients.call) == 'function');
+ok('clients returns an array', type(m.clients.call().clients) == 'array');
 
 // instance lifecycle: create -> listed -> delete; main is protected
 ok('create_instance ok', m.create_instance.call({ args: { instance: 'extra' } }).ok == true);
