@@ -4,6 +4,8 @@
 // cache and triggers rotation on schedule, running each job in a short-lived
 // child (uloop.task) so a slow job never stalls the loop. Overlap is prevented
 // by the workers' own lock files. Timing decisions live in nordvpn.service.
+// Also runs the optional egress probe (a ping through each tunnel, in a child
+// as well) and the watchdog that recovers an unhealthy tunnel.
 
 'use strict';
 
@@ -28,12 +30,48 @@ const should_refresh = _service.should_refresh,
       should_rotate = _service.should_rotate,
       should_recover = _service.should_recover,
       watchdog_update = _service.watchdog_update,
-      watchdog_result_update = _service.watchdog_result_update;
-const status = require('nordvpn.status').status;
+      watchdog_result_update = _service.watchdog_result_update,
+      should_probe = _service.should_probe,
+      effective_state = _service.effective_state,
+      probe_update = _service.probe_update,
+      probe_clear = _service.probe_clear;
+const _status = require('nordvpn.status');
+const status = _status.status,
+      egress_probe = _status.egress_probe;
+const record_event = require('nordvpn.history').record_event;
 
 uloop.init();
 
 let last_cache = 0;
+// Instances with a probe child in flight: a slow probe (every target timing
+// out) must not pile up a second one behind it.
+let probing = {};
+
+// Ping through the tunnel in a child and fold the result into the persisted
+// probe fields when it returns. Only transitions reach the event history.
+function start_probe(inst, dev, gateway, targets) {
+	probing[inst] = true;
+	uloop.task(
+		function() { return egress_probe(dev, targets); },
+		function(result) {
+			delete probing[inst];
+			// A child that died without a result says nothing about the
+			// tunnel; do not count it as a failed probe.
+			if (type(result) != 'object')
+				return;
+			let u =probe_update(read_state(inst) || {}, result, gateway, time());
+			record(u.fields, inst);
+			if (u.event == 'egress_lost') {
+				log('egress probe: ' + inst + ' forwards no traffic through ' + gateway);
+				record_event(inst, 'egress_lost', { server: gateway,
+					detail: 'no reply from ' + join(', ', targets) });
+			} else if (u.event == 'egress_restored') {
+				log('egress probe: ' + inst + ' forwards traffic again');
+				record_event(inst, 'egress_restored', { server: gateway, detail: 'reply from ' + result.target });
+			}
+		}
+	);
+}
 
 function tick() {
 	// Fresh cursor each tick so committed config changes are picked up.
@@ -63,18 +101,26 @@ function tick() {
 			mark_attempt(now, inst);
 		} else if (should_rotate(s, last, now, hm)) {
 			mark_attempt(now, inst);
-			uloop.task(function() { rotate(null, inst); });
+			uloop.task(function() { rotate(null, inst, 'schedule'); });
 		}
 
 		// Watchdog timers persist in the per-instance rotate state across daemon
 		// restarts. Ineligible instances clear that state without a status probe,
-		// so enabling or unpinning always starts with a fresh grace window.
+		// so enabling or unpinning always starts with a fresh grace window. The
+		// egress probe is independent of the watchdog (it also feeds the status
+		// page), so a status read happens when either one is on.
 		let st = read_state(inst) || {};
 		let ds = (type(st.degraded_since) == 'int') ? st.degraded_since : 0;
 		let last_recover = (type(st.last_recover) == 'int') ? st.last_recover : 0;
 		let fails = (type(st.recover_fails) == 'int') ? st.recover_fails : 0;
 		let active = s.enabled && s.watchdog &&
 			!(s.fixed_server && s.fixed_server != '');
+		let probe_on = s.enabled && s.egress_probe;
+		if (!probe_on) {
+			let clr = probe_clear(st);
+			if (clr)
+				record(clr, inst);
+		}
 		if (!active) {
 			let upd = watchdog_update(null, {
 				degraded_since: ds,
@@ -84,10 +130,19 @@ function tick() {
 			if (upd.degraded_since != ds || upd.last_recover != last_recover ||
 			    upd.recover_fails != fails)
 				record(upd, inst);
-			continue;
+			if (!probe_on)
+				continue;
 		}
 
-		let state = status(uci, inst).state;
+		let cur = status(uci, inst);
+		if (should_probe(s, cur.state) && cur.device && cur.gateway && !probing[inst])
+			start_probe(inst, cur.device, cur.gateway, s.probe_targets);
+		if (!active)
+			continue;
+
+		// A tunnel whose handshake is fresh but whose probe keeps failing is
+		// 'no_egress' here, which the watchdog treats like a stale handshake.
+		let state = effective_state(s, cur.state, st, cur.gateway);
 		let upd = watchdog_update(state, {
 			degraded_since: ds,
 			last_recover: last_recover,
@@ -105,8 +160,10 @@ function tick() {
 			// double-fire. The worker result advances backoff only for a real
 			// failed recovery, not when another rotation owns the lock.
 			record({ last_recover: now }, inst);
+			record_event(inst, 'watchdog', { server: cur.gateway, reason: state,
+				detail: sprintf('unhealthy for %d s', now - ds) });
 			uloop.task(
-				function() { return rotate(null, inst); },
+				function() { return rotate(null, inst, 'watchdog'); },
 				function(result) {
 					let latest = read_state(inst) || {};
 					let current = (type(latest.recover_fails) == 'int')

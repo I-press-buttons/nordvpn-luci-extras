@@ -34,6 +34,8 @@ const _api = require('nordvpn.api');
 const get_private_key = _api.get_private_key;
 const _routing = require('nordvpn.routing');
 const enforce_routing = _routing.enforce;
+const _history = require('nordvpn.history');
+const record_event = _history.record_event;
 
 // Locate the managed peer section (type wireguard_<iface>, interface=<iface>).
 function find_peer(uci, iface) {
@@ -70,6 +72,7 @@ function set_credentials(uci, token, instance) {
 	uci.set('network', iface, 'addresses', [ FIXED_ADDRESS ]);
 	uci.delete('network', iface, 'nordvpn_token');
 	uci.commit('network');
+	record_event(instance, 'credentials_set');
 	return { ok: true };
 }
 
@@ -350,9 +353,22 @@ function apply_inner(uci, instance) {
 		error: 'could not reach any server for the current selection; restored the previous connection' };
 }
 
+// History entry for an apply outcome. Pure/testable.
+function apply_event(res) {
+	if (res && res.state == 'success')
+		return { type: 'connect', fields: { server: res.gateway } };
+	return { type: 'connect_failed', fields: {
+		server: res ? res.gateway : null,
+		error: (res && res.error) ? res.error : 'unknown error',
+		detail: (res && res.restored) ? 'restored the previous server' : null
+	} };
+}
+
 function apply(uci, instance) {
 	let res = apply_inner(uci, instance);
 	restore_wan_default();
+	let ev = apply_event(res);
+	record_event(instance, ev.type, ev.fields);
 	return res;
 }
 
@@ -552,6 +568,7 @@ function disconnect(uci, instance) {
 	}
 	run([ 'ifdown', iface ]);
 	restore_wan_default();
+	record_event(instance, 'disabled');
 	return { ok: true, interface: iface };
 }
 
@@ -574,6 +591,7 @@ function clear_credentials(uci, instance) {
 		uci.set('network', iface, 'auto', '0');
 	}
 	uci.commit('network');
+	record_event(instance, 'credentials_cleared');
 	return { ok: true, interface: iface };
 }
 
@@ -660,14 +678,16 @@ function delete_instance(uci, name) {
 		}
 		uci.commit('nordvpn');
 		restore_wan_default();
+		_history.clear_events(name);
 		return { ok: true, reset: name, interface: iface };
 	}
 
 	uci.delete('nordvpn', name);
 	uci.commit('nordvpn');
 	restore_wan_default();
+	_history.clear_events(name);
 	return { ok: true, deleted: name, interface: iface };
 }
 
-return { set_credentials, clear_credentials, current_peer, restore_peer, write_relay, bring_up, verify_handshake, connect_one, apply, disconnect, create_instance, delete_instance, restore_wan_default,
+return { set_credentials, clear_credentials, current_peer, restore_peer, write_relay, bring_up, verify_handshake, connect_one, apply_event, apply, disconnect, create_instance, delete_instance, restore_wan_default,
 	write_apply_status, read_apply_status, apply_running, apply_status_report, run_apply, start_apply };

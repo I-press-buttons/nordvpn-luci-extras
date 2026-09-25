@@ -26,6 +26,7 @@ const bring_up = _apply.bring_up,
       connect_one = _apply.connect_one,
       verify_handshake = _apply.verify_handshake,
       restore_wan_default = _apply.restore_wan_default;
+const record_event = require('nordvpn.history').record_event;
 
 const ROTATE_LOCK = '/tmp/nordvpn_rotate.lock';
 const ROTATE_STATE = '/tmp/nordvpn_rotate_state.json';
@@ -179,7 +180,7 @@ function rotate_inner(uci, instance) {
 		if (verify_handshake(iface, s.verify_timeout)) {
 			record({ last_success: time(), server: relay.hostname }, instance);
 			log('rotated ' + s.name + ' to ' + relay.hostname);
-			return { ok: true, server: relay.hostname };
+			return { ok: true, server: relay.hostname, from: current_gw };
 		}
 	}
 
@@ -193,9 +194,24 @@ function rotate_inner(uci, instance) {
 	return { error: 'no working server found', restored: saved != null };
 }
 
+// History entry for a finished rotation, or null when there is nothing worth
+// recording (losing the lock race: the rotation that holds it records its
+// own outcome). `reason` says who asked: 'schedule', 'watchdog' or 'manual'.
+// Pure/testable.
+function rotation_event(res, reason) {
+	if (!res || (res.skipped && res.reason == 'rotation already running'))
+		return null;
+	if (res.ok)
+		return { type: 'rotate', fields: { server: res.server, from: res.from, reason: reason } };
+	if (res.skipped)
+		return { type: 'rotate_skipped', fields: { reason: reason, detail: res.reason } };
+	return { type: 'rotate_failed', fields: { reason: reason, error: res.error,
+		detail: res.restored ? 'restored the previous server' : null } };
+}
+
 // Public entry point: serialize with any other rotation of the same instance
-// via a per-instance lock.
-function rotate(uci, instance) {
+// via a per-instance lock. `reason` only labels the history entry.
+function rotate(uci, instance, reason) {
 	uci = uci || cursor();
 	let lock = acquire_lock(lock_path(instance), 300);
 	if (!lock)
@@ -209,7 +225,10 @@ function rotate(uci, instance) {
 	}
 	release_lock(lock);
 	restore_wan_default();
+	let ev = rotation_event(res, reason || 'manual');
+	if (ev)
+		record_event(instance, ev.type, ev.fields);
 	return res;
 }
 
-return { shuffle, current_key, plan_candidates, read_state, record, last_attempt_ts, mark_attempt, rotate };
+return { shuffle, current_key, plan_candidates, read_state, record, last_attempt_ts, mark_attempt, rotation_event, rotate };

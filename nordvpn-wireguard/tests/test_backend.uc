@@ -923,6 +923,157 @@ write_cache(cache, cpath);
 	eq('mtu null on zero/garbage', recommend_mtu(0), null);
 }
 
+// 11. egress probe settings, decisions and state folding (pure)
+{
+	const _status = require('nordvpn.status');
+	const PT = _cmn.PROBE_FAIL_THRESHOLD;
+
+	eq('ipv4: valid literal', _cmn.validate_ipv4('1.1.1.1'), '1.1.1.1');
+	eq('ipv4: octet out of range', _cmn.validate_ipv4('1.1.1.256'), null);
+	eq('ipv4: hostname refused', _cmn.validate_ipv4('one.one.one.one'), null);
+	eq('ipv4: shell metachar refused', _cmn.validate_ipv4('1.1.1.1;reboot'), null);
+	eq('ipv4: trailing line refused', _cmn.validate_ipv4('1.1.1.1\n8.8.8.8'), null);
+
+	global.MOCK_UCI = { nordvpn: { main: { '.type': 'instance', interface: 'nordvpn' } }, network: {} };
+	let s0 = load_settings(cursor());
+	eq('probe: off by default', s0.egress_probe, false);
+	eq('probe: default targets', s0.probe_targets, _cmn.DEFAULT_PROBE_TARGETS);
+	global.MOCK_UCI = { nordvpn: { main: { '.type': 'instance', interface: 'nordvpn', egress_probe: '1',
+		probe_target: [ '9.9.9.9', 'bogus', '9.9.9.9', '10.0.0.300', '149.112.112.112' ] } }, network: {} };
+	let s1 = load_settings(cursor());
+	eq('probe: enabled from config', s1.egress_probe, true);
+	eq('probe: targets validated and deduped', s1.probe_targets, [ '9.9.9.9', '149.112.112.112' ]);
+	global.MOCK_UCI = { nordvpn: { main: { '.type': 'instance', interface: 'nordvpn', probe_target: 'nope' } }, network: {} };
+	eq('probe: all-invalid targets fall back to defaults', load_settings(cursor()).probe_targets, _cmn.DEFAULT_PROBE_TARGETS);
+
+	// Nothing is run for a device or target that fails validation.
+	eq('probe: invalid device refused', _status.egress_probe('wg0; reboot', [ '1.1.1.1' ]).ok, false);
+	eq('probe: no valid target -> not ok', _status.egress_probe('nordvpn', [ 'x', null ]).ok, false);
+
+	let on = { enabled: true, egress_probe: true };
+	ok('should_probe: connected + on', _service.should_probe(on, 'connected'));
+	ok('should_probe: not when degraded', !_service.should_probe(on, 'degraded'));
+	ok('should_probe: not when probe off', !_service.should_probe({ ...on, egress_probe: false }, 'connected'));
+	ok('should_probe: not when disabled', !_service.should_probe({ ...on, enabled: false }, 'connected'));
+
+	let gw = 'ee70.nordvpn.com';
+	let failing = { probe_server: gw, probe_fails: PT };
+	eq('effective: failing probe -> no_egress', _service.effective_state(on, 'connected', failing, gw), 'no_egress');
+	eq('effective: below threshold stays connected',
+		_service.effective_state(on, 'connected', { probe_server: gw, probe_fails: PT - 1 }, gw), 'connected');
+	eq('effective: failures from another server ignored',
+		_service.effective_state(on, 'connected', failing, 'nl1.nordvpn.com'), 'connected');
+	eq('effective: probe off ignores stale failures',
+		_service.effective_state({ ...on, egress_probe: false }, 'connected', failing, gw), 'connected');
+	eq('effective: other states pass through', _service.effective_state(on, 'degraded', failing, gw), 'degraded');
+
+	// no_egress is unhealthy for the watchdog, with the usual grace period.
+	let wd = { enabled: true, watchdog: true, fixed_server: '' };
+	ok('recover: no_egress past grace -> true', _service.should_recover(wd, 'no_egress', 1000, 0, 0, 1100));
+	ok('recover: no_egress within grace -> false', !_service.should_recover(wd, 'no_egress', 1070, 0, 0, 1100));
+	eq('watchdog: no_egress stamps degraded_since',
+		_service.watchdog_update('no_egress', { degraded_since: 0, last_recover: 0, recover_fails: 0 }, 1100, true).degraded_since, 1100);
+
+	// Folding results: failures count up to the threshold (one lost event),
+	// a success resets and reports the restore; a new server starts fresh.
+	let st = {}, evs = [];
+	for (let i = 1; i <= PT + 1; i++) {
+		let u = _service.probe_update(st, { ok: false, target: null }, gw, 1000 + i);
+		st = { ...st, ...u.fields };
+		push(evs, u.event);
+	}
+	eq('fold: failures counted', st.probe_fails, PT + 1);
+	eq('fold: exactly one egress_lost at the threshold', filter(evs, (e) => e == 'egress_lost'), [ 'egress_lost' ]);
+	eq('fold: lost event on the threshold tick', evs[PT - 1], 'egress_lost');
+	let u = _service.probe_update(st, { ok: true, target: '1.1.1.1' }, gw, 2000);
+	eq('fold: success resets and restores', [ u.fields.probe_fails, u.fields.probe_ok_at, u.event ], [ 0, 2000, 'egress_restored' ]);
+	u = _service.probe_update({ probe_server: gw, probe_fails: 1 }, { ok: true, target: '1.1.1.1' }, gw, 2000);
+	eq('fold: success below threshold is no event', u.event, null);
+	u = _service.probe_update(st, { ok: false }, 'nl1.nordvpn.com', 2000);
+	eq('fold: new server restarts the count', [ u.fields.probe_fails, u.fields.probe_server ], [ 1, 'nl1.nordvpn.com' ]);
+	eq('fold: null result counts as failure', _service.probe_update({}, null, gw, 1).fields.probe_fails, 1);
+
+	eq('clear: nothing to clear', _service.probe_clear({ last_attempt: 5 }), null);
+	eq('clear: resets probe fields', _service.probe_clear(st).probe_fails, 0);
+
+	eq('report: probe off', _service.egress_report({ egress_probe: false }, st, gw), { enabled: false });
+	eq('report: not yet checked', _service.egress_report(on, {}, gw).ok, null);
+	let rep = _service.egress_report(on, { probe_server: gw, probe_at: 50, probe_fails: 0, probe_ok_at: 50, probe_target: '1.1.1.1' }, gw);
+	eq('report: healthy', [ rep.ok, rep.fails, rep.checked_at, rep.ok_at, rep.target ], [ true, 0, 50, 50, '1.1.1.1' ]);
+	rep = _service.egress_report(on, st, gw);
+	eq('report: failing', [ rep.ok, rep.fails ], [ false, PT + 1 ]);
+	eq('report: other server is unchecked', _service.egress_report(on, st, 'nl1.nordvpn.com').ok, null);
+}
+
+// 12. transfer counters and interface uptime in status
+{
+	const _status = require('nordvpn.status');
+	eq('transfer: sums peers', _status.parse_transfer('AAA=\t100\t20\nBBB=\t5\t1\n'), { rx_bytes: 105, tx_bytes: 21 });
+	eq('transfer: empty output -> null', _status.parse_transfer(''), null);
+	eq('transfer: garbage -> null', _status.parse_transfer('x\ty\tz'), null);
+
+	global.MOCK_UCI = { nordvpn: { main: { '.type': 'instance', interface: 'nordvpn' } },
+		network: { nordvpn: { '.type': 'interface', private_key: KEY } } };
+	global.MOCK_UBUS = { 'network.interface.nordvpn~status': { up: true, l3_device: 'nordvpn', uptime: 4242 } };
+	let st = status(cursor());
+	eq('status: uptime from netifd', st.uptime, 4242);
+	eq('status: tunnel device', st.device, 'nordvpn');
+	global.MOCK_UBUS = { 'network.interface.nordvpn~status': { up: false, l3_device: 'nordvpn', uptime: 4242 } };
+	st = status(cursor());
+	eq('status: no uptime while down', [ st.uptime, st.transfer ], [ null, null ]);
+	global.MOCK_UBUS = {};
+}
+
+// 13. event history
+{
+	const _history = require('nordvpn.history');
+	const _apply_m = require('nordvpn.apply');
+
+	let ev = _history.make_event('rotate', { server: 'a', from: 'b', reason: 'schedule', junk: 'x' }, 77);
+	eq('event: known fields kept, unknown dropped', ev, { ts: 77, type: 'rotate', server: 'a', from: 'b', reason: 'schedule' });
+	eq('event: unknown type refused', _history.make_event('bogus', {}, 1), null);
+	let tok = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
+	eq('event: token-shaped text redacted', _history.make_event('connect_failed', { error: 'bad ' + tok }, 1).error, 'bad <redacted-token>');
+	// Non-hex filler: a long hex run would be redacted before it is clipped.
+	let longtxt = '';
+	for (let i = 0; i < 200; i++)
+		longtxt += 'x';
+	eq('event: long text clipped', length(_history.make_event('connect_failed', { error: longtxt }, 1).error), 160);
+
+	let l = [];
+	for (let i = 0; i < 7; i++)
+		l = _history.append_capped(l, { ts: i }, 5);
+	eq('append: capped to newest', map(l, (e) => e.ts), [ 2, 3, 4, 5, 6 ]);
+	eq('append: corrupt list tolerated', length(_history.append_capped('junk', { ts: 1 }, 5)), 1);
+
+	let inst = 'nvtest_hist';
+	_history.clear_events(inst);
+	eq('history: empty when never written', _history.read_events(inst), []);
+	_history.record_event(inst, 'connect', { server: 's1' }, 10);
+	_history.record_event(inst, 'rotate', { server: 's2', from: 's1', reason: 'schedule' }, 20);
+	_history.record_event(inst, 'nonsense', {}, 30);
+	let got = _history.read_events(inst);
+	eq('history: newest first, invalid skipped', map(got, (e) => e.type), [ 'rotate', 'connect' ]);
+	eq('history: limit', length(_history.read_events(inst, 1)), 1);
+	for (let i = 0; i < _cmn.HISTORY_MAX + 5; i++)
+		_history.record_event(inst, 'watchdog', {}, 100 + i);
+	eq('history: file stays capped', length(_history.read_events(inst)), _cmn.HISTORY_MAX);
+	_history.clear_events(inst);
+	eq('history: cleared', _history.read_events(inst), []);
+	eq('history: main keeps the historical path', _history.history_path(null), '/tmp/nordvpn_events.json');
+
+	// Outcome -> event mapping for rotation and apply.
+	eq('rot event: success', _rotate.rotation_event({ ok: true, server: 'b', from: 'a' }, 'watchdog'),
+		{ type: 'rotate', fields: { server: 'b', from: 'a', reason: 'watchdog' } });
+	eq('rot event: lock race not recorded', _rotate.rotation_event({ skipped: true, reason: 'rotation already running' }, 'schedule'), null);
+	eq('rot event: skip', _rotate.rotation_event({ skipped: true, reason: 'fixed server configured' }, 'manual').type, 'rotate_skipped');
+	let rf = _rotate.rotation_event({ error: 'no working server found', restored: true }, 'schedule');
+	eq('rot event: failure keeps the restore note', [ rf.type, rf.fields.detail ], [ 'rotate_failed', 'restored the previous server' ]);
+	eq('apply event: success', _apply_m.apply_event({ state: 'success', gateway: 'g' }), { type: 'connect', fields: { server: 'g' } });
+	eq('apply event: failure', _apply_m.apply_event({ state: 'failure', error: 'boom' }).fields.error, 'boom');
+	eq('apply event: partial failure is a failure', _apply_m.apply_event({ state: 'partial_failure', gateway: 'g', error: 'e' }).type, 'connect_failed');
+}
+
 unlink(cpath);
 printf('\n%s\n', fails ? ('FAILURES: ' + fails) : 'ALL PHASE-3 TESTS PASSED');
 exit(fails ? 1 : 0);

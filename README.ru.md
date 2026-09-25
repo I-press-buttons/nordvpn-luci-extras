@@ -202,6 +202,8 @@ config instance 'main'
 	option verify_timeout '8'        # seconds to wait for a WG handshake
 	option max_retries '10'          # candidate servers per rotation
 	option watchdog '0'              # auto-reconnect a stale tunnel (off when pinned)
+	option egress_probe '0'          # ping through the tunnel every 30 s (internet check)
+	list probe_target '1.1.1.1'      # IPv4 probe targets; default 1.1.1.1 + 8.8.8.8
 	option auto_routing '1'          # route all LAN traffic via the VPN
 	list source_network 'media'      # or: steer only these networks (see below)
 	option killswitch '0'            # block steered traffic while VPN is down
@@ -236,6 +238,7 @@ TCP MSS-clamping (`mtu_fix`) остаётся как страховка.
 ubus call nordvpn status            # runtime state, location, handshake age
 ubus call nordvpn instances         # status of every configured VPN instance
 ubus call nordvpn external_ip       # public IP as seen through the tunnel
+ubus call nordvpn history '{"instance":"main"}'  # recent events, newest first
 ubus call nordvpn disconnect        # take the tunnel down, pause rotation
 ubus call nordvpn clear_credentials # forget the stored WireGuard key
 ubus call nordvpn locations         # cached country/city tree (+ per-city counts)
@@ -256,7 +259,12 @@ ubus call nordvpn refresh_locations # start an async server-list refresh
 поэтому ротация выключена); страница LuCI завязывает свои кнопки действий на оба
 флага — показывая единый переключатель Enable/Disable
 (Включить/Выключить) и скрывая «Rotate now» (Ротировать сейчас) для
-закреплённого туннеля.
+закреплённого туннеля. С включённой проверкой интернета `no_egress` означает,
+что хендшейк свежий, но туннель не пропускает трафик (см. ниже), а `egress`
+содержит результат последней проверки. Пока интерфейс поднят, `uptime` — это
+секунды с момента, когда netifd его поднял, а `transfer` (`rx_bytes`/`tx_bytes`)
+— байты, прошедшие через туннель с тех пор; страница LuCI показывает и то и
+другое, а также текущую скорость.
 
 ### Несколько VPN-инстансов
 
@@ -363,10 +371,40 @@ VPN с той же страной **выхода** (страна входа мо
 мёртвый пул серверов не долбится. Детект **только по хендшейку**: watchdog
 замечает мёртвый или неотвечающий сервер (протухший WireGuard-хендшейк), но
 **не делает внешней egress-пробы**, поэтому туннель с живым хендшейком и
-сломанным исходящим соединением *не* детектируется. Как и ротация, watchdog
+сломанным исходящим соединением детектируется только с включённой проверкой
+интернета (см. ниже). Как и ротация, watchdog
 не срабатывает при запиненном сервере (чекбокс в LuCI тогда скрыт), а его
 восстановление идёт под тем же per-instance lock, что и плановая ротация, —
 гонки исключены.
+
+### Проверка интернета (egress-проба)
+
+Свежий хендшейк доказывает лишь, что сервер отвечает по WireGuard, но не то,
+что он пропускает трафик. Опциональная **проверка интернета** (**Advanced
+settings → Internet check** или `option egress_probe '1'`; по умолчанию
+выключена) каждые 30 секунд пингует цели через туннель — с привязкой к
+устройству туннеля, так что проверяется именно путь через VPN даже при
+policy routing, и только по IPv4-адресам, так что DNS не нужен. Ответа от
+любой цели достаточно. После **3 неудачных проверок подряд** состояние
+инстанса становится `no_egress` (в интерфейсе — «No internet»), а включённый
+watchdog обрабатывает это как протухший хендшейк: после своего 60-секундного
+grace-окна ротирует на другой сервер, с тем же backoff. Неудачи привязаны к
+серверу, на котором измерены, поэтому ротация начинает счёт заново. Проверка
+идёт в дочернем процессе и никогда не блокирует демон. Цели по умолчанию —
+1.1.1.1 и 8.8.8.8; свои задаются через `list probe_target` (или поле **Check
+targets**). При запиненном сервере проверка продолжает работать для
+отображения; выключен только watchdog.
+
+### История событий
+
+Бэкенд хранит последние 50 событий каждого инстанса — подключения и неудачные
+подключения, ротации (плановые, ручные или от watchdog, со старым и новым
+сервером), пропущенные и неудавшиеся ротации, восстановления watchdog,
+пропажу и возвращение интернета, выключения и смену учётных данных — в
+`/tmp/nordvpn_events*.json` (состояние времени выполнения, очищается при
+перезагрузке). Страница LuCI показывает их в блоке **Recent events**; из CLI —
+`ubus call nordvpn history '{"instance":"main"}'` (опционально `limit`).
+Удаление или сброс инстанса очищает его историю.
 
 ### Кэш списка серверов
 

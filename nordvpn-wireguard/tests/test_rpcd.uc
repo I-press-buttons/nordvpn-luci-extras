@@ -173,5 +173,26 @@ ok('main options wiped', global.MOCK_UCI.nordvpn.main.country_code == null && gl
 eq('migration stamp kept', global.MOCK_UCI.nordvpn.main.config_version, '1');
 ok('main network interface removed', global.MOCK_UCI.network.nordvpn == null);
 
+// history: events recorded by the write methods, newest first; egress report
+{
+	unlink('/tmp/nordvpn_events.json');
+	global.MOCK_UCI = { nordvpn: { main: { '.type': 'instance', interface: 'nordvpn', cache_dir: cdir, enabled: '1' } },
+		network: { nordvpn: { '.type': 'interface', private_key: KEY, vpn_type: 'nordvpn' } } };
+	global.MOCK_UBUS = {};
+	eq('history: empty at first', m.history.call({ args: {} }).events, []);
+	m.disconnect.call({});
+	m.clear_credentials.call({});
+	let h = m.history.call({ args: { instance: 'main' } });
+	eq('history: write methods recorded, newest first', map(h.events, (e) => e.type), [ 'credentials_cleared', 'disabled' ]);
+	eq('history: limit honoured', length(m.history.call({ args: { limit: 1 } }).events), 1);
+	eq('history: unknown instance', m.history.call({ args: { instance: 'nope' } }).error, 'no such instance');
+
+	eq('status: egress report off by default', m.status.call({}).egress, { enabled: false });
+	global.MOCK_UCI.nordvpn.main.egress_probe = '1';
+	let eg = m.status.call({}).egress;
+	eq('status: egress report on, not yet checked', [ eg.enabled, eg.ok ], [ true, null ]);
+	unlink('/tmp/nordvpn_events.json');
+}
+
 printf('\n%s\n', fails ? ('FAILURES: ' + fails) : 'ALL RPCD TESTS PASSED');
 exit(fails ? 1 : 0);

@@ -8,6 +8,9 @@ import { connect } from 'ubus';
 const _common = require('nordvpn.common');
 const load_settings = _common.load_settings,
       validate_wg_key = _common.validate_wg_key,
+      validate_interface = _common.validate_interface,
+      validate_ipv4 = _common.validate_ipv4,
+      PROBE_TIMEOUT = _common.PROBE_TIMEOUT,
       run = _common.run;
 
 // Newest WireGuard handshake age in seconds for device `dev`, or null.
@@ -28,6 +31,45 @@ function handshake_age(dev) {
 		return null;
 	let age = time() - best;
 	return age < 0 ? 0 : age;
+}
+
+// Parse `wg show <dev> transfer` output ("<pubkey>\t<rx>\t<tx>" per peer)
+// into byte totals summed over peers, or null when nothing parsed. Pure.
+function parse_transfer(out) {
+	let rx = 0, tx = 0, seen = false;
+	for (let line in split(trim(out || ''), '\n')) {
+		let parts = split(line, '\t');
+		if (length(parts) >= 3 && match(parts[1], /^[0-9]+$/) && match(parts[2], /^[0-9]+$/)) {
+			rx += int(parts[1]);
+			tx += int(parts[2]);
+			seen = true;
+		}
+	}
+	return seen ? { rx_bytes: rx, tx_bytes: tx } : null;
+}
+
+// Bytes received/sent over the tunnel since the interface came up, or null.
+function transfer(dev) {
+	let res = run([ 'wg', 'show', dev, 'transfer' ]);
+	return (res.code == 0) ? parse_transfer(res.stdout) : null;
+}
+
+// Egress probe: can traffic actually leave through the tunnel? Pings each
+// target bound to the tunnel device (SO_BINDTODEVICE, so policy routing and
+// the main table do not matter) and stops at the first reply. A live
+// handshake only proves the server answers WireGuard; this proves it
+// forwards. Returns { ok, target } — target is the host that answered.
+function egress_probe(dev, targets) {
+	if (!validate_interface(dev))
+		return { ok: false, target: null };
+	for (let t in (targets || [])) {
+		if (!validate_ipv4(t))
+			continue;
+		let r = run([ 'ping', '-q', '-c', '1', '-W', '' + PROBE_TIMEOUT, '-I', dev, t ]);
+		if (r.code == 0)
+			return { ok: true, target: t };
+	}
+	return { ok: false, target: null };
 }
 
 function find_peer(uci, iface) {
@@ -74,6 +116,11 @@ function status(uci, instance) {
 		gateway: peer ? uci.get('network', peer, 'nordvpn_gateway') : null,
 		endpoint: endpoint_host ? (endpoint_host + ':' + (endpoint_port || '')) : null,
 		latest_handshake_seconds: null,
+		// Tunnel device (for the egress probe), seconds since netifd brought
+		// the interface up, and bytes through the tunnel since then.
+		device: null,
+		uptime: null,
+		transfer: null,
 		rotation: {
 			enabled: s.rotation_enabled,
 			mode: s.rotation_mode,
@@ -90,7 +137,7 @@ function status(uci, instance) {
 	// immediately: status() is called on every daemon tick (watchdog), and a
 	// leaked connection per tick exhausts ubusd's file descriptors within hours,
 	// after which nothing on the router can talk to ubus at all.
-	let ifup = false, l3dev = iface;
+	let ifup = false, l3dev = iface, uptime = null;
 	let ub = connect();
 	if (ub) {
 		let st = ub.call('network.interface.' + iface, 'status', {});
@@ -98,8 +145,15 @@ function status(uci, instance) {
 			ifup = st.up ? true : false;
 			if (st.l3_device)
 				l3dev = st.l3_device;
+			if (type(st.uptime) == 'int')
+				uptime = st.uptime;
 		}
 		ub.disconnect();
+	}
+	result.device = l3dev;
+	if (ifup) {
+		result.uptime = uptime;
+		result.transfer = transfer(l3dev);
 	}
 
 	let hs = handshake_age(l3dev);
@@ -118,4 +172,4 @@ function status(uci, instance) {
 	return result;
 }
 
-return { status };
+return { status, parse_transfer, egress_probe };

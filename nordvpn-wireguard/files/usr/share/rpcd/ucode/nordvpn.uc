@@ -12,6 +12,8 @@ const validate_token = _common.validate_token,
       validate_instance = _common.validate_instance,
       validate_country_code = _common.validate_country_code,
       validate_location_code = _common.validate_location_code,
+      bounded_int = _common.bounded_int,
+      HISTORY_MAX = _common.HISTORY_MAX,
       load_settings = _common.load_settings,
       list_instances = _common.list_instances,
       cache_file_path = _common.cache_file_path;
@@ -27,7 +29,11 @@ const _rotate = require('nordvpn.rotate');
 const rotate = _rotate.rotate,
       read_state = _rotate.read_state,
       last_attempt_ts = _rotate.last_attempt_ts;
-const next_rotation = require('nordvpn.service').next_rotation;
+const _service = require('nordvpn.service');
+const next_rotation = _service.next_rotation,
+      effective_state = _service.effective_state,
+      egress_report = _service.egress_report;
+const read_events = require('nordvpn.history').read_events;
 const list_clients = require('nordvpn.clients').clients;
 const detect_routing = require('nordvpn.routing').detect;
 const _cache = require('nordvpn.cache');
@@ -56,6 +62,10 @@ function build_status(uci, name) {
 	if (state && state.last_success)
 		st.rotation.last_success = state.last_success;
 	let s = load_settings(uci, name);
+	// Fold in the daemon's egress probe: a handshake-healthy tunnel that
+	// forwards nothing reads as 'no_egress', exactly as the watchdog sees it.
+	st.state = effective_state(s, st.state, state, st.gateway);
+	st.egress = egress_report(s, state, st.gateway);
 	st.rotation.next_run = next_rotation(s, last_attempt_ts(name), time());
 	st.routing = detect_routing(uci, s, true);
 	return st;
@@ -127,6 +137,21 @@ methods.servers = {
 			return { relays: pool_relays(cache, set, a.hop_mode) };
 		}
 		return { relays: city_relays(cache, a.country, a.city, a.hop_mode) };
+	}
+};
+
+// Recent events of one instance (connects, rotations, watchdog recoveries,
+// egress probe transitions), newest first.
+methods.history = {
+	args: { instance: '', limit: 0 },
+	call: function(request) {
+		let uci = cursor();
+		let name = req_instance(uci, request);
+		if (!name)
+			return { error: 'no such instance' };
+		let a = request.args || {};
+		let limit = bounded_int(a.limit, 1, HISTORY_MAX) || HISTORY_MAX;
+		return { instance: name, events: read_events(name, limit) };
 	}
 };
 
@@ -274,7 +299,7 @@ methods.rotate_now = {
 		let name = req_instance(uci, request);
 		if (!name)
 			return { error: 'no such instance' };
-		return rotate(uci, name);
+		return rotate(uci, name, 'manual');
 	}
 };
 

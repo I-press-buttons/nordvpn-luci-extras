@@ -7,7 +7,8 @@
 const _common = require('nordvpn.common');
 const WATCHDOG_GRACE = _common.WATCHDOG_GRACE,
       WATCHDOG_COOLDOWN_BASE = _common.WATCHDOG_COOLDOWN_BASE,
-      WATCHDOG_COOLDOWN_MAX = _common.WATCHDOG_COOLDOWN_MAX;
+      WATCHDOG_COOLDOWN_MAX = _common.WATCHDOG_COOLDOWN_MAX,
+      PROBE_FAIL_THRESHOLD = _common.PROBE_FAIL_THRESHOLD;
 
 // Refresh when the interval elapsed, or on first tick if the cache is stale.
 function should_refresh(settings, last_cache, now, cache_stale) {
@@ -57,10 +58,86 @@ function next_rotation(settings, last_rotate, now) {
 }
 
 // States that may trigger a watchdog recovery. The grace period gives a fresh
-// connection time to complete its first handshake.
+// connection time to complete its first handshake. 'no_egress' is a tunnel
+// whose handshake is fresh but whose egress probe keeps failing.
 function is_unhealthy(state) {
 	return state == 'connecting' || state == 'degraded' ||
-		state == 'disconnected';
+		state == 'disconnected' || state == 'no_egress';
+}
+
+// ── Egress probe ────────────────────────────────────────────────────
+// status() judges a tunnel by its WireGuard handshake alone, which proves the
+// server answers but not that it forwards. The optional probe pings through
+// the tunnel; its result is kept in the per-instance rotate state as
+// { probe_fails, probe_at, probe_ok_at, probe_target, probe_server } and
+// folded into the state here.
+
+// Probe on this tick? Only a handshake-healthy tunnel is worth probing: any
+// other state is already unhealthy on its own.
+function should_probe(settings, state) {
+	return settings.enabled && settings.egress_probe && state == 'connected';
+}
+
+// The state as the watchdog and the UI should see it: 'connected' becomes
+// 'no_egress' once the probe failed PROBE_FAIL_THRESHOLD times in a row
+// against the server the tunnel is on now. Failures recorded against a
+// previous server (a rotation happened since) do not count.
+function effective_state(settings, state, st, gateway) {
+	if (state != 'connected' || !settings.egress_probe || !st)
+		return state;
+	if (!gateway || st.probe_server != gateway)
+		return state;
+	let fails = (type(st.probe_fails) == 'int') ? st.probe_fails : 0;
+	return (fails >= PROBE_FAIL_THRESHOLD) ? 'no_egress' : state;
+}
+
+// Fold one probe result ({ ok, target }) into the persisted probe fields.
+// Returns { fields, event } where `event` is 'egress_lost' when this result
+// crossed the threshold, 'egress_restored' when it ended a lost episode, else
+// null — so the history records transitions, not every tick.
+function probe_update(st, result, gateway, now) {
+	let same = st && gateway && st.probe_server == gateway;
+	let prev = (same && type(st.probe_fails) == 'int') ? st.probe_fails : 0;
+	let ok = (result && result.ok) ? true : false;
+	let fields = {
+		probe_at: now,
+		probe_server: gateway || null,
+		probe_fails: ok ? 0 : prev + 1,
+		probe_ok_at: ok ? now : ((same && type(st.probe_ok_at) == 'int') ? st.probe_ok_at : 0),
+		probe_target: ok ? result.target : null
+	};
+	let event = null;
+	if (ok && prev >= PROBE_FAIL_THRESHOLD)
+		event = 'egress_restored';
+	else if (!ok && fields.probe_fails == PROBE_FAIL_THRESHOLD)
+		event = 'egress_lost';
+	return { fields, event };
+}
+
+// Probe fields to write when the probe is off, so a stale failure count never
+// resurfaces when it is turned back on. null when there is nothing to clear.
+function probe_clear(st) {
+	if (!st || (!st.probe_at && !st.probe_fails && !st.probe_server))
+		return null;
+	return { probe_at: 0, probe_server: null, probe_fails: 0, probe_ok_at: 0, probe_target: null };
+}
+
+// The probe summary the status API reports, or { enabled: false }.
+function egress_report(settings, st, gateway) {
+	if (!settings.egress_probe)
+		return { enabled: false };
+	let same = st && gateway && st.probe_server == gateway && type(st.probe_at) == 'int' && st.probe_at > 0;
+	if (!same)
+		return { enabled: true, ok: null, fails: 0, checked_at: null, ok_at: null, target: null };
+	let fails = (type(st.probe_fails) == 'int') ? st.probe_fails : 0;
+	return {
+		enabled: true,
+		ok: fails == 0,
+		fails: fails,
+		checked_at: st.probe_at,
+		ok_at: (type(st.probe_ok_at) == 'int' && st.probe_ok_at > 0) ? st.probe_ok_at : null,
+		target: st.probe_target || null
+	};
 }
 
 // Watchdog decision: recover a persistently unhealthy instance by rotating
@@ -116,5 +193,6 @@ function watchdog_result_update(result, fails) {
 
 return {
 	should_refresh, should_rotate, next_rotation, should_recover,
-	watchdog_update, watchdog_result_update
+	watchdog_update, watchdog_result_update,
+	should_probe, effective_state, probe_update, probe_clear, egress_report
 };
