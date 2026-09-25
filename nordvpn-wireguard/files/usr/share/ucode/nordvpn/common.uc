@@ -57,6 +57,17 @@ const WATCHDOG_GRACE = 60;
 const WATCHDOG_COOLDOWN_BASE = 120;
 const WATCHDOG_COOLDOWN_MAX = 900;
 
+// Egress probe: consecutive failed checks (one per 30-second daemon tick)
+// before a handshake-healthy tunnel counts as having no egress, the per-target
+// ping timeout, and the default targets (plain IPv4 literals, so the check
+// needs no DNS and cannot leak a lookup out of the WAN).
+const PROBE_FAIL_THRESHOLD = 3;
+const PROBE_TIMEOUT = 2;
+const DEFAULT_PROBE_TARGETS = [ '1.1.1.1', '8.8.8.8' ];
+
+// Per-instance event history: newest entries kept, older ones dropped.
+const HISTORY_MAX = 50;
+
 // ── Primitive validators ─────────────────────────────────────────────
 // Each returns a normalized value or null; callers treat null as invalid.
 
@@ -178,6 +189,16 @@ function validate_instance(n) {
 	return match(n, /^[A-Za-z0-9_]+$/) ? n : null;
 }
 
+// Dotted-quad IPv4 literal with every octet in range, else null.
+function validate_ipv4(a) {
+	if (type(a) != 'string' || !match(a, /^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$/))
+		return null;
+	for (let o in split(a, '.'))
+		if (int(o) > 255)
+			return null;
+	return a;
+}
+
 // Empty (main table) or a table name/number.
 function validate_routing_table(t) {
 	if (t == null || t == '')
@@ -283,6 +304,16 @@ function load_settings(uci, instance) {
 		rp_add(rp);
 	}
 
+	// `list probe_target` — IPv4 hosts the egress probe pings through the
+	// tunnel. Invalid entries are dropped; none left = the defaults.
+	let pt = uci.get('nordvpn', name, 'probe_target');
+	let probe_targets = [];
+	for (let x in (type(pt) == 'array') ? pt : (type(pt) == 'string' ? [ pt ] : []))
+		if (validate_ipv4(x) && index(probe_targets, x) < 0)
+			push(probe_targets, x);
+	if (length(probe_targets) == 0)
+		probe_targets = [ ...DEFAULT_PROBE_TARGETS ];
+
 	return {
 		name: name,
 		source_networks: source_networks,
@@ -307,6 +338,11 @@ function load_settings(uci, instance) {
 		// Optional watchdog: auto-reconnect (rotate away) when the tunnel stays
 		// unhealthy. Off by default; never fires with a pinned fixed_server.
 		watchdog: g('watchdog', '0') == '1',
+		// Optional egress probe: ping probe_targets through the tunnel every
+		// daemon tick, so a tunnel whose handshake is alive but which forwards
+		// nothing is noticed (and recovered by the watchdog when that is on).
+		egress_probe: g('egress_probe', '0') == '1',
+		probe_targets: probe_targets,
 		verify_timeout: bi('verify_timeout', '8', MIN_VERIFY_TIMEOUT, MAX_VERIFY_TIMEOUT),
 		max_retries: bi('max_retries', '10', 1, 50),
 		// Automatic traffic routing (zone + default route via the tunnel). The
@@ -458,9 +494,11 @@ return {
 	MIN_ROTATION_INTERVAL, MAX_ROTATION_INTERVAL, MIN_CACHE_REFRESH, MAX_CACHE_REFRESH,
 	MIN_VERIFY_TIMEOUT, MAX_VERIFY_TIMEOUT,
 	WATCHDOG_GRACE, WATCHDOG_COOLDOWN_BASE, WATCHDOG_COOLDOWN_MAX,
+	PROBE_FAIL_THRESHOLD, PROBE_TIMEOUT, DEFAULT_PROBE_TARGETS, HISTORY_MAX,
 	bounded_int, validate_interface, validate_token, validate_wg_key, validate_hostname,
 	validate_port, validate_hop_mode, validate_dns_mode, relay_kind, validate_rotation_mode, validate_interval, validate_time,
 	validate_country_code, validate_location_code, validate_instance, validate_routing_table, validate_dir,
+	validate_ipv4,
 	load_settings, list_instances, globals_section, cache_file_path, iso_ts, redact, log,
 	atomic_write, acquire_lock, release_lock, sh_quote, open_cmd, run
 };

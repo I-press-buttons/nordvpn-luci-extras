@@ -12,7 +12,7 @@ const log = _common.log,
 
 // Optional argument: the instance to rotate (default 'main').
 let instance = (length(ARGV) > 0 ? validate_instance(ARGV[0]) : null) || 'main';
-let res = rotate(null, instance);
+let res = rotate(null, instance, 'manual');
 
 if (res.ok) {
 	printf('nordvpn-rotate: connected to %s\n', res.server);

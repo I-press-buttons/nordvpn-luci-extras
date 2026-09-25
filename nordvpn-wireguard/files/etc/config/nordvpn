@@ -41,6 +41,13 @@ config instance 'main'
 	# Detection is handshake-based only (no external egress probe); ignored
 	# when a fixed_server is pinned.
 	# option watchdog '0'
+	# Optional egress probe: ping the targets below through the tunnel every
+	# 30 s. Three failed checks in a row mark a handshake-healthy tunnel as
+	# 'no_egress' (shown in the UI; recovered by the watchdog when that is on).
+	# Targets are IPv4 literals; any reply counts. Default 1.1.1.1 and 8.8.8.8.
+	# option egress_probe '0'
+	# list probe_target '1.1.1.1'
+	# list probe_target '8.8.8.8'
 	# Automatic traffic routing: create a firewall zone and route all LAN
 	# traffic through the tunnel. Enabled for fresh installs; ignored (never
 	# touches anything) when a custom routing table or own routes are detected.
