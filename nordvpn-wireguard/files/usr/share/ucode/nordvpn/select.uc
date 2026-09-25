@@ -5,7 +5,8 @@
 'use strict';
 
 import { rand } from 'math';
-const relay_kind = require('nordvpn.common').relay_kind;
+const _common = require('nordvpn.common');
+const relay_kind = _common.relay_kind;
 
 // All relays matching country/city/hop_mode. city_code '' means any city.
 // hop_mode 'multihop' and 'onion' select exactly that kind; anything else
@@ -43,7 +44,7 @@ function location_candidates(cache, locations, hop_mode) {
 		return out;
 	for (let entry in locations) {
 		let list = [];
-		if (match(entry, /^[A-Za-z]{2}$/))
+		if (_common.full_match(entry, /^[A-Za-z]{2}$/))
 			list = candidates(cache, entry, '', hop_mode);
 		else if (type(entry) == 'string' && index(entry, '-') > 0)
 			list = candidates(cache, split(entry, '-')[0], entry, hop_mode);

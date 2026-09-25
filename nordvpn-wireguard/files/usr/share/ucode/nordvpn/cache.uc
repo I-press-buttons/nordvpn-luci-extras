@@ -18,6 +18,10 @@ const open_cmd = _common.open_cmd,
       FETCH_STATUS_FILE = _common.FETCH_STATUS_FILE,
       CACHE_LOCK_FILE = _common.CACHE_LOCK_FILE,
       relay_kind = _common.relay_kind,
+      clean_label = _common.clean_label,
+      validate_hostname = _common.validate_hostname,
+      validate_wg_key = _common.validate_wg_key,
+      validate_country_code = _common.validate_country_code,
       atomic_write = _common.atomic_write,
       acquire_lock = _common.acquire_lock,
       release_lock = _common.release_lock,
@@ -83,6 +87,7 @@ function read_fetch_status() {
 }
 
 // ── Normalization ────────────────────────────────────────────────────
+
 
 function new_accumulator() {
 	return {
@@ -155,21 +160,27 @@ function add_server(acc, server) {
 	if (!cinfo)
 		return;
 
-	let country_name = cinfo.name;
-	let country_code = lc(cinfo.code || '');
-	let city_name = (cinfo.city && cinfo.city.name) ? cinfo.city.name : 'Unknown';
+	// Everything below ends up in /etc/config/network (endpoint, key) or in
+	// the UI, so malformed entries are dropped rather than passed along.
+	let country_code = validate_country_code(cinfo.code);
+	if (!country_code)
+		return;
+	let country_name = clean_label(cinfo.name, uc(country_code));
+	let city_name = clean_label(cinfo.city ? cinfo.city.name : null, 'Unknown');
 	let location_code = country_code + '-' + replace(lc(city_name), /[^a-z0-9]/g, '');
 
-	let public_key = extract_public_key(server);
+	let public_key = validate_wg_key(extract_public_key(server));
 	if (!public_key)
+		return;
+	let hostname = validate_hostname(server.hostname);
+	if (!hostname)
 		return;
 
 	let country = ensure_country(acc, country_name, country_code);
 	let city = ensure_city(acc, country, location_code, city_name,
 		loc.latitude, loc.longitude, country_code);
 
-	let hostname = server.hostname || '';
-	let friendly = server.name || '';
+	let friendly = clean_label(server.name, '');
 
 	// Multihop: hostname cc1-cc2##.nordvpn.com, or name "CountryA - CountryB #".
 	// POSIX ERE only ([.] for literal dots; no \s/\w/non-greedy).
@@ -199,10 +210,10 @@ function add_server(acc, server) {
 
 	push(city.relays, {
 		hostname: hostname,
-		ip_address: server.station || '',
+		ip_address: validate_hostname(server.station) || '',
 		name: friendly,
 		public_key: public_key,
-		load: server.load || 0,
+		load: (type(server.load) == 'int' && server.load >= 0 && server.load <= 100) ? server.load : 0,
 		location: location_code,
 		port: DEFAULT_PORT,
 		active: true,

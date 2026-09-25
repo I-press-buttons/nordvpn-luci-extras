@@ -198,10 +198,11 @@ config instance 'main'
 	option watchdog '0'              # auto-reconnect a stale tunnel (off when pinned)
 	option auto_routing '1'          # route all LAN traffic via the VPN
 	list source_network 'media'      # or: steer only these networks (see below)
+	list source_device 'aa:bb:cc:dd:ee:ff'  # and/or individual devices, by MAC
 	option killswitch '0'            # block steered traffic while VPN is down
 	option block_ipv6 '1'            # block direct IPv6 (leak prevention)
 	option vpn_dns 'off'             # off | standard | threat (NordVPN resolvers)
-	option cache_dir ''              # empty = /tmp, shared by all instances
+	option cache_dir ''              # empty = /tmp, shared by all instances; /etc, /usr, /root etc. are refused
 	option cache_refresh_interval '21600'   # seconds, background refresh
 ```
 
@@ -283,6 +284,28 @@ every local IPv4 subnet into the instance's table (interface subnets, static
 routes and the allowed-IPs of your own WireGuard links; your own routes for
 the same subnet always win). Or keep using your own policy-routing rules
 (manual mode is detected and left alone).
+
+### Steering individual devices
+
+Below the networks, **Steered devices** picks single clients instead (or as
+well). The section is collapsed by default; opening it loads the known clients
+(DHCP leases, static leases and the neighbour table) into a searchable list.
+The search is case-insensitive and matches the name, any IP, or the MAC with or
+without separators (`aabb`, `aa:bb` and `AA-BB` all find `aa:bb:…`); a full
+MAC that is not listed can be added by hand. Click a row (or press Space) to
+route that device through this instance; selected rows are highlighted and
+*Selected only* narrows the list to them.
+
+Devices are matched by **MAC address** (`list source_device`), so a new DHCP
+lease keeps them on the tunnel. The backend adds a stamped fw4 rule per device
+that marks its packets, plus one `mark … lookup <table>` rule (priority 19000,
+above the network rules, so a device choice beats its network's), and the same
+kill-switch / IPv6 prohibit rules as networks. The mark is the table id in the
+top byte (`0xff000000` mask, clear of mwan3 and pbr), so device steering needs
+a routing table with an id of 1–255 — the default, a table named after the
+interface, gets one automatically. A device belongs to one tunnel: a MAC already
+steered by another enabled instance is shown locked in the picker and skipped
+by the backend. The list is hidden while *Route all LAN traffic* is on.
 
 ![VPN instances](docs/screenshots/instances.png)
 

@@ -15,6 +15,7 @@ const candidates = _select.candidates, by_hostname = _select.by_hostname, pick =
       selection_candidates = _select.selection_candidates;
 const parse_credentials = require('nordvpn.api').parse_credentials;
 const write_relay = require('nordvpn.apply').write_relay;
+const _apply = require('nordvpn.apply');
 const _cmn = require('nordvpn.common');
 const load_settings = _cmn.load_settings, list_instances = _cmn.list_instances;
 const status = require('nordvpn.status').status;
@@ -756,6 +757,159 @@ write_cache(cache, cpath);
 	eq('status per instance: media configured', status(uci, 'media').configured, true);
 	eq('status per instance: main not configured', status(uci, 'main').configured, false);
 	eq('status carries the instance name', status(uci, 'media').instance, 'media');
+}
+
+// 9b. Hardening: cache_dir and routing_table validation, relay validation.
+{
+	let vd = _cmn.validate_dir, vt = _cmn.validate_routing_table;
+	eq('dir: /tmp allowed', vd('/tmp'), '/tmp');
+	eq('dir: user storage allowed', vd('/mnt/usb/nordvpn'), '/mnt/usb/nordvpn');
+	eq('dir: /etc/uci-defaults refused (sourced by sh at boot)', vd('/etc/uci-defaults'), null);
+	eq('dir: /etc/hotplug.d refused', vd('/etc/hotplug.d/iface'), null);
+	eq('dir: traversal refused', vd('/tmp/../etc/uci-defaults'), null);
+	eq('dir: trailing slash still refused', vd('/usr/'), null);
+	eq('dir: prefix is by path segment', vd('/etcetera'), '/etcetera');
+	eq('dir: root refused', vd('/'), null);
+	eq('dir: refused dir falls back to /tmp',
+		_cmn.cache_file_path({ cache_dir: '/etc/uci-defaults' }), '/tmp/nordvpn_servers_cache.json');
+	eq('table: name ok', vt('vpn'), 'vpn');
+	eq('table: local refused', vt('local'), null);
+	eq('table: 255 refused', vt('255'), null);
+	eq('table: newline refused', vt('vpn\n100 evil'), null);
+
+	global.MOCK_UCI = { nordvpn: { main: { '.type': 'instance', routing_table: 'local' } } };
+	eq('table: invalid falls back to main', load_settings(cursor()).routing_table, '');
+
+	let k = 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=';
+	let srv = function(host, key, name) {
+		return { hostname: host, name: name, locations: [ { country: { code: 'DE',
+			name: 'Germany', city: { name: 'Berlin' } } } ],
+			technologies: [ { identifier: 'wireguard_udp',
+				metadata: [ { name: 'public_key', value: key } ] } ] };
+	};
+	let n = normalize([ srv('de1.nordvpn.com', k, '<img src=x onerror=alert(1)> #1'),
+		srv('evil;reboot', k, 'x'), srv('de2.nordvpn.com', 'nope', 'y') ]);
+	eq('cache: only the valid relay kept', n.stats.gateways, 1);
+	eq('cache: markup stripped from names', n.countries[0].cities[0].relays[0].name,
+		'img src=x onerror=alert(1) #1');
+
+	global.MOCK_UCI = { nordvpn: { main: { '.type': 'instance', interface: 'nordvpn' } },
+		network: { nordvpn: { '.type': 'interface', vpn_type: 'nordvpn' } } };
+	let uci = cursor();
+	ok('write_relay refuses a bad endpoint', !write_relay(uci, 'nordvpn',
+		{ hostname: 'a b', public_key: k, location: 'de-berlin' }, load_settings(uci)));
+	ok('write_relay refuses a bad key', !write_relay(uci, 'nordvpn',
+		{ hostname: 'de1.nordvpn.com', public_key: 'x', location: 'de-berlin' }, load_settings(uci)));
+	ok('nothing written for a refused relay', global.MOCK_UCI.network.nordvpn.nordvpn_gateway == null);
+
+	ok('managed: missing section is claimable', _cmn.managed_interface(uci, 'nv_new'));
+	ok('managed: stamped interface', _cmn.managed_interface(uci, 'nordvpn'));
+	global.MOCK_UCI.network.wan = { '.type': 'interface', proto: 'dhcp' };
+	ok('managed: wan is not', !_cmn.managed_interface(uci, 'wan'));
+}
+
+// 8c. Device steering: MAC -> fw4 MARK rule, one mark lookup/prohibit set.
+{
+	eq('mac: colon form normalized', _cmn.validate_mac('AA:BB:CC:DD:EE:FF'), 'aa:bb:cc:dd:ee:ff');
+	eq('mac: dash form normalized', _cmn.validate_mac('aa-bb-cc-dd-ee-0f'), 'aa:bb:cc:dd:ee:0f');
+	eq('mac: bare hex normalized', _cmn.validate_mac('AABBCCDDEEFF'), 'aa:bb:cc:dd:ee:ff');
+	eq('mac: short refused', _cmn.validate_mac('aa:bb:cc:dd:ee'), null);
+	eq('mac: newline refused', _cmn.validate_mac('aa:bb:cc:dd:ee:ff\nx'), null);
+
+	global.MOCK_UCI = { nordvpn: { main: { '.type': 'instance', enabled: '1',
+		source_device: [ 'AA:BB:CC:DD:EE:01', 'aa-bb-cc-dd-ee-01', 'junk', 'aabbccddee02' ] } } };
+	eq('load_settings: devices validated + deduped', load_settings(cursor()).source_devices,
+		[ 'aa:bb:cc:dd:ee:01', 'aa:bb:cc:dd:ee:02' ]);
+	global.MOCK_UCI.nordvpn.main.source_device = 'aa:bb:cc:dd:ee:03';
+	eq('load_settings: single device string', load_settings(cursor()).source_devices, [ 'aa:bb:cc:dd:ee:03' ]);
+
+	eq('mark: table 100 in the top byte', _routing.device_mark(100), '0x64000000/0xff000000');
+	eq('mark: table id > 255 has none', _routing.device_mark(1000), null);
+	eq('table id: numeric', _routing.rt_table_id('100'), 100);
+	eq('table id: builtin main', _routing.rt_table_id('main'), 254);
+
+	let D1 = 'aa:bb:cc:dd:ee:01', D2 = 'aa:bb:cc:dd:ee:02';
+	let dsteer = function(over) {
+		let base = { name: 'media', enabled: true, interface: 'nordvpn_rs', routing_table: '100',
+			auto_routing: false, killswitch: true, block_ipv6: true, use_vpn_dns: false,
+			source_networks: [], source_devices: [ D1, D2 ] };
+		for (let k in over)
+			base[k] = over[k];
+		return base;
+	};
+	let count = function(conf, role) {
+		let n = [];
+		for (let k in global.MOCK_UCI[conf])
+			if (global.MOCK_UCI[conf][k].nordvpn_role == role)
+				push(n, global.MOCK_UCI[conf][k]);
+		return n;
+	};
+	global.MOCK_UCI = { nordvpn: {
+		main: { '.type': 'instance', interface: 'nordvpn', enabled: '1' },
+		media: { '.type': 'instance', interface: 'nordvpn_rs', enabled: '1', source_device: [ D1, D2 ] }
+	}, network: {
+		nordvpn_rs: { '.type': 'interface', proto: 'wireguard', private_key: KEY, vpn_type: 'nordvpn' },
+		lan: { '.type': 'interface', proto: 'static', ipaddr: '192.168.1.1/24' }
+	}, firewall: {
+		zlan: { '.type': 'zone', name: 'lan', network: [ 'lan' ] },
+		zwan: { '.type': 'zone', name: 'wan', masq: '1', network: [ 'wan' ] }
+	} };
+	let uci = cursor();
+	eq('devices alone make the instance steered', detect_routing(uci, dsteer({}), false).mode, 'steered');
+	let res = enforce_routing(uci, dsteer({}));
+	ok('device steering changes network + firewall', res.changed_network && res.changed_firewall);
+	let marks = count('firewall', 'device_mark');
+	eq('one MARK rule per device', length(marks), 2);
+	let m1 = filter(marks, (r) => r.src_mac == D1)[0];
+	ok('MARK rule shape', m1 && m1.target == 'MARK' && m1.src == '*' && m1.proto == 'all' &&
+		m1.set_xmark == '0x64000000/0xff000000' && m1.nordvpn_iface == 'nordvpn_rs');
+	let lk = count('network', 'dev_lookup');
+	ok('one mark lookup rule into the table',
+		length(lk) == 1 && lk[0].mark == '0x64000000/0xff000000' && lk[0].lookup == '100' && lk[0].priority == '19000');
+	eq('kill switch prohibit for devices', length(count('network', 'dev_ks')), 1);
+	eq('IPv6 prohibit for devices', length(count('network', 'dev_v6')), 1);
+	eq('LAN zone forwards into the VPN zone', length(filter(count('firewall', 'forwarding'),
+		(f) => f.src == 'lan' && f.dest == 'nordvpn_rs')), 1);
+
+	res = enforce_routing(uci, dsteer({}));
+	ok('device steering is idempotent', !res.changed_network && !res.changed_firewall);
+
+	enforce_routing(uci, dsteer({ source_devices: [ D2 ] }));
+	marks = count('firewall', 'device_mark');
+	ok('deselecting removes only that MARK rule', length(marks) == 1 && marks[0].src_mac == D2);
+
+	enforce_routing(uci, dsteer({ killswitch: false, block_ipv6: false }));
+	ok('toggles off drop the device prohibits',
+		length(count('network', 'dev_ks')) == 0 && length(count('network', 'dev_v6')) == 0);
+
+	// Another instance listing the same MAC first owns it.
+	global.MOCK_UCI.nordvpn.main.source_device = [ D1 ];
+	res = enforce_routing(uci, dsteer({}));
+	marks = count('firewall', 'device_mark');
+	ok('a MAC owned by an earlier instance is skipped', length(marks) == 1 && marks[0].src_mac == D2);
+	ok('... with a note', length(filter(res.notes, (n) => index(n, 'already steered by instance main') >= 0)) == 1);
+	delete global.MOCK_UCI.nordvpn.main.source_device;
+
+	res = enforce_routing(uci, dsteer({ routing_table: '1000' }));
+	eq('table id > 255: no MARK rules', length(count('firewall', 'device_mark')), 0);
+	eq('table id > 255: no lookup rule', length(count('network', 'dev_lookup')), 0);
+	ok('table id > 255: note', length(filter(res.notes, (n) => index(n, 'id of 1-255') >= 0)) == 1);
+
+	enforce_routing(uci, dsteer({}));
+	enforce_routing(uci, dsteer({ source_devices: [] }));
+	ok('clearing devices removes every device object',
+		length(count('firewall', 'device_mark')) == 0 && length(count('network', 'dev_lookup')) == 0 &&
+		length(count('network', 'dev_ks')) == 0 && length(count('network', 'dev_v6')) == 0);
+
+	enforce_routing(uci, dsteer({}));
+	enforce_routing(uci, dsteer({ enabled: false }));
+	ok('disabling the instance releases device objects',
+		length(count('firewall', 'device_mark')) == 0 && length(count('network', 'dev_lookup')) == 0);
+
+	enforce_routing(uci, dsteer({}));
+	ok('delete_instance removes device objects',
+		_apply.delete_instance(uci, 'media').ok == true &&
+		length(count('firewall', 'device_mark')) == 0 && length(count('network', 'dev_lookup')) == 0);
 }
 
 // 10. MTU recommendation (pure): WAN MTU minus 80, clamped to [1280, 1420].

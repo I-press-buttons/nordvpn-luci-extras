@@ -28,6 +28,7 @@ const rotate = _rotate.rotate,
       read_state = _rotate.read_state,
       last_attempt_ts = _rotate.last_attempt_ts;
 const next_rotation = require('nordvpn.service').next_rotation;
+const list_clients = require('nordvpn.clients').clients;
 const detect_routing = require('nordvpn.routing').detect;
 const _cache = require('nordvpn.cache');
 const read_cache = _cache.read_cache,
@@ -129,6 +130,14 @@ methods.servers = {
 	}
 };
 
+// Known LAN clients (DHCP leases, static hosts, neighbour table) for the
+// per-device steering picker. Read-only; MACs/IPs validated, names sanitized.
+methods.clients = {
+	call: function() {
+		return { clients: list_clients(cursor()) };
+	}
+};
+
 methods.refresh_status = {
 	call: function() {
 		return read_fetch_status() || { state: 'idle' };
@@ -148,7 +157,7 @@ methods.external_ip = {
 		for (let url in [ 'https://api.ipify.org', 'https://ifconfig.me/ip' ]) {
 			let r = _common.run([ 'curl', '-s', '-m', '8', '--interface', iface, url ]);
 			let ip = trim(r.stdout || '');
-			if (r.code == 0 && length(ip) > 0 && length(ip) <= 45 && match(ip, /^[0-9a-fA-F:.]+$/))
+			if (r.code == 0 && length(ip) > 0 && length(ip) <= 45 && _common.full_match(ip, /^[0-9a-fA-F:.]+$/))
 				return { ip: ip, interface: iface };
 		}
 		return { error: 'could not determine the external IP' };
