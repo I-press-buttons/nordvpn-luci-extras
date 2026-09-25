@@ -47,6 +47,7 @@ var callDisconnect = rpc.declare({ object: 'nordvpn', method: 'disconnect', para
 var callClearCredentials = rpc.declare({ object: 'nordvpn', method: 'clear_credentials', params: [ 'instance' ] });
 var callCreateInstance = rpc.declare({ object: 'nordvpn', method: 'create_instance', params: [ 'instance' ] });
 var callDeleteInstance = rpc.declare({ object: 'nordvpn', method: 'delete_instance', params: [ 'instance' ] });
+var callHistory = rpc.declare({ object: 'nordvpn', method: 'history', params: [ 'instance', 'limit' ] });
 
 // Cadence of the apply watcher. The whole point of the asynchronous apply is to
 // leave rpcd free, so the probe must stay rare compared to the work it watches;
@@ -64,6 +65,10 @@ var APPLY_TIMEOUT_MS = 240000;
 // Cadence of the background status poll, kept in a constant because the apply
 // watcher has to take that poller off the queue and put it back.
 var STATUS_POLL_S = 5;
+// Events shown in the "Recent events" panel (the backend keeps up to 50).
+var HISTORY_LIMIT = 25;
+// A probe target: a dotted-quad IPv4 literal (the backend accepts nothing else).
+var IPV4_RE = /^(25[0-5]|2[0-4]\d|1?\d?\d)(\.(25[0-5]|2[0-4]\d|1?\d?\d)){3}$/;
 
 var STYLE = '' +
 	'.nv-status-main{display:flex;flex-wrap:wrap;align-items:baseline;gap:.75em;font-size:1.05em}' +
@@ -135,6 +140,12 @@ var STYLE = '' +
 	'.nv-token-field .control-group{display:flex;width:100%}' +
 	'.nv-token-field .control-group input{flex:1 1 auto;width:100%}' +
 	'details.nv-advanced>summary{cursor:pointer;font-weight:700;padding:.3em 0}' +
+	// Recent events: flex rows like the instance list, time column first.
+	'.nv-hist-row{display:flex;flex-wrap:wrap;gap:.2em .9em;padding:.35em 0;border-bottom:1px solid var(--border-color-medium,#ddd)}' +
+	'.nv-hist-row:last-child{border-bottom:none}' +
+	'.nv-hist-time{flex:none;min-width:10.5em;color:var(--text-color-medium,#666);font-variant-numeric:tabular-nums}' +
+	'.nv-hist-what{flex:1 1 14em;min-width:0;overflow-wrap:anywhere}' +
+	'.nv-hist-detail{color:var(--text-color-medium,#666);font-size:.92em}' +
 	'.hidden{display:none!important}';
 
 return view.extend({
@@ -161,7 +172,11 @@ return view.extend({
 
 		this.instancesNode = E('div');
 		this.statusNode = E('div');
+		this.historyNode = this.buildHistory();
 		this.formNode = E('div');
+		this.xferSamples = {};
+		this.xferRates = {};
+		this.trackTransfer(this.instances);
 		this.updateInstancesTable();
 		this.updateStatusBand();
 		dom.content(this.formNode, this.buildFormSections());
@@ -171,6 +186,7 @@ return view.extend({
 			E('h2', {}, _('NordVPN')),
 			this.instancesNode,
 			this.statusNode,
+			this.historyNode,
 			this.formNode,
 			this.buildActions()
 		]);
@@ -250,6 +266,7 @@ return view.extend({
 		this.status = this.statusOf(name) || {};
 		this.updateInstancesTable();
 		this.updateStatusBand();
+		this.refreshHistory(true);
 		dom.content(this.formNode, this.buildFormSections());
 	},
 
@@ -344,6 +361,7 @@ return view.extend({
 			connected:      { label: _('Connected'),      color: 'var(--success-color,#2d8f4e)' },
 			connecting:     { label: _('Connecting'),     color: 'var(--warning-color,#b8860b)' },
 			degraded:       { label: _('Degraded'),       color: 'var(--warning-color,#b8860b)' },
+			no_egress:      { label: _('No internet'),    color: 'var(--warning-color,#b8860b)' },
 			disconnected:   { label: _('Disconnected'),   color: 'var(--error-color,#c0392b)' },
 			disabled:       { label: _('Disabled'),       color: 'var(--text-color-medium,#666)' },
 			error:          { label: _('Error'),          color: 'var(--error-color,#c0392b)' },
@@ -366,6 +384,56 @@ return view.extend({
 		if (sec < 90)
 			return _('Handshake %d seconds ago').format(sec);
 		return _('Handshake %d minutes ago').format(Math.floor(sec / 60));
+	},
+
+	// Compact duration: "45 s", "12 min", "3 h 5 min", "2 d 4 h".
+	fmtDuration: function(sec) {
+		sec = Math.max(0, Math.floor(sec));
+		if (sec < 60)
+			return _('%d s').format(sec);
+		if (sec < 3600)
+			return _('%d min').format(Math.floor(sec / 60));
+		if (sec < 86400)
+			return _('%d h %d min').format(Math.floor(sec / 3600), Math.floor(sec % 3600 / 60));
+		return _('%d d %d h').format(Math.floor(sec / 86400), Math.floor(sec % 86400 / 3600));
+	},
+
+	fmtBytes: function(n) {
+		var units = [ 'B', 'KB', 'MB', 'GB', 'TB' ];
+		var i = 0;
+		n = Math.max(0, n || 0);
+		while (n >= 1024 && i < units.length - 1) {
+			n /= 1024;
+			i++;
+		}
+		return (i ? n.toFixed(n < 10 ? 1 : 0) : '' + n) + ' ' + units[i];
+	},
+
+	// Remember each instance's byte counters between polls and derive a rate
+	// from consecutive samples. A new server, a restarted interface (counters
+	// went backwards) or a long gap starts over instead of showing nonsense.
+	trackTransfer: function(list) {
+		var now = Date.now();
+		(list || []).forEach(L.bind(function(st) {
+			var x = st.transfer;
+			var name = st.instance;
+			if (!x) {
+				delete this.xferSamples[name];
+				delete this.xferRates[name];
+				return;
+			}
+			var prev = this.xferSamples[name];
+			var dt = prev ? (now - prev.t) / 1000 : 0;
+			if (prev && prev.gw === st.gateway && dt >= 1 && dt <= 60 &&
+			    x.rx_bytes >= prev.rx && x.tx_bytes >= prev.tx)
+				this.xferRates[name] = {
+					rx: (x.rx_bytes - prev.rx) / dt,
+					tx: (x.tx_bytes - prev.tx) / dt
+				};
+			else if (!prev || prev.gw !== st.gateway || dt > 60)
+				delete this.xferRates[name];
+			this.xferSamples[name] = { t: now, gw: st.gateway, rx: x.rx_bytes, tx: x.tx_bytes };
+		}, this));
 	},
 
 	// Resolve a country code and a city slug to display names from the loaded
@@ -410,7 +478,7 @@ return view.extend({
 		}, _('Reconnect')));
 
 		if (!s.fixed) {
-			var live = (s.state === 'connected' || s.state === 'degraded');
+			var live = (s.state === 'connected' || s.state === 'degraded' || s.state === 'no_egress');
 			btns.push(E('button', {
 				class: 'cbi-button',
 				disabled: !live || null,
@@ -444,9 +512,27 @@ return view.extend({
 			details.push(hs);
 		if (s.endpoint)
 			details.push(_('Endpoint: %s').format(s.endpoint));
+		if (s.uptime != null && s.state !== 'disconnected')
+			details.push(_('Up %s').format(this.fmtDuration(s.uptime)));
+		if (s.transfer) {
+			var xfer = _('Traffic ↓ %s ↑ %s').format(this.fmtBytes(s.transfer.rx_bytes), this.fmtBytes(s.transfer.tx_bytes));
+			var rate = this.xferRates && this.xferRates[this.instance];
+			if (rate && (rate.rx >= 1 || rate.tx >= 1))
+				xfer += ' ' + _('(↓ %s/s ↑ %s/s)').format(this.fmtBytes(rate.rx), this.fmtBytes(rate.tx));
+			details.push(xfer);
+		}
+		var eg = s.egress || {};
+		if (eg.enabled && s.configured && s.enabled !== false) {
+			if (eg.ok === true)
+				details.push(_('Internet check OK'));
+			else if (eg.ok === false)
+				details.push(_('Internet check failed %d times in a row').format(eg.fails || 0));
+			else if (s.state === 'connected')
+				details.push(_('Internet check pending'));
+		}
 		if (s.gateway && /^[a-z]{2}-onion/.test(s.gateway))
 			details.push(_('🧅 Onion over VPN'));
-		if (s.state !== 'connected' && s.routing && s.routing.killswitch)
+		if (s.state !== 'connected' && s.state !== 'no_egress' && s.routing && s.routing.killswitch)
 			details.push(_('Kill switch is blocking LAN traffic'));
 		if (s.state === 'connected') {
 			var ipKey = this.instance + '|' + (s.gateway || '');
@@ -495,12 +581,111 @@ return view.extend({
 		}, this));
 	},
 
+	/* ---- event history ---------------------------------------------- */
+
+	// Built once: the status poll repaints the band every few seconds, and a
+	// <details> inside it would snap shut on every repaint. The list is only
+	// fetched while the panel is open.
+	buildHistory: function() {
+		this.histBody = E('div', {}, E('em', {}, _('Loading…')));
+		this.histDetails = E('details', {
+			class: 'nv-advanced cbi-section',
+			toggle: L.bind(function() { this.refreshHistory(true); }, this)
+		}, [
+			E('summary', {}, _('Recent events')),
+			E('div', { class: 'cbi-section-node' }, this.histBody)
+		]);
+		return this.histDetails;
+	},
+
+	// Fetch and render the selected instance's events when the panel is open.
+	// `reset` shows the loading placeholder first (another instance selected),
+	// so a slow answer never leaves the previous instance's events on screen.
+	refreshHistory: function(reset) {
+		if (!this.histDetails || !this.histDetails.open)
+			return Promise.resolve();
+		var inst = this.instance;
+		if (reset)
+			dom.content(this.histBody, E('em', {}, _('Loading…')));
+		return callHistory(inst, HISTORY_LIMIT).then(L.bind(function(res) {
+			if (inst !== this.instance)
+				return;
+			var events = (res && Array.isArray(res.events)) ? res.events : [];
+			if (!events.length) {
+				dom.content(this.histBody, E('em', {}, _('No events recorded since the router started.')));
+				return;
+			}
+			dom.content(this.histBody, events.map(L.bind(function(ev) {
+				var d = this.describeEvent(ev);
+				var what = [ E('span', { style: d.color ? ('color:' + d.color) : null }, d.text) ];
+				if (d.detail)
+					what.push(E('span', { class: 'nv-hist-detail' }, ' — ' + d.detail));
+				return E('div', { class: 'nv-hist-row' }, [
+					E('span', { class: 'nv-hist-time' }, new Date(ev.ts * 1000).toLocaleString()),
+					E('span', { class: 'nv-hist-what' }, what)
+				]);
+			}, this)));
+		}, this)).catch(L.bind(function(e) {
+			if (inst === this.instance)
+				dom.content(this.histBody, E('em', {}, _('Could not load events: %s').format(e)));
+		}, this));
+	},
+
+	// One history entry as { text, detail, color }. Backend errors and
+	// details arrive in English, like every other backend error on this page.
+	describeEvent: function(ev) {
+		var ok = 'var(--success-color,#2d8f4e)';
+		var warn = 'var(--warning-color,#b8860b)';
+		var bad = 'var(--error-color,#c0392b)';
+		var server = ev.server || '?';
+		var why = {
+			schedule: _('scheduled'),
+			watchdog: _('watchdog'),
+			manual: _('manual')
+		}[ev.reason] || ev.reason || '';
+		var detail = [ ev.error, ev.detail ].filter(Boolean).join(' — ');
+		switch (ev.type) {
+		case 'connect':
+			return { text: _('Connected to %s').format(server), color: ok };
+		case 'connect_failed':
+			return { text: _('Connect failed'), detail: detail, color: bad };
+		case 'rotate':
+			return { text: ev.from
+				? _('Rotated (%s): %s → %s').format(why, ev.from, server)
+				: _('Rotated (%s) to %s').format(why, server), color: ok };
+		case 'rotate_failed':
+			return { text: _('Rotation failed (%s)').format(why), detail: detail, color: bad };
+		case 'rotate_skipped':
+			return { text: _('Rotation skipped (%s)').format(why), detail: detail };
+		case 'watchdog':
+			return { text: _('Watchdog: %s, switching servers').format({
+				connecting: _('stuck connecting'),
+				degraded: _('handshake went stale'),
+				disconnected: _('tunnel down'),
+				no_egress: _('no internet through the tunnel')
+			}[ev.reason] || ev.reason || '?'), detail: detail, color: warn };
+		case 'egress_lost':
+			return { text: _('No internet through %s').format(server), detail: detail, color: warn };
+		case 'egress_restored':
+			return { text: _('Internet through %s is back').format(server), detail: detail, color: ok };
+		case 'disabled':
+			return { text: _('Instance disabled') };
+		case 'credentials_set':
+			return { text: _('Credentials set') };
+		case 'credentials_cleared':
+			return { text: _('Credentials removed') };
+		}
+		return { text: ev.type || _('Unknown'), detail: detail };
+	},
+
 	refreshStatus: function() {
 		return callInstances().then(L.bind(function(res) {
 			this.instances = (res && res.instances) || [];
+			this.trackTransfer(this.instances);
 			this.status = this.statusOf(this.instance) || {};
 			this.updateInstancesTable();
 			this.updateStatusBand();
+			this.refreshHistory();
 			if (this.rotNextSpan)
 				dom.content(this.rotNextSpan, this.nextRotationText());
 			// If the detected routing mode changed underneath an idle form (no
@@ -1395,6 +1580,13 @@ return view.extend({
 		this.wdBox = E('input', { type: 'checkbox', change: L.bind(this.markDirty, this) });
 		this.wdBox.checked = (g('watchdog', '0') === '1');
 
+		this.probeBox = E('input', { type: 'checkbox', change: L.bind(function() {
+			this.markDirty();
+			this.probeTargetsRow.classList.toggle('hidden', !this.probeBox.checked);
+		}, this) });
+		this.probeBox.checked = (g('egress_probe', '0') === '1');
+		var targets = L.toArray(uci.get('nordvpn', this.instance, 'probe_target'));
+
 		var body = E('div', { class: 'cbi-section-node' }, [
 			this.row(_('Interface name'), [ this.input('interface', 'text', g('interface', 'nordvpn')) ],
 				_('Name of the managed WireGuard interface. ⚠ Changing it after setup recreates the tunnel under the new name and orphans the old interface’s firewall/routing objects.')),
@@ -1407,7 +1599,13 @@ return view.extend({
 				_('How many candidate servers a rotation may try')),
 			this.wdRow = this.row(_('Auto-reconnect (watchdog)'), [
 				E('label', { class: 'nv-check' }, [ this.wdBox, _('Reconnect automatically when the tunnel goes stale') ])
-			], _('Auto-reconnect when the tunnel goes stale (handshake-based; no external probe; off when a specific server is pinned)')),
+			], _('Switches to another server when the handshake goes stale — or, with the internet check on, when the tunnel stops forwarding traffic. Off when a specific server is pinned.')),
+			this.row(_('Internet check'), [
+				E('label', { class: 'nv-check' }, [ this.probeBox, _('Ping through the tunnel every 30 seconds') ])
+			], _('Catches a tunnel whose handshake is alive but which forwards nothing. After 3 failed checks in a row it shows as "No internet", and the watchdog (when on) switches servers.')),
+			this.probeTargetsRow = this.row(_('Check targets'), [
+				this.input('probe_target', 'text', targets.join(' '), { placeholder: '1.1.1.1 8.8.8.8', style: 'width:240px' })
+			], _('IPv4 addresses to ping through the tunnel, separated by spaces; a reply from any of them counts. Empty = 1.1.1.1 and 8.8.8.8.')),
 			this.row(_('Cache directory'), [ this.input('cache_dir', 'text', gm('cache_dir', ''), { placeholder: '/tmp' }) ],
 				_('Where to store the downloaded server list, shared by all instances (leave empty for /tmp)')),
 			this.row(_('Server cache'), [
@@ -1424,6 +1622,8 @@ return view.extend({
 			this.maxRetriesRow.classList.add('hidden');
 			this.wdRow.classList.add('hidden');
 		}
+		if (!this.probeBox.checked)
+			this.probeTargetsRow.classList.add('hidden');
 
 		return E('details', { class: 'nv-advanced cbi-section' }, [
 			E('summary', {}, _('Advanced settings')),
@@ -1847,6 +2047,20 @@ return view.extend({
 		// Written unconditionally (not tied to the routing block); the backend
 		// ignores it while a server is pinned.
 		uci.set('nordvpn', inst, 'watchdog', (this.wdBox && this.wdBox.checked) ? '1' : '0');
+
+		// The probe also feeds the status page, so it is independent of the
+		// watchdog and of a pinned server.
+		uci.set('nordvpn', inst, 'egress_probe', (this.probeBox && this.probeBox.checked) ? '1' : '0');
+		var targets = this.probeTargetList();
+		if (targets.length)
+			uci.set('nordvpn', inst, 'probe_target', targets);
+		else
+			uci.unset('nordvpn', inst, 'probe_target');
+	},
+
+	probeTargetList: function() {
+		var el = this.refs.probe_target;
+		return el ? (el.value || '').split(/[\s,]+/).filter(Boolean) : [];
 	},
 
 	save: function() {
@@ -1855,6 +2069,11 @@ return view.extend({
 		var validCount = (this.poolEntries || []).filter(function(e) { return e.count != null; }).length;
 		if (!validCount) {
 			this.notice(_('Please add at least one country or city for this hop mode.'), 'error');
+			return Promise.resolve();
+		}
+		var badTarget = this.probeTargetList().filter(function(t) { return !IPV4_RE.test(t); })[0];
+		if (badTarget) {
+			this.notice(_('Internet check target "%s" is not an IPv4 address.').format(badTarget), 'error');
 			return Promise.resolve();
 		}
 		this.collectIntoUci();
