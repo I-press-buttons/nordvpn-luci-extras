@@ -205,6 +205,8 @@ config instance 'main'
 	option verify_timeout '8'        # seconds to wait for a WG handshake
 	option max_retries '10'          # candidate servers per rotation
 	option watchdog '0'              # auto-reconnect a stale tunnel (off when pinned)
+	option egress_probe '0'          # ping through the tunnel every 30 s (internet check)
+	list probe_target '1.1.1.1'      # IPv4 probe targets; default 1.1.1.1 + 8.8.8.8
 	option auto_routing '1'          # route all LAN traffic via the VPN
 	list source_network 'media'      # or: steer only these networks (see below)
 	option killswitch '0'            # block steered traffic while VPN is down
@@ -240,6 +242,7 @@ Geheimnisse werden nie zurückgegeben.
 ubus call nordvpn status            # runtime state, location, handshake age
 ubus call nordvpn instances         # status of every configured VPN instance
 ubus call nordvpn external_ip       # public IP as seen through the tunnel
+ubus call nordvpn history '{"instance":"main"}'  # recent events, newest first
 ubus call nordvpn disconnect        # take the tunnel down, pause rotation
 ubus call nordvpn clear_credentials # forget the stored WireGuard key
 ubus call nordvpn locations         # cached country/city tree (+ per-city counts)
@@ -260,7 +263,13 @@ administrative `enabled`-Flag (eine deaktivierte Instanz ist absichtlich
 abgeschaltet, nicht bloß getrennt) und `fixed` (ein Server ist angepinnt, also
 ist die Rotation aus); die LuCI-Seite richtet ihre Aktions-Buttons nach beidem
 aus — sie zeigt einen einzelnen Aktivieren/Deaktivieren-Umschalter und
-verbirgt „Jetzt rotieren“ für einen angepinnten Tunnel.
+verbirgt „Jetzt rotieren“ für einen angepinnten Tunnel. Mit aktiver
+Internet-Prüfung bedeutet `no_egress`, dass der Handshake frisch ist, der Tunnel
+aber keinen Traffic weiterleitet (siehe unten); `egress` enthält das Ergebnis
+der letzten Prüfung. Solange das Interface aktiv ist, gibt `uptime` die
+Sekunden seit dem Hochfahren durch netifd an und `transfer`
+(`rx_bytes`/`tx_bytes`) die seitdem durch den Tunnel übertragenen Bytes; die
+LuCI-Seite zeigt beides samt aktuellem Durchsatz.
 
 ### Mehrere VPN-Instanzen
 
@@ -373,11 +382,43 @@ connected ist, sodass ein toter Serverpool nicht bombardiert wird. Die
 Erkennung basiert **nur auf dem Handshake**: der Watchdog bemerkt einen toten
 oder nicht antwortenden Server (abgelaufener WireGuard-Handshake), führt aber
 **keine externe Egress-Probe** durch — ein Tunnel mit lebendigem Handshake,
-aber unterbrochener ausgehender Verbindung wird *nicht* erkannt. Wie die
+aber unterbrochener ausgehender Verbindung wird dafür erst mit der unten
+beschriebenen Internet-Prüfung erkannt. Wie die
 Rotation feuert der Watchdog nie, solange ein bestimmter Server angepinnt ist
 (die LuCI-Checkbox ist dann ausgeblendet), und seine Wiederherstellung läuft
 unter derselben pro-Instanz-Sperre wie die geplante Rotation, sodass sich
 beide niemals überholen.
+
+### Internet-Prüfung (Egress-Probe)
+
+Ein frischer Handshake beweist nur, dass der Server auf WireGuard antwortet,
+nicht dass er Traffic weiterleitet. Die optionale **Internet-Prüfung**
+(**Advanced settings → Internet check** oder `option egress_probe '1'`;
+standardmäßig aus) pingt die Prüfziele alle 30 Sekunden durch den Tunnel — an
+das Tunnel-Device gebunden, sodass auch bei Policy-Routing der VPN-Pfad getestet
+wird, und nur IPv4-Literale, sodass kein DNS nötig ist. Eine Antwort von
+irgendeinem Ziel genügt. Nach **3 fehlgeschlagenen Prüfungen in Folge** wird
+der Zustand der Instanz zu `no_egress` (angezeigt als „No internet“), und bei
+aktivem Watchdog wird das wie ein veralteter Handshake behandelt: nach dessen
+60-Sekunden-Grace-Fenster rotiert er auf einen anderen Server, mit demselben
+Backoff. Fehlschläge gehören zu dem Server, auf dem sie gemessen wurden; eine
+Rotation beginnt die Zählung also neu. Die Prüfung läuft in einem
+Kindprozess und blockiert den Daemon nie. Standardziele sind 1.1.1.1 und
+8.8.8.8; eigene lassen sich mit `list probe_target` (oder dem Feld **Check
+targets**) setzen. Auch bei angepinntem Server läuft die Prüfung zur Anzeige
+weiter; nur der Watchdog bleibt dann aus.
+
+### Ereignisverlauf
+
+Das Backend speichert pro Instanz die letzten 50 Ereignisse — Verbindungen und
+fehlgeschlagene Verbindungen, Rotationen (geplant, manuell oder durch den
+Watchdog, mit altem und neuem Server), übersprungene und fehlgeschlagene
+Rotationen, Watchdog-Wiederherstellungen, verlorenes und wiederhergestelltes
+Internet, Deaktivierungen und Änderungen der Zugangsdaten — in
+`/tmp/nordvpn_events*.json` (Laufzeitzustand, beim Neustart gelöscht). Die
+LuCI-Seite zeigt sie unter **Recent events**; auf der CLI
+`ubus call nordvpn history '{"instance":"main"}'` (optional `limit`). Das
+Löschen oder Zurücksetzen einer Instanz leert ihren Verlauf.
 
 ### Serverlisten-Cache
 
