@@ -54,6 +54,7 @@ config instance 'main'
 	# 103.86.96.96/99.99, blocks ads and malware).
 	option vpn_dns 'off'
 	# Server-list cache directory (empty = /tmp) and background refresh period.
+	# System trees (/etc, /usr, /root, ...) are refused and fall back to /tmp.
 	option cache_dir ''
 	option cache_refresh_interval '21600'
 	# Stamped by the migration/uci-defaults script; gates one-shot migrations.

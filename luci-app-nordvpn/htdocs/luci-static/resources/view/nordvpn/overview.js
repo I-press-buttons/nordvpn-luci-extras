@@ -11,6 +11,21 @@
  * (nordvpn-wireguard); performs no direct privileged filesystem or network ops.
  */
 
+// LuCI's E() hands a bare string child to innerHTML. This view renders server,
+// city and country names from the NordVPN API plus backend error text — none of
+// it markup — so this local E() routes every string child through a text node.
+// Same signatures as dom.create(): E(tag, attr, data) and E(tag, data).
+// dom.content()/dom.append() calls below pass strings wrapped in an array for
+// the same reason.
+var E = function(html, attr, data) {
+	if (!(attr instanceof Object) || Array.isArray(attr))
+		data = attr, attr = null;
+	if (data != null && typeof(data) !== 'function' && !Array.isArray(data) && !dom.elem(data))
+		data = [ '' + data ];
+	// {} rather than null: dom.create() would re-shuffle a null attr and drop data.
+	return dom.create(html, attr || {}, data);
+};
+
 var callInstances = rpc.declare({ object: 'nordvpn', method: 'instances' });
 var callLocations = rpc.declare({ object: 'nordvpn', method: 'locations' });
 var callServers = rpc.declare({ object: 'nordvpn', method: 'servers', params: [ 'locations', 'hop_mode' ] });
@@ -276,7 +291,7 @@ return view.extend({
 		}
 		return callCreateInstance(name).then(L.bind(function(res) {
 			if (res && res.error) {
-				dom.content(err, res.error);
+				dom.content(err, [ res.error ]);
 				return;
 			}
 			ui.hideModal();
@@ -288,7 +303,7 @@ return view.extend({
 				this.notice(_('Instance "%s" created. Set its credentials and pick a country, then save.').format(name), 'info', 6000);
 			}, this));
 		}, this)).catch(L.bind(function(e) {
-			dom.content(err, '' + e);
+			dom.content(err, [ '' + e ]);
 		}, this));
 	},
 
@@ -502,7 +517,7 @@ return view.extend({
 			this.updateInstancesTable();
 			this.updateStatusBand();
 			if (this.rotNextSpan)
-				dom.content(this.rotNextSpan, this.nextRotationText());
+				dom.content(this.rotNextSpan, [ this.nextRotationText() ]);
 			// If the detected routing mode changed underneath an idle form (no
 			// unsaved edits), rebuild it — the panel's shape depends on the mode,
 			// so it must not go stale until a manual page refresh.
@@ -1179,7 +1194,7 @@ return view.extend({
 			summary = total ? _('set: %d countries, ~%d servers').format(groups.length, total)
 				: _('set: %d countries').format(groups.length);
 		this.poolChips.appendChild(this.poolCount);
-		dom.content(this.poolCount, summary);
+		dom.content(this.poolCount, [ summary ]);
 
 		// Guidance: the server list drives the picker, and the set must not be
 		// empty — the connection picks within it.
@@ -1188,7 +1203,7 @@ return view.extend({
 			note = _('Loading server list… use "Refresh server list" in Advanced settings if it does not appear.');
 		else if (!groups.length)
 			note = _('Add at least one country or city.');
-		dom.content(this.poolNote, note);
+		dom.content(this.poolNote, [ note ]);
 		this.poolNote.classList.toggle('hidden', !note);
 		if (this.poolTrigger)
 			this.poolTrigger.disabled = !(this.locations || {}).available;
@@ -1487,7 +1502,7 @@ return view.extend({
 				multihop: _('Country is the exit country (your visible IP); traffic enters through the partner country shown in the server name.'),
 				onion: _('Traffic leaves the VPN server through the Tor network. Noticeably slower, and some sites block Tor exits.')
 			};
-			dom.content(this.hopNote, notes[mode] || '');
+			dom.content(this.hopNote, [ notes[mode] || '' ]);
 			this.hopNote.classList.toggle('hidden', !notes[mode]);
 		}
 	},
@@ -1959,7 +1974,7 @@ return view.extend({
 		return callSetCredentials(token, this.instance).then(L.bind(function(res) {
 			if (res && res.error) {
 				btn.disabled = false;
-				dom.content(err, res.error);
+				dom.content(err, [ res.error ]);
 				return;
 			}
 			ui.hideModal();
@@ -1969,7 +1984,7 @@ return view.extend({
 			}, this));
 		}, this)).catch(function(e) {
 			btn.disabled = false;
-			dom.content(err, '' + e);
+			dom.content(err, [ '' + e ]);
 		});
 	},
 
@@ -1992,14 +2007,14 @@ return view.extend({
 		return callRefreshStatus().then(L.bind(function(st) {
 			var state = st ? st.state : 'idle';
 			if (state === 'running') {
-				dom.content(this.cacheRow, _('Loading… %d servers so far').format((st && st.gateways) || 0));
+				dom.content(this.cacheRow, [ _('Loading… %d servers so far').format((st && st.gateways) || 0) ]);
 				return;
 			}
 			poll.remove(this._cachePoll);
 			btn.disabled = false;
 			return callLocations().then(L.bind(function(loc) {
 				this.locations = loc || { available: false };
-				dom.content(this.cacheRow, this.cacheSummary());
+				dom.content(this.cacheRow, [ this.cacheSummary() ]);
 				this.rebuildPoolWidget();
 				this.refreshServerList();
 			}, this));

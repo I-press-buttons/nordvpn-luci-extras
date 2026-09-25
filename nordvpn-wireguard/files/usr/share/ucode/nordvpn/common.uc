@@ -60,6 +60,15 @@ const WATCHDOG_COOLDOWN_MAX = 900;
 // ── Primitive validators ─────────────────────────────────────────────
 // Each returns a normalized value or null; callers treat null as invalid.
 
+// ucode compiles regex literals with REG_NEWLINE (unless given the /s flag), so
+// ^ and $ also match at line breaks and /^[a-z]+$/ accepts "ok\nanything".
+// Validators therefore match through this helper, which refuses any newline
+// first — REG_NEWLINE only special-cases '\n' — so the anchors cover the whole
+// string on every ucode version.
+function full_match(s, re) {
+	return type(s) == 'string' && index(s, '\n') < 0 && match(s, re) != null;
+}
+
 // Coerce to an integer within [min, max], else null.
 function bounded_int(v, min, max) {
 	let n;
@@ -69,7 +78,7 @@ function bounded_int(v, min, max) {
 	} else if (t == 'double') {
 		n = int(v);
 	} else if (t == 'string') {
-		if (!match(v, /^-?[0-9]+$/))
+		if (!full_match(v, /^-?[0-9]+$/))
 			return null;
 		n = int(v);
 	} else {
@@ -86,14 +95,14 @@ function validate_interface(name) {
 		return null;
 	if (length(name) < 1 || length(name) > 15)
 		return null;
-	return match(name, /^[A-Za-z0-9_]+$/) ? name : null;
+	return full_match(name, /^[A-Za-z0-9_]+$/) ? name : null;
 }
 
 // Exactly 64 hex characters.
 function validate_token(t) {
 	if (type(t) != 'string')
 		return null;
-	return match(t, /^[0-9a-fA-F]{64}$/) ? t : null;
+	return full_match(t, /^[0-9a-fA-F]{64}$/) ? t : null;
 }
 
 // WireGuard base64 key: 32 bytes -> 43 base64 chars + one '=' pad. Checked
@@ -113,7 +122,7 @@ function validate_wg_key(k) {
 function validate_hostname(h) {
 	if (type(h) != 'string' || length(h) < 1 || length(h) > 253)
 		return null;
-	return match(h, /^[A-Za-z0-9._:-]+$/) ? h : null;
+	return full_match(h, /^[A-Za-z0-9._:-]+$/) ? h : null;
 }
 
 function validate_port(p) {
@@ -155,51 +164,93 @@ function validate_interval(v) {
 function validate_time(s) {
 	if (type(s) != 'string')
 		return null;
-	return match(s, /^([01][0-9]|2[0-3]):[0-5][0-9]$/) ? s : null;
+	return full_match(s, /^([01][0-9]|2[0-3]):[0-5][0-9]$/) ? s : null;
 }
 
 function validate_country_code(c) {
 	if (type(c) != 'string')
 		return null;
-	return match(c, /^[A-Za-z]{2}$/) ? lc(c) : null;
+	return full_match(c, /^[A-Za-z]{2}$/) ? lc(c) : null;
 }
 
 // Location/city slug, e.g. "ee-tallinn".
 function validate_location_code(c) {
 	if (type(c) != 'string')
 		return null;
-	return match(c, /^[A-Za-z0-9-]+$/) ? c : null;
+	return full_match(c, /^[A-Za-z0-9-]+$/) ? c : null;
 }
 
 // Instance section name (also used in state-file paths, so keep it strict).
 function validate_instance(n) {
 	if (type(n) != 'string' || length(n) < 1 || length(n) > 32)
 		return null;
-	return match(n, /^[A-Za-z0-9_]+$/) ? n : null;
+	return full_match(n, /^[A-Za-z0-9_]+$/) ? n : null;
 }
 
-// Empty (main table) or a table name/number.
+// Empty (main table) or a table name/number. The name is also written into
+// /etc/iproute2/rt_tables, so keep it strict. The kernel's reserved 'local'
+// (255) and unspec (0) tables are refused: routing the tunnel's default into
+// them breaks the router's own networking.
 function validate_routing_table(t) {
 	if (t == null || t == '')
 		return '';
-	if (type(t) != 'string')
+	if (type(t) != 'string' || length(t) > 31)
 		return null;
-	return match(t, /^[A-Za-z0-9_]+$/) ? t : null;
+	if (!full_match(t, /^[A-Za-z0-9_]+$/))
+		return null;
+	if (t == 'local' || t == 'unspec' || full_match(t, /^0*(0|255)$/))
+		return null;
+	return t;
 }
 
 // Absolute path, no shell/traversal-hostile characters. Char-by-char (no regex)
 // to keep the '/' handling unambiguous.
 const DIR_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._/-';
 
+// System trees the cache file must never land in. Several OpenWrt directories
+// are sourced by /bin/sh as root (/etc/uci-defaults at boot, /etc/hotplug.d on
+// every event), and the cache is JSON built from API data, whose strings sh
+// would expand. The cache belongs in /tmp or on user storage (/mnt, /opt, ...).
+const DIR_DENY = [ '/etc', '/bin', '/sbin', '/lib', '/lib64', '/usr', '/www',
+	'/proc', '/sys', '/dev', '/overlay', '/rom', '/boot', '/root' ];
+
 function validate_dir(d) {
 	if (d == null || d == '')
 		return '';
-	if (type(d) != 'string' || substr(d, 0, 1) != '/')
+	if (type(d) != 'string' || substr(d, 0, 1) != '/' || length(d) > 255)
 		return null;
 	for (let i = 0; i < length(d); i++)
 		if (index(DIR_ALPHABET, substr(d, i, 1)) < 0)
 			return null;
+	// No '.'/'..' segments: '/tmp/../etc' must not slip past the deny list.
+	for (let seg in split(d, '/'))
+		if (seg == '.' || seg == '..')
+			return null;
+	let norm = d;
+	while (length(norm) > 0 && substr(norm, -1) == '/')
+		norm = substr(norm, 0, length(norm) - 1);
+	if (norm == '')
+		return null;
+	for (let p in DIR_DENY)
+		if (norm == p || index(norm + '/', p + '/') == 0)
+			return null;
 	return d;
+}
+
+// Is `iface` safe for this app to (re)configure? True when the network section
+// does not exist yet (set_credentials creates it) or is an interface stamped
+// vpn_type=nordvpn — the stamp every path that creates it sets, and one only
+// the backend writes (the LuCI ACL grants no write access to 'network'). The
+// `interface` option lives in the user-writable nordvpn config, so without this
+// check it could name wan/lan/a user tunnel, which would then be rewritten,
+// taken down or have its peer deleted.
+function managed_interface(uci, iface) {
+	if (!validate_interface(iface))
+		return false;
+	let t = uci.get('network', iface);
+	if (t == null)
+		return true;
+	return t == 'interface' && uci.get('network', iface, 'vpn_type') == 'nordvpn';
 }
 
 // ── Settings ─────────────────────────────────────────────────────────
@@ -289,7 +340,8 @@ function load_settings(uci, instance) {
 		locations: locations,
 		enabled: g('enabled', '0') == '1',
 		interface: validate_interface(g('interface', DEFAULT_INTERFACE)) || DEFAULT_INTERFACE,
-		routing_table: g('routing_table', ''),
+		// Invalid names fall back to the main table (see validate_routing_table).
+		routing_table: validate_routing_table(g('routing_table', '')) || '',
 		// Optional WireGuard interface MTU override; null = keep the netifd
 		// default (1420). Clamped to the valid Ethernet/IPv6 range.
 		mtu: (function() {
@@ -458,9 +510,9 @@ return {
 	MIN_ROTATION_INTERVAL, MAX_ROTATION_INTERVAL, MIN_CACHE_REFRESH, MAX_CACHE_REFRESH,
 	MIN_VERIFY_TIMEOUT, MAX_VERIFY_TIMEOUT,
 	WATCHDOG_GRACE, WATCHDOG_COOLDOWN_BASE, WATCHDOG_COOLDOWN_MAX,
-	bounded_int, validate_interface, validate_token, validate_wg_key, validate_hostname,
+	full_match, bounded_int, validate_interface, validate_token, validate_wg_key, validate_hostname,
 	validate_port, validate_hop_mode, validate_dns_mode, relay_kind, validate_rotation_mode, validate_interval, validate_time,
 	validate_country_code, validate_location_code, validate_instance, validate_routing_table, validate_dir,
-	load_settings, list_instances, globals_section, cache_file_path, iso_ts, redact, log,
+	managed_interface, load_settings, list_instances, globals_section, cache_file_path, iso_ts, redact, log,
 	atomic_write, acquire_lock, release_lock, sh_quote, open_cmd, run
 };

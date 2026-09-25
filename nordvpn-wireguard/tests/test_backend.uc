@@ -758,6 +758,55 @@ write_cache(cache, cpath);
 	eq('status carries the instance name', status(uci, 'media').instance, 'media');
 }
 
+// 9b. Hardening: cache_dir and routing_table validation, relay validation.
+{
+	let vd = _cmn.validate_dir, vt = _cmn.validate_routing_table;
+	eq('dir: /tmp allowed', vd('/tmp'), '/tmp');
+	eq('dir: user storage allowed', vd('/mnt/usb/nordvpn'), '/mnt/usb/nordvpn');
+	eq('dir: /etc/uci-defaults refused (sourced by sh at boot)', vd('/etc/uci-defaults'), null);
+	eq('dir: /etc/hotplug.d refused', vd('/etc/hotplug.d/iface'), null);
+	eq('dir: traversal refused', vd('/tmp/../etc/uci-defaults'), null);
+	eq('dir: trailing slash still refused', vd('/usr/'), null);
+	eq('dir: prefix is by path segment', vd('/etcetera'), '/etcetera');
+	eq('dir: root refused', vd('/'), null);
+	eq('dir: refused dir falls back to /tmp',
+		_cmn.cache_file_path({ cache_dir: '/etc/uci-defaults' }), '/tmp/nordvpn_servers_cache.json');
+	eq('table: name ok', vt('vpn'), 'vpn');
+	eq('table: local refused', vt('local'), null);
+	eq('table: 255 refused', vt('255'), null);
+	eq('table: newline refused', vt('vpn\n100 evil'), null);
+
+	global.MOCK_UCI = { nordvpn: { main: { '.type': 'instance', routing_table: 'local' } } };
+	eq('table: invalid falls back to main', load_settings(cursor()).routing_table, '');
+
+	let k = 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=';
+	let srv = function(host, key, name) {
+		return { hostname: host, name: name, locations: [ { country: { code: 'DE',
+			name: 'Germany', city: { name: 'Berlin' } } } ],
+			technologies: [ { identifier: 'wireguard_udp',
+				metadata: [ { name: 'public_key', value: key } ] } ] };
+	};
+	let n = normalize([ srv('de1.nordvpn.com', k, '<img src=x onerror=alert(1)> #1'),
+		srv('evil;reboot', k, 'x'), srv('de2.nordvpn.com', 'nope', 'y') ]);
+	eq('cache: only the valid relay kept', n.stats.gateways, 1);
+	eq('cache: markup stripped from names', n.countries[0].cities[0].relays[0].name,
+		'img src=x onerror=alert(1) #1');
+
+	global.MOCK_UCI = { nordvpn: { main: { '.type': 'instance', interface: 'nordvpn' } },
+		network: { nordvpn: { '.type': 'interface', vpn_type: 'nordvpn' } } };
+	let uci = cursor();
+	ok('write_relay refuses a bad endpoint', !write_relay(uci, 'nordvpn',
+		{ hostname: 'a b', public_key: k, location: 'de-berlin' }, load_settings(uci)));
+	ok('write_relay refuses a bad key', !write_relay(uci, 'nordvpn',
+		{ hostname: 'de1.nordvpn.com', public_key: 'x', location: 'de-berlin' }, load_settings(uci)));
+	ok('nothing written for a refused relay', global.MOCK_UCI.network.nordvpn.nordvpn_gateway == null);
+
+	ok('managed: missing section is claimable', _cmn.managed_interface(uci, 'nv_new'));
+	ok('managed: stamped interface', _cmn.managed_interface(uci, 'nordvpn'));
+	global.MOCK_UCI.network.wan = { '.type': 'interface', proto: 'dhcp' };
+	ok('managed: wan is not', !_cmn.managed_interface(uci, 'wan'));
+}
+
 // 10. MTU recommendation (pure): WAN MTU minus 80, clamped to [1280, 1420].
 {
 	eq('mtu 1500 -> 1420 (vendor default)', recommend_mtu(1500), 1420);

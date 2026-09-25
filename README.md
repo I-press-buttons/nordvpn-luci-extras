@@ -201,7 +201,7 @@ config instance 'main'
 	option killswitch '0'            # block steered traffic while VPN is down
 	option block_ipv6 '1'            # block direct IPv6 (leak prevention)
 	option vpn_dns 'off'             # off | standard | threat (NordVPN resolvers)
-	option cache_dir ''              # empty = /tmp, shared by all instances
+	option cache_dir ''              # empty = /tmp, shared by all instances; /etc, /usr, /root etc. are refused
 	option cache_refresh_interval '21600'   # seconds, background refresh
 ```
 

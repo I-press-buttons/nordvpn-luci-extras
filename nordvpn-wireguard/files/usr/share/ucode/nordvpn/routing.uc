@@ -135,6 +135,9 @@ function find_managed(uci, sectype, role, iface) {
 // therefore maintains stamped bypass routes for every local IPv4 subnet.
 
 function ip4_to_int(a) {
+	// No newline: ucode's anchors are per-line (see common.full_match).
+	if (type(a) != 'string' || index(a, '\n') >= 0)
+		return null;
 	let m = match(a, /^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$/);
 	if (!m)
 		return null;
@@ -366,7 +369,7 @@ function reconcile_local_routes(uci, iface, table, desired) {
 // the instance's table with a stamped line (best effort). Numeric tables and
 // already-registered names need nothing.
 function ensure_rt_table(name) {
-	if (match(name, /^[0-9]+$/))
+	if (_common.full_match(name, /^[0-9]+$/))
 		return true;
 	let data = readfile(RT_TABLES) || '';
 	let used = {};
@@ -390,7 +393,7 @@ function ensure_rt_table(name) {
 
 // Remove ONLY a stamped rt_tables line for `name`; user entries are kept.
 function drop_rt_table(name) {
-	if (name == null || name == '' || match(name, /^[0-9]+$/))
+	if (name == null || name == '' || _common.full_match(name, /^[0-9]+$/))
 		return;
 	let data = readfile(RT_TABLES);
 	if (!data || index(data, MARK) < 0)

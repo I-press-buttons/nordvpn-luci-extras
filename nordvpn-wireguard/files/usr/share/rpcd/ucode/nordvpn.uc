@@ -148,7 +148,7 @@ methods.external_ip = {
 		for (let url in [ 'https://api.ipify.org', 'https://ifconfig.me/ip' ]) {
 			let r = _common.run([ 'curl', '-s', '-m', '8', '--interface', iface, url ]);
 			let ip = trim(r.stdout || '');
-			if (r.code == 0 && length(ip) > 0 && length(ip) <= 45 && match(ip, /^[0-9a-fA-F:.]+$/))
+			if (r.code == 0 && length(ip) > 0 && length(ip) <= 45 && _common.full_match(ip, /^[0-9a-fA-F:.]+$/))
 				return { ip: ip, interface: iface };
 		}
 		return { error: 'could not determine the external IP' };

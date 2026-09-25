@@ -19,6 +19,9 @@ const FIXED_ADDRESS = _common.FIXED_ADDRESS,
       validate_interface = _common.validate_interface,
       validate_instance = _common.validate_instance,
       validate_wg_key = _common.validate_wg_key,
+      validate_hostname = _common.validate_hostname,
+      validate_port = _common.validate_port,
+      managed_interface = _common.managed_interface,
       iso_ts = _common.iso_ts,
       run = _common.run;
 const _cache = require('nordvpn.cache');
@@ -49,13 +52,15 @@ function find_peer(uci, iface) {
 // shared key reportedly risks being locked by NordVPN when reused). The token
 // is never written to UCI. Returns { ok: true } or { error }.
 function set_credentials(uci, token, instance) {
-	let res = get_private_key(token);
-	if (res.error)
-		return res;
-
 	let iface = validate_interface(load_settings(uci, instance).interface);
 	if (!iface)
 		return { error: 'invalid interface name' };
+	if (!managed_interface(uci, iface))
+		return { error: 'interface ' + iface + ' is not managed by nordvpn' };
+
+	let res = get_private_key(token);
+	if (res.error)
+		return res;
 
 	if (!uci.get('network', iface))
 		uci.set('network', iface, 'interface');
@@ -99,8 +104,14 @@ function restore_peer(uci, iface, saved) {
 		uci.set('network', peer, 'nordvpn_gateway', saved.gateway);
 }
 
-// Write the interface + peer for the chosen relay (no commit).
+// Write the interface + peer for the chosen relay (no commit). The relay comes
+// from the cache file, so its endpoint and key are re-validated here before
+// they reach /etc/config/network. Returns false (nothing written) if invalid.
 function write_relay(uci, iface, relay, s) {
+	if (!relay || !validate_hostname(relay.hostname) || !validate_wg_key(relay.public_key) ||
+	    (relay.port != null && !validate_port(relay.port)))
+		return false;
+
 	uci.set('network', iface, 'proto', 'wireguard');
 	uci.set('network', iface, 'vpn_type', 'nordvpn');
 	uci.set('network', iface, 'auto', '1');
@@ -142,6 +153,7 @@ function write_relay(uci, iface, relay, s) {
 	uci.set('network', peer, 'persistent_keepalive', '' + DEFAULT_KEEPALIVE);
 	uci.set('network', peer, 'allowed_ips', [ '0.0.0.0/0', '::/0' ]);
 	uci.set('network', peer, 'nordvpn_gateway', relay.hostname);
+	return true;
 }
 
 // Bring the managed interface up. iface is whitelist-validated, so the argv is
@@ -197,7 +209,8 @@ function shuffle(list) {
 }
 
 function connect_one(uci, iface, relay, s) {
-	write_relay(uci, iface, relay, s);
+	if (!write_relay(uci, iface, relay, s))
+		return false;
 	uci.commit('network');
 	return bring_up(iface);
 }
@@ -252,6 +265,8 @@ function apply_inner(uci, instance) {
 	let iface = validate_interface(s.interface);
 	if (!iface)
 		return { state: 'failure', error: 'invalid interface name' };
+	if (!managed_interface(uci, iface))
+		return { state: 'failure', error: 'interface ' + iface + ' is not managed by nordvpn' };
 	if (!validate_wg_key(uci.get('network', iface, 'private_key')))
 		return { state: 'failure', error: 'no credentials configured' };
 
@@ -381,7 +396,7 @@ function self_pid() {
 	if (!raw)
 		return null;
 	let first = split(trim(raw), ' ')[0];
-	return match(first, /^[0-9]+$/) ? int(first) : null;
+	return _common.full_match(first, /^[0-9]+$/) ? int(first) : null;
 }
 
 // Is this record a believable 'running' one? A worker can die mid-apply (a
@@ -495,7 +510,7 @@ function start_apply(instance) {
 	let out = trim(r.stdout || '');
 	let started = time();
 	let rec = { instance: name, state: 'running',
-		pid: match(out, /^[0-9]+$/) ? int(out) : null,
+		pid: _common.full_match(out, /^[0-9]+$/) ? int(out) : null,
 		started_at: iso_ts(started), started_at_epoch: started,
 		finished_at: null, result: null, error: null };
 	// The worker writes its own 'running' record before it does any work and
@@ -513,6 +528,8 @@ function disconnect(uci, instance) {
 	let iface = validate_interface(s.interface);
 	if (!iface)
 		return { error: 'invalid interface name' };
+	if (!managed_interface(uci, iface))
+		return { error: 'interface ' + iface + ' is not managed by nordvpn' };
 	uci.set('nordvpn', s.name, 'enabled', '0');
 	uci.commit('nordvpn');
 
@@ -546,6 +563,8 @@ function clear_credentials(uci, instance) {
 	let iface = validate_interface(s.interface);
 	if (!iface)
 		return { error: 'invalid interface name' };
+	if (!managed_interface(uci, iface))
+		return { error: 'interface ' + iface + ' is not managed by nordvpn' };
 	run([ 'ifdown', iface ]);
 	let peer = find_peer(uci, iface);
 	if (peer)
@@ -619,13 +638,17 @@ function delete_instance(uci, name) {
 	if (routing.changed_network || routing.changed_firewall)
 		uci = cursor(); // see apply(): committed deletions break iteration
 
-	run([ 'ifdown', iface ]);
-	let peer = find_peer(uci, iface);
-	if (peer)
-		uci.delete('network', peer);
-	if (uci.get('network', iface) != null && uci.get('network', iface, 'vpn_type') == 'nordvpn')
-		uci.delete('network', iface);
-	uci.commit('network');
+	// The instance section goes either way, but a foreign interface it merely
+	// pointed at (wan, a user tunnel) is never taken down or stripped.
+	if (managed_interface(uci, iface)) {
+		run([ 'ifdown', iface ]);
+		let peer = find_peer(uci, iface);
+		if (peer)
+			uci.delete('network', peer);
+		if (uci.get('network', iface) != null)
+			uci.delete('network', iface);
+		uci.commit('network');
+	}
 
 	if (name == 'main') {
 		let all = uci.get_all('nordvpn', 'main');
