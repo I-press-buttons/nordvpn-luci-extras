@@ -203,6 +203,7 @@ config instance 'main'
 	option auto_routing '1'          # route all LAN traffic via the VPN
 	list source_network 'media'      # or: steer only these networks (see below)
 	list source_device 'aa:bb:cc:dd:ee:ff'  # and/or individual devices, by MAC
+	list steer_domain 'example.com'  # and/or domains (+ subdomains); needs dnsmasq-full
 	option killswitch '0'            # block steered traffic while VPN is down
 	option block_ipv6 '1'            # block direct IPv6 (leak prevention)
 	option vpn_dns 'off'             # off | standard | threat (NordVPN resolvers)
@@ -316,6 +317,32 @@ a routing table with an id of 1–255 — the default, a table named after the
 interface, gets one automatically. A device belongs to one tunnel: a MAC already
 steered by another enabled instance is shown locked in the picker and skipped
 by the backend. The list is hidden while *Route all LAN traffic* is on.
+
+### Steering by domain
+
+**Steered domains** (under Steered devices, or `list steer_domain`) sends
+traffic to specific domains, and their subdomains, through the instance while
+everything else uses the WAN — e.g. only a streaming service through a given
+country. dnsmasq adds every address it resolves for those names to a stamped
+fw4 nft set (`nv_<interface>_dom`), and one stamped firewall rule gives LAN-zone
+packets to those addresses the same mark as steered devices, so they share the device
+lookup rule and the kill-switch / IPv6 prohibit rules. The domain list lives in
+a stamped `config ipset` section in `/etc/config/dhcp`; user sections there are
+never touched.
+
+Limits:
+
+- Needs **dnsmasq with nftset support** — install `dnsmasq-full` in place of
+  `dnsmasq`. Without it the backend creates nothing and the page shows a
+  warning.
+- Only clients that resolve through the router's dnsmasq are steered. Devices
+  or apps with their own DNS (DNS-over-HTTPS, hard-coded resolvers) bypass it.
+- A firewall reload empties the set; the backend restarts dnsmasq after its own
+  changes, and otherwise the set refills as clients look the names up again.
+- IPv4 only, like the tunnel; with *Block direct IPv6* on, IPv6 to those
+  destinations is blocked instead of leaking.
+- Needs a routing table id of 1–255 (as for devices), at most 64 domains per
+  instance, and is hidden while *Route all LAN traffic* is on.
 
 ![VPN instances](docs/screenshots/instances.png)
 
@@ -473,7 +500,7 @@ On every apply the backend first *detects* the current scheme:
   resolve through the tunnel; `off` keeps the system/WAN resolver.
 
 - **Steered** — specific networks are ticked under *Steered networks*
-  (`list source_network`). Only their traffic is policy-routed into the
+  (`list source_network`), or devices / domains are listed (see above). Only their traffic is policy-routed into the
   instance's table; the router's own traffic and other networks are untouched.
   The kill switch / IPv6 toggles become per-network prohibit rules that fire
   only when the tunnel cannot serve the traffic, and every local IPv4 subnet

@@ -1042,6 +1042,8 @@ return view.extend({
 		this.steerRow = null;
 		this.devRow = null;
 		this.devList = null;
+		this.domRow = null;
+		this.domArea = null;
 
 		// Read-only context: the interface and table this instance uses, so the
 		// firewall/routing wiring is visible right here — not only in Advanced.
@@ -1110,6 +1112,8 @@ return view.extend({
 				body.appendChild(this.steerRow);
 			this.devRow = this.buildDevicePicker();
 			body.appendChild(this.devRow);
+			this.domRow = this.buildDomainEditor(rt);
+			body.appendChild(this.domRow);
 			this.ksRow = this.row(_('Kill switch'), [
 				E('label', { class: 'nv-check' }, [ this.ksBox, _('Block LAN internet access while the VPN is down') ])
 			]);
@@ -1129,6 +1133,62 @@ return view.extend({
 			E('legend', {}, _('Traffic routing')),
 			body
 		]);
+	},
+
+	/* ---- per-domain steering ------------------------------------------- */
+
+	// Mirror of the backend's validate_domain(): lower-case, drop a leading
+	// '*.'/'.' and a trailing '.'; null when it is not a plain DNS name.
+	normDomain: function(s) {
+		var d = String(s || '').trim().toLowerCase().replace(/^\*?\./, '').replace(/\.$/, '');
+		if (!d || d.length > 253)
+			return null;
+		return /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$/.test(d) ? d : null;
+	},
+
+	// Split the editor text into { valid (deduped), invalid } entries.
+	parseDomains: function() {
+		var valid = [], invalid = [];
+		var raw = this.domArea ? (this.domArea.value || '').split(/[\s,]+/).filter(Boolean) : [];
+		raw.forEach(L.bind(function(x) {
+			var d = this.normDomain(x);
+			if (!d)
+				invalid.push(x);
+			else if (valid.indexOf(d) < 0)
+				valid.push(d);
+		}, this));
+		return { valid: valid.slice(0, 64), invalid: invalid, capped: valid.length > 64 };
+	},
+
+	steeredDomains: function() {
+		return this.parseDomains().valid;
+	},
+
+	updateDomainNote: function() {
+		if (!this.domNote)
+			return;
+		var p = this.parseDomains();
+		var msgs = [];
+		if (p.invalid.length)
+			msgs.push(_('Ignored (not a domain name): %s').format(p.invalid.join(' ')));
+		if (p.capped)
+			msgs.push(_('Only the first 64 domains are used.'));
+		dom.content(this.domNote, msgs.join(' '));
+		this.domNote.classList.toggle('hidden', !msgs.length);
+	},
+
+	buildDomainEditor: function(rt) {
+		var cur = L.toArray(uci.get('nordvpn', this.instance, 'steer_domain'));
+		this.domArea = E('textarea', { class: 'cbi-input-textarea', rows: 3, style: 'width:100%;max-width:420px',
+			placeholder: 'example.com\nvideo.example.org',
+			input: L.bind(function() { this.updateDomainNote(); this.onRoutingToggle(); }, this) }, cur.join('\n'));
+		this.domNote = E('div', { class: 'cbi-value-description nv-inline-note hidden' });
+		var unsupported = (rt.domain_steering === 'unsupported')
+			? E('div', { class: 'cbi-value-description nv-inline-note' },
+				_('⚠ The installed dnsmasq cannot fill nftables sets, so these domains are not steered. Install dnsmasq-full (replacing dnsmasq) and save again.'))
+			: '';
+		return this.row(_('Steered domains'), [ this.domArea, this.domNote, unsupported ],
+			_('Route only traffic to these domains (and their subdomains) through this instance, one per line. Works for clients that use this router for DNS; apps with their own encrypted DNS bypass it. IPv4 only; needs dnsmasq-full.'));
 	},
 
 	/* ---- per-device steering picker ------------------------------------ */
@@ -1368,9 +1428,11 @@ return view.extend({
 		if (init !== true)
 			this.markDirty();
 		var auto = this.autoRouting && this.autoRouting.checked;
-		var on = auto || this.steeredNetworks().length > 0 || this.steeredDevices().length > 0;
+		var on = auto || this.steeredNetworks().length > 0 || this.steeredDevices().length > 0 ||
+			this.steeredDomains().length > 0;
 		if (this.steerRow) this.steerRow.classList.toggle('hidden', !!auto);
 		if (this.devRow) this.devRow.classList.toggle('hidden', !!auto);
+		if (this.domRow) this.domRow.classList.toggle('hidden', !!auto);
 		if (this.ksRow) this.ksRow.classList.toggle('hidden', !on);
 		if (this.v6Row) this.v6Row.classList.toggle('hidden', !on);
 		if (this.dnsRow) this.dnsRow.classList.toggle('hidden', !on);
@@ -2328,7 +2390,12 @@ return view.extend({
 				uci.set('nordvpn', inst, 'source_network', steered);
 			else
 				uci.unset('nordvpn', inst, 'source_network');
-			if (steered.length || devices.length) {
+			var domains = autoOn ? [] : this.steeredDomains();
+			if (domains.length)
+				uci.set('nordvpn', inst, 'steer_domain', domains);
+			else if (this.domArea)
+				uci.unset('nordvpn', inst, 'steer_domain');
+			if (steered.length || devices.length || domains.length) {
 				// Steering needs a routing table; default to the interface name.
 				var rtb = this.refs.routing_table ? (this.refs.routing_table.value || '').trim()
 					: (uci.get('nordvpn', inst, 'routing_table') || '');

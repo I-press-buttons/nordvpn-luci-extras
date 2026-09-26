@@ -208,6 +208,7 @@ config instance 'main'
 	list probe_target '1.1.1.1'      # IPv4 probe targets; default 1.1.1.1 + 8.8.8.8
 	option auto_routing '1'          # route all LAN traffic via the VPN
 	list source_network 'media'      # or: steer only these networks (see below)
+	list steer_domain 'example.com'  # and/or domains (+ subdomains); needs dnsmasq-full
 	option killswitch '0'            # block steered traffic while VPN is down
 	option block_ipv6 '1'            # block direct IPv6 (leak prevention)
 	option vpn_dns 'off'             # off | standard | threat (NordVPN resolvers)
@@ -306,6 +307,34 @@ ubus call nordvpn refresh_locations # start an async server-list refresh
 WireGuard-линков; ваши собственные маршруты для той же подсети всегда
 побеждают). Либо продолжайте использовать свои собственные правила
 policy-routing (ручной режим определяется и не трогается).
+
+### Направление по доменам
+
+**Steered domains** (Направляемые домены; `list steer_domain`) отправляет
+через инстанс трафик к указанным доменам и их поддоменам, а всё остальное идёт
+через WAN — например, только стриминговый сервис через нужную страну. dnsmasq
+добавляет каждый адрес, который он разрешает для этих имён, в помеченный
+nft-набор fw4 (`nv_<interface>_dom`), а одно помеченное правило файрвола
+ставит пакетам из зоны LAN к этим адресам ту же метку, что и направляемым устройствам, —
+поэтому они используют то же lookup-правило и prohibit-правила kill switch /
+IPv6. Список доменов хранится в помеченной секции `config ipset` в
+`/etc/config/dhcp`; пользовательские секции там не трогаются.
+
+Ограничения:
+
+- Нужен **dnsmasq с поддержкой nftset** — установите `dnsmasq-full` вместо
+  `dnsmasq`. Без него бэкенд ничего не создаёт, а страница показывает
+  предупреждение.
+- Направляются только клиенты, которые разрешают имена через dnsmasq роутера.
+  Устройства и приложения со своим DNS (DNS-over-HTTPS, жёстко заданные
+  резолверы) его обходят.
+- Перезагрузка файрвола очищает набор; после своих изменений бэкенд
+  перезапускает dnsmasq, а в остальных случаях набор заполняется снова, когда
+  клиенты повторно запрашивают имена.
+- Только IPv4, как и туннель; при включённом *Block direct IPv6* IPv6 к этим
+  адресам блокируется, а не утекает.
+- Нужна таблица маршрутизации с id 1–255 (как для устройств), не больше 64
+  доменов на инстанс; скрыто, пока включено *Route all LAN traffic*.
 
 ![VPN-инстансы](docs/screenshots/instances.png)
 

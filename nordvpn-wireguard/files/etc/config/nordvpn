@@ -40,6 +40,9 @@ config instance 'main'
 	# devices (by MAC) through this instance's routing table.
 	# list source_network 'media'
 	# list source_device 'aa:bb:cc:dd:ee:ff'
+	# Steering by destination: traffic to these domains (and subdomains) from
+	# LAN clients using the router's DNS. Needs dnsmasq-full (nftset support).
+	# list steer_domain 'example.com'
 	# Seconds to wait for a WireGuard handshake when verifying a server, and
 	# how many candidate servers a rotation may try before giving up.
 	option verify_timeout '8'

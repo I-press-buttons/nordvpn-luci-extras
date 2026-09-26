@@ -68,6 +68,9 @@ const DEFAULT_PROBE_TARGETS = [ '1.1.1.1', '8.8.8.8' ];
 // Per-instance event history: newest entries kept, older ones dropped.
 const HISTORY_MAX = 50;
 
+// Most domains one instance may steer (each becomes a dnsmasq nftset match).
+const MAX_STEER_DOMAINS = 64;
+
 // ── Primitive validators ─────────────────────────────────────────────
 // Each returns a normalized value or null; callers treat null as invalid.
 
@@ -220,6 +223,22 @@ function validate_ipv4(a) {
 
 // Client MAC address: 'aa:bb:cc:dd:ee:ff', '-' separators, or 12 bare hex
 // digits. Normalized to lowercase colon form, the form stored in UCI.
+// A DNS domain to steer: lower-cased, a leading '*.'/'.' and a trailing '.'
+// dropped (dnsmasq matches subdomains anyway). Letters, digits and hyphens per
+// label, no label starting or ending with '-', 253 characters at most.
+function validate_domain(d) {
+	if (type(d) != 'string')
+		return null;
+	d = lc(trim(d));
+	d = replace(d, /^[*]?[.]/, '');
+	d = replace(d, /[.]$/, '');
+	if (length(d) == 0 || length(d) > 253)
+		return null;
+	if (!full_match(d, /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?([.][a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$/))
+		return null;
+	return d;
+}
+
 function validate_mac(m) {
 	if (type(m) != 'string')
 		return null;
@@ -379,6 +398,16 @@ function load_settings(uci, instance) {
 			push(source_devices, mac);
 	}
 
+	// `list steer_domain` — DNS domains (and their subdomains) whose traffic
+	// is steered through this instance, via dnsmasq nftset. Deduped, capped.
+	let sdm = uci.get('nordvpn', name, 'steer_domain');
+	let steer_domains = [];
+	for (let x in ((type(sdm) == 'array') ? sdm : (sdm != null ? [ sdm ] : []))) {
+		let d = validate_domain(x);
+		if (d && index(steer_domains, d) < 0 && length(steer_domains) < MAX_STEER_DOMAINS)
+			push(steer_domains, d);
+	}
+
 	// `list locations` — the instance's location set: countries ('de') and/or
 	// cities ('de-berlin') that both the initial connect and the rotation pick
 	// from. Empty = the legacy country_code/city_code selection. A city code
@@ -417,6 +446,7 @@ function load_settings(uci, instance) {
 		name: name,
 		source_networks: source_networks,
 		source_devices: source_devices,
+		source_domains: steer_domains,
 		locations: locations,
 		enabled: g('enabled', '0') == '1',
 		interface: validate_interface(g('interface', DEFAULT_INTERFACE)) || DEFAULT_INTERFACE,
@@ -600,11 +630,11 @@ return {
 	MIN_ROTATION_INTERVAL, MAX_ROTATION_INTERVAL, MIN_CACHE_REFRESH, MAX_CACHE_REFRESH,
 	MIN_VERIFY_TIMEOUT, MAX_VERIFY_TIMEOUT,
 	WATCHDOG_GRACE, WATCHDOG_COOLDOWN_BASE, WATCHDOG_COOLDOWN_MAX,
-	PROBE_FAIL_THRESHOLD, PROBE_TIMEOUT, DEFAULT_PROBE_TARGETS, HISTORY_MAX,
+	PROBE_FAIL_THRESHOLD, PROBE_TIMEOUT, DEFAULT_PROBE_TARGETS, HISTORY_MAX, MAX_STEER_DOMAINS,
 	full_match, bounded_int, validate_interface, validate_token, validate_wg_key, validate_hostname,
 	validate_port, validate_hop_mode, validate_dns_mode, relay_kind, validate_selection, validate_server_group, validate_rotation_mode, validate_interval, validate_time,
 	validate_country_code, validate_location_code, validate_instance, validate_routing_table, validate_dir,
-	validate_mac, clean_label, validate_ipv4,
+	validate_mac, validate_domain, clean_label, validate_ipv4,
 	managed_interface, load_settings, list_instances, globals_section, cache_file_path, iso_ts, redact, log,
 	atomic_write, acquire_lock, release_lock, sh_quote, open_cmd, run
 };

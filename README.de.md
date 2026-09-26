@@ -211,6 +211,7 @@ config instance 'main'
 	list probe_target '1.1.1.1'      # IPv4 probe targets; default 1.1.1.1 + 8.8.8.8
 	option auto_routing '1'          # route all LAN traffic via the VPN
 	list source_network 'media'      # or: steer only these networks (see below)
+	list steer_domain 'example.com'  # and/or domains (+ subdomains); needs dnsmasq-full
 	option killswitch '0'            # block steered traffic while VPN is down
 	option block_ipv6 '1'            # block direct IPv6 (leak prevention)
 	option vpn_dns 'off'             # off | standard | threat (NordVPN resolvers)
@@ -310,6 +311,35 @@ IPv4-Subnetz in die Tabelle der Instanz (Interface-Subnetze, statische Routen un
 die Allowed-IPs deiner eigenen WireGuard-Links; deine eigenen Routen für dasselbe
 Subnetz gewinnen immer). Oder du nutzt weiterhin deine eigenen
 Policy-Routing-Regeln (der manuelle Modus wird erkannt und unangetastet gelassen).
+
+### Steuerung nach Domain
+
+**Steered domains** (`list steer_domain`) leitet den Traffic zu bestimmten
+Domains und ihren Subdomains durch die Instanz, während alles andere über das
+WAN geht — etwa nur einen Streamingdienst über ein bestimmtes Land. dnsmasq
+trägt jede Adresse, die es für diese Namen auflöst, in ein gestempeltes
+fw4-nft-Set (`nv_<interface>_dom`) ein, und eine gestempelte Firewall-Regel gibt
+Paketen aus der LAN-Zone an diese Adressen dieselbe Markierung wie gesteuerten Geräten — sie
+teilen sich also deren Lookup-Regel und die Kill-Switch-/IPv6-Prohibit-Regeln.
+Die Domainliste liegt in einem gestempelten `config ipset`-Abschnitt in
+`/etc/config/dhcp`; Abschnitte des Nutzers werden dort nie angefasst.
+
+Einschränkungen:
+
+- Benötigt **dnsmasq mit nftset-Unterstützung** — installiere `dnsmasq-full`
+  anstelle von `dnsmasq`. Ohne es legt das Backend nichts an, und die Seite
+  zeigt eine Warnung.
+- Gesteuert werden nur Clients, die über das dnsmasq des Routers auflösen.
+  Geräte oder Apps mit eigenem DNS (DNS-over-HTTPS, fest eingetragene
+  Resolver) umgehen es.
+- Ein Firewall-Reload leert das Set; nach eigenen Änderungen startet das
+  Backend dnsmasq neu, ansonsten füllt sich das Set wieder, sobald Clients die
+  Namen erneut abfragen.
+- Nur IPv4, wie der Tunnel; mit *Block direct IPv6* wird IPv6 zu diesen Zielen
+  blockiert statt zu lecken.
+- Benötigt eine Routing-Tabelle mit einer ID von 1–255 (wie bei Geräten),
+  höchstens 64 Domains pro Instanz, und ist ausgeblendet, solange *Route all
+  LAN traffic* aktiv ist.
 
 ![VPN-Instanzen](docs/screenshots/instances.png)
 

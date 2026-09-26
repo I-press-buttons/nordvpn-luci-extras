@@ -418,6 +418,31 @@ function device_mark(table_id) {
 	return sprintf('0x%x/0x%x', table_id << 24, DEVICE_MARK_MASK);
 }
 
+// Name of the fw4 nft set (and the dnsmasq nftset target) holding the
+// resolved addresses of an instance's steered domains.
+function domain_set_name(iface) {
+	return 'nv_' + iface + '_dom';
+}
+
+// Whether the installed dnsmasq can fill nft sets (dnsmasq-full; the stock
+// dnsmasq is built without it). Same test as OpenWrt's dnsmasq init script:
+// 'nftset' among the compile-time options ('no-nftset' when absent). Cached
+// for a minute, since rpcd asks on every status poll.
+let nftset_cache = null;
+function nftset_supported() {
+	if (nftset_cache && time() - nftset_cache.at < 60)
+		return nftset_cache.ok;
+	let ok = false;
+	let r = run([ 'dnsmasq', '--version' ]);
+	if (r.code == 0)
+		for (let line in split(r.stdout, '\n'))
+			if (index(line, 'Compile time options:') == 0 &&
+			    index(line + ' ', ' nftset ') >= 0)
+				ok = true;
+	nftset_cache = { at: time(), ok: ok };
+	return ok;
+}
+
 // MAC -> owning instance. A device belongs to at most one tunnel: the first
 // enabled instance (list_instances order, 'main' first) that lists it.
 function device_owners(uci) {
@@ -577,6 +602,39 @@ function reconcile_rules(uci, sectype, role, iface, want_nets, mkopts, key, conf
 	return changed;
 }
 
+// Reconcile the one stamped dnsmasq 'ipset' section of an instance with the
+// wanted domain list (empty = remove it). dnsmasq resolves each domain (and
+// its subdomains) into the fw4 set `setname`. Returns true on change.
+function reconcile_domain_dns(uci, iface, setname, domains) {
+	let have = find_managed_rules(uci, 'ipset', 'domain_dns', iface, 'nordvpn_set', 'dhcp');
+	let changed = false;
+	for (let i = 0; i < length(have); i++) {
+		if (length(domains) == 0 || i > 0) {
+			uci.delete('dhcp', have[i].section);
+			changed = true;
+		}
+	}
+	if (length(domains) == 0)
+		return changed;
+	let sec = length(have) ? have[0].section : null;
+	if (!sec) {
+		sec = uci.add('dhcp', 'ipset');
+		uci.set('dhcp', sec, MARK, '1');
+		uci.set('dhcp', sec, ROLE, 'domain_dns');
+		uci.set('dhcp', sec, 'nordvpn_iface', iface);
+		changed = true;
+	}
+	let want = { nordvpn_set: setname, name: [ setname ], domain: domains,
+		table: 'fw4', table_family: 'inet', family: '4' };
+	for (let k in want) {
+		if (sprintf('%J', uci.get('dhcp', sec, k)) != sprintf('%J', want[k])) {
+			uci.set('dhcp', sec, k, want[k]);
+			changed = true;
+		}
+	}
+	return changed;
+}
+
 // Reconcile stamped firewall forwardings (into the instance zone) with the
 // desired source-zone list. Returns true on change.
 function reconcile_forwardings(uci, iface, dest_zone, want_srcs) {
@@ -641,7 +699,8 @@ function detect(uci, s, runtime) {
 	let iface = s.interface;
 	let zone = find_zone_of(uci, iface);
 	let peer = find_peer(uci, iface);
-	let steering = length(s.source_networks || []) > 0 || length(s.source_devices || []) > 0;
+	let steering = length(s.source_networks || []) > 0 || length(s.source_devices || []) > 0 ||
+		length(s.source_domains || []) > 0;
 	// With steering active, extra user routes INSIDE the instance's table are
 	// legitimate companions (e.g. a media→LAN route); only routes referencing
 	// the interface itself signal a hand-built scheme. Without steering, a
@@ -662,6 +721,11 @@ function detect(uci, s, runtime) {
 		user_routes: user_routes,
 		source_networks: s.source_networks || [],
 		source_devices: s.source_devices || [],
+		source_domains: s.source_domains || [],
+		// 'unsupported' when domains are configured but dnsmasq cannot fill
+		// nft sets (needs dnsmasq-full); null when not checked or not needed.
+		domain_steering: (runtime && length(s.source_domains || []) > 0)
+			? (nftset_supported() ? 'ok' : 'unsupported') : null,
 		route_allowed_ips: peer ? (uci.get('network', peer, 'route_allowed_ips') == '1') : false,
 		killswitch: find_managed(uci, 'rule', 'killswitch') != null ||
 			length(find_managed_rules(uci, 'rule', 'steer_ks', iface)) > 0,
@@ -681,10 +745,12 @@ function detect(uci, s, runtime) {
 // Bring the stamped configuration in line with the settings. Creates objects
 // only in automatic mode; removes ONLY stamped objects when their toggle (or
 // automatic mode itself) is off. Does not commit — the caller owns the
-// transaction. Returns { changed_network, changed_firewall, notes }.
-function enforce(uci, s) {
+// transaction. `opts.nftset` overrides the dnsmasq nftset capability check
+// (tests). Returns { changed_network, changed_firewall, changed_dhcp,
+// domains_active, notes }.
+function enforce(uci, s, opts) {
 	let notes = [];
-	let cn = false, cf = false;
+	let cn = false, cf = false, cd = false;
 	let iface = s.interface;
 	let det = detect(uci, s, false);
 	// A disabled instance releases all managed objects: an explicit Disable
@@ -770,18 +836,58 @@ function enforce(uci, s) {
 			steer_devs = [];
 		}
 	}
-	let marks = (mark && length(steer_devs)) ? [ mark ] : [];
+	// 1b''. Domain steering: dnsmasq resolves the listed domains into a fw4
+	//       nft set, and one MARK rule gives packets to those addresses the
+	//       same mark as steered devices — so the device lookup and prohibit
+	//       rules below route them (and apply the kill switch) unchanged.
+	//       Only LAN-zone traffic is marked: that zone is the one given a
+	//       forwarding into the VPN zone below.
+	let steer_doms = [];
+	if (steer && length(s.source_domains || []) > 0) {
+		let supported = (opts && opts.nftset != null) ? !!opts.nftset : nftset_supported();
+		if (!mark)
+			mark = device_mark(rt_table_id(table));
+		if (!supported)
+			push(notes, 'domain steering needs dnsmasq with nftset support (dnsmasq-full)');
+		else if (!det.lan_zone)
+			push(notes, 'domain steering: could not determine the LAN zone');
+		else if (!mark)
+			push(notes, 'domain steering needs a routing table with an id of 1-255; ' + table + ' has none');
+		else
+			steer_doms = s.source_domains;
+	}
+	let setname = domain_set_name(iface);
+	let dom_sets = length(steer_doms) ? [ setname ] : [];
+	if (reconcile_rules(uci, 'ipset', 'domain_set', iface, dom_sets, function(n) {
+		return { name: n, family: 'ipv4', match: [ 'dest_ip' ] };
+	}, 'name', 'firewall'))
+		cf = true;
+	if (reconcile_rules(uci, 'rule', 'domain_mark', iface, dom_sets, function(n) {
+		return { name: 'NordVPN domains ' + iface, src: det.lan_zone, ipset: n, family: 'ipv4',
+			proto: 'all', target: 'MARK', set_xmark: mark };
+	}, 'ipset', 'firewall'))
+		cf = true;
+	if (reconcile_domain_dns(uci, iface, setname, steer_doms))
+		cd = true;
+
+	let marks = (mark && (length(steer_devs) || length(steer_doms))) ? [ mark ] : [];
 	if (reconcile_rules(uci, 'rule', 'device_mark', iface, steer_devs, function(mac) {
 		return { name: 'NordVPN device ' + mac, src: '*', src_mac: mac, proto: 'all',
 			target: 'MARK', set_xmark: mark };
 	}, 'src_mac', 'firewall'))
 		cf = true;
-	// A table change moves the mark: rewrite MARK rules carrying a stale one.
+	// A table change moves the mark: rewrite MARK rules carrying a stale one
+	// (and a domain rule whose LAN zone was renamed).
 	if (length(marks))
 		uci.foreach('firewall', 'rule', function(sec) {
-			if (sec[MARK] == '1' && sec[ROLE] == 'device_mark' && sec.nordvpn_iface == iface &&
-			    sec.set_xmark != mark) {
+			if (sec[MARK] != '1' || sec.nordvpn_iface != iface)
+				return;
+			if ((sec[ROLE] == 'device_mark' || sec[ROLE] == 'domain_mark') && sec.set_xmark != mark) {
 				uci.set('firewall', sec['.name'], 'set_xmark', mark);
+				cf = true;
+			}
+			if (sec[ROLE] == 'domain_mark' && det.lan_zone && sec.src != det.lan_zone) {
+				uci.set('firewall', sec['.name'], 'src', det.lan_zone);
 				cf = true;
 			}
 		});
@@ -861,6 +967,9 @@ function enforce(uci, s) {
 				}
 				// Steered devices: the zones of the networks they were last
 				// seen on, and the LAN zone for devices currently offline.
+				// Steered domains: any LAN client may resolve them.
+				if (length(steer_doms) && det.lan_zone && index(want_srcs, det.lan_zone) < 0)
+					push(want_srcs, det.lan_zone);
 				if (length(steer_devs)) {
 					let seen = device_zones(uci, steer_devs);
 					if (det.lan_zone)
@@ -958,8 +1067,9 @@ function enforce(uci, s) {
 		cn = true;
 	}
 
-	return { changed_network: cn, changed_firewall: cf, notes: notes };
+	return { changed_network: cn, changed_firewall: cf, changed_dhcp: cd,
+		domains_active: length(steer_doms) > 0, notes: notes };
 }
 
 return { detect, enforce, find_wan_zone, find_lan_zone, count_user_routes, recommend_mtu,
-	rt_table_id, device_mark, device_owners };
+	rt_table_id, device_mark, device_owners, domain_set_name, nftset_supported };
