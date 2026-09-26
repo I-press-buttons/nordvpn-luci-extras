@@ -4,7 +4,7 @@
 
 'use strict';
 
-import { rand, srand } from 'math';
+import { srand } from 'math';
 import { readfile, unlink, stat } from 'fs';
 import { cursor } from 'uci';
 const _common = require('nordvpn.common');
@@ -29,7 +29,8 @@ const read_cache = _cache.read_cache;
 const _select = require('nordvpn.select');
 const selection_candidates = _select.selection_candidates,
       by_hostname = _select.by_hostname,
-      pick = _select.pick;
+      pick = _select.pick,
+      order_candidates = _select.order_candidates;
 const _api = require('nordvpn.api');
 const get_private_key = _api.get_private_key;
 const _routing = require('nordvpn.routing');
@@ -200,15 +201,27 @@ function verify_handshake(iface, seconds) {
 	return false;
 }
 
-function shuffle(list) {
-	let a = [];
-	for (let x in list)
-		push(a, x);
-	for (let i = length(a) - 1; i > 0; i--) {
-		let j = rand() % (i + 1);
-		let t = a[i]; a[i] = a[j]; a[j] = t;
+// Commit and reload whatever an enforce_routing() pass changed. The firewall
+// goes first so the domain nft set exists before dnsmasq is restarted to fill
+// it; a firewall reload also empties that set, so dnsmasq is restarted then
+// too (flushing its cache makes clients' next lookups repopulate the set).
+// Steering/prohibit rules are plain netifd config; a reload makes netifd apply
+// the delta (unchanged interfaces are left alone). True when anything was
+// committed.
+function commit_routing(uci, routing) {
+	if (routing.changed_firewall) {
+		uci.commit('firewall');
+		run([ '/etc/init.d/firewall', 'reload' ]);
 	}
-	return a;
+	if (routing.changed_network) {
+		uci.commit('network');
+		run([ 'ubus', 'call', 'network', 'reload' ]);
+	}
+	if (routing.changed_dhcp)
+		uci.commit('dhcp');
+	if (routing.changed_dhcp || (routing.changed_firewall && routing.domains_active))
+		run([ '/etc/init.d/dnsmasq', 'restart' ]);
+	return !!(routing.changed_firewall || routing.changed_network || routing.changed_dhcp);
 }
 
 function connect_one(uci, iface, relay, s) {
@@ -288,17 +301,7 @@ function apply_inner(uci, instance) {
 	// Reconcile the managed routing/firewall objects with the settings. Only
 	// stamped objects are ever touched; a detected manual scheme is left alone.
 	let routing = enforce_routing(uci, s);
-	if (routing.changed_firewall) {
-		uci.commit('firewall');
-		run([ '/etc/init.d/firewall', 'reload' ]);
-	}
-	if (routing.changed_network) {
-		uci.commit('network');
-		// Steering/prohibit rules are plain netifd config; a reload makes
-		// netifd apply the delta (unchanged interfaces are left alone).
-		run([ 'ubus', 'call', 'network', 'reload' ]);
-	}
-	if (routing.changed_network || routing.changed_firewall) {
+	if (commit_routing(uci, routing)) {
 		// Committing deletions invalidates the cursor's section iteration
 		// state (find_peer silently missed sections) — start fresh.
 		uci = cursor();
@@ -327,7 +330,7 @@ function apply_inner(uci, instance) {
 	let list = selection_candidates(cache, s);
 	if (length(list) == 0)
 		return { state: 'failure', error: 'no matching server found for the current selection' };
-	list = shuffle(list);
+	list = order_candidates(list, s.selection);
 
 	let tries = length(list);
 	if (tries > 4)
@@ -551,15 +554,7 @@ function disconnect(uci, instance) {
 
 	s.enabled = false;
 	let routing = enforce_routing(uci, s);
-	if (routing.changed_firewall) {
-		uci.commit('firewall');
-		run([ '/etc/init.d/firewall', 'reload' ]);
-	}
-	if (routing.changed_network) {
-		uci.commit('network');
-		run([ 'ubus', 'call', 'network', 'reload' ]);
-	}
-	if (routing.changed_network || routing.changed_firewall)
+	if (commit_routing(uci, routing))
 		uci = cursor();
 
 	if (uci.get('network', iface) != null) {
@@ -645,16 +640,9 @@ function delete_instance(uci, name) {
 	s.use_vpn_dns = false;
 	s.source_networks = [];
 	s.source_devices = [];
+	s.source_domains = [];
 	let routing = enforce_routing(uci, s);
-	if (routing.changed_firewall) {
-		uci.commit('firewall');
-		run([ '/etc/init.d/firewall', 'reload' ]);
-	}
-	if (routing.changed_network) {
-		uci.commit('network');
-		run([ 'ubus', 'call', 'network', 'reload' ]);
-	}
-	if (routing.changed_network || routing.changed_firewall)
+	if (commit_routing(uci, routing))
 		uci = cursor(); // see apply(): committed deletions break iteration
 
 	// The instance section goes either way, but a foreign interface it merely

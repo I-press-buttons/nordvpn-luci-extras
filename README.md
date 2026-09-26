@@ -1,103 +1,179 @@
-# NordVPN WireGuard for OpenWrt
+# NordVPN for OpenWrt — LuCI Extras
 
-**English** · [Русский](README.ru.md) · [Deutsch](README.de.md)
-
-Configure NordVPN's WireGuard (NordLynx) service on OpenWrt, with a one-time
-credential exchange, a location set to connect and rotate across (whole
-countries or specific cities, including Double VPN and Onion over VPN), a
-load-aware server picker, automatic rotation, multiple parallel VPN instances,
-per-network traffic steering with kill switch and IPv6 leak protection, and a
-native LuCI page.
-
-> **Unofficial.** This project is not affiliated with, endorsed by, or supported
-> by Nord Security. "NordVPN" and "NordLynx" are trademarks of their respective
-> owners. Use your own NordVPN account and access token.
+Manage NordVPN on your OpenWrt router from the LuCI web interface: sign in
+once, pick where you want to appear, and decide which devices, networks or
+websites go through the VPN. The router keeps the tunnel healthy by itself.
 
 ![LuCI overview page](docs/screenshots/overview.png)
 
-## Architecture
+> **Unofficial.** This project is not affiliated with, endorsed by, or supported
+> by Nord Security. "NordVPN" and "NordLynx" are trademarks of their respective
+> owners. You need your own NordVPN subscription and access token.
 
-The project ships as **two packages** so the VPN service is useful without a web
-interface and the LuCI app stays a thin frontend:
+## What it's for
 
-- **`nordvpn-wireguard`** — the backend (targets `openwrt/packages`,
-  `net/nordvpn-wireguard`). ucode + procd + an rpcd/ubus object. Does credential
-  exchange, server-list caching, WireGuard interface/peer generation,
-  handshake verification, scheduled rotation and runtime status. Works from the
-  CLI and over ubus with no LuCI installed.
-- **`luci-app-nordvpn`** — the LuCI frontend (targets `openwrt/luci`,
-  `applications/luci-app-nordvpn`). A JavaScript view that calls the backend's
-  ubus methods. Performs no privileged filesystem or network-config operations
-  itself.
+NordVPN's own apps run on phones and computers, one device at a time. Running
+the VPN **on the router** covers everything behind it: smart TVs, consoles,
+IoT gadgets and guests, none of which need an app. Doing that by hand on
+OpenWrt means generating WireGuard configs, finding working servers, writing
+policy-routing rules and firewall zones, and fixing things when a server dies.
 
-The browser never receives the access token or the WireGuard private key.
+This project does all of that from one LuCI page:
 
-## Repository layout
+- **Easy setup.** Paste a NordVPN access token, choose countries, press
+  *Save and reconnect*. There are no config files to edit and no keys to copy
+  around.
+- **Choose what goes through the VPN.** Send the whole LAN, only some
+  networks, only some devices, or only some websites.
+- **It maintains itself.** It verifies servers before using them, rotates
+  them on a schedule, and replaces a dead tunnel automatically.
+- **Power-user features.** Several VPN tunnels at once, each in a different
+  country, with Double VPN, Onion over VPN, a kill switch and IPv6 leak
+  protection.
+- **No LuCI required.** The backend works from the command line and over
+  ubus too, so scripts and headless routers can use it.
 
+This is a fork of [**Aladex/nordvpn-luci**](https://github.com/Aladex/nordvpn-luci)
+that adds the extra features marked **(fork)** below.
+
+## Features
+
+### Connecting
+
+- **One-time sign-in.** Your NordVPN token is exchanged for a WireGuard key
+  once and is **never stored**. The browser never sees the token or the key.
+
+  ![Credentials dialog](docs/screenshots/credentials-modal.png)
+
+- **Location sets.** Pick whole countries or specific cities. The first
+  connection and every rotation choose from this set.
+
+  ![Choosing locations](docs/screenshots/locations.gif)
+
+- **Server picker.** It's grouped by country and sorted by load, with a
+  one-click *Lowest load*, or you can leave it on *Automatic*. Pinning a
+  server locks the tunnel to it.
+
+  ![Picking a server](docs/screenshots/server.gif)
+
+- **Hop modes.** *Single hop*, *Multihop* (Double VPN: enter in one country
+  and exit in another), or *Onion over VPN* (exit through Tor). Tor servers
+  are never picked unless you choose that mode.
+
+  ![Onion over VPN mode](docs/screenshots/onion-mode.png)
+
+- **Load-aware server choice (fork).** Automatic connects and rotations
+  prefer lightly loaded servers but still spread out, so several routers or
+  tunnels don't all land on the same one. You can also choose *Lowest load
+  first* or plain *Random*.
+- **P2P servers only (fork).** Limit a tunnel to NordVPN's servers optimised
+  for file sharing. Dedicated IP servers are never picked automatically, but
+  they're tagged in the picker so you can pin your own.
+
+### Staying connected
+
+- **Handshake-verified servers.** NordVPN's list includes dead endpoints, so
+  every candidate server must complete a real WireGuard handshake before it
+  is used. If none do, the last working server is restored.
+- **Scheduled rotation.** Rotate every N minutes or at a set time of day. The
+  page shows when the next rotation will happen.
+
+  ![Automatic rotation](docs/screenshots/rotation.png)
+
+- **Watchdog.** It automatically switches servers when a tunnel goes stale,
+  with backoff so a bad day doesn't hammer the servers.
+- **Internet check.** It pings through the tunnel to catch a server that
+  answers handshakes but forwards no traffic.
+- **Live status.** The page shows the real connected city, the public IP seen
+  through the tunnel, uptime, traffic and throughput, and the recent events
+  (connects, rotations, recoveries) for each tunnel.
+
+### Choosing what goes through the VPN
+
+- **Whole LAN.** A firewall zone and default route through the tunnel. The
+  WAN default route is never modified.
+- **Steered networks.** Only selected networks (for example a *media* or
+  *guest* VLAN) use the tunnel. Local subnets stay reachable.
+
+  ![Steered networks](docs/screenshots/routing-steered.png)
+
+- **Steered devices.** Pick single devices from a searchable list of known
+  clients. They're matched by MAC address, so they stay on the VPN after a
+  new DHCP lease.
+- **Steered domains (fork).** Send only traffic to chosen websites (and
+  their subdomains) through the VPN, for example one streaming service,
+  while everything else uses your normal connection.
+- **Kill switch and IPv6 leak block.** When the tunnel is down, steered
+  traffic is blocked rather than leaking out through the WAN.
+- **NordVPN DNS.** Optionally use NordVPN's resolvers, or Threat Protection,
+  which blocks ads and malware at the DNS level.
+- **Leaves your own setup alone.** If you already route traffic by hand, the
+  app detects it and doesn't touch it. Everything it creates is tagged and
+  removed cleanly.
+
+  ![Manual routing detected](docs/screenshots/routing-manual.png)
+
+### Several tunnels at once
+
+- **Multiple instances.** Run tunnels side by side, for example the main
+  LAN through Germany and a media network through Serbia. Each has its own
+  credentials, locations, schedule and routing.
+
+  ![VPN instances](docs/screenshots/instances.png)
+
+- **Advanced settings.** MTU (with a recommendation calculated from your WAN),
+  connection timeout, server attempts, cache location and more.
+
+  ![Advanced settings](docs/screenshots/advanced.png)
+
+## How it works
+
+```mermaid
+flowchart LR
+    UI["LuCI page<br/>(luci-app-nordvpn)"] -- ubus --> RPC["rpcd object 'nordvpn'"]
+    CLI["CLI / scripts"] -- ubus --> RPC
+    RPC --> BE["nordvpn-wireguard<br/>ucode backend"]
+    D["nordvpn-service daemon<br/>(rotation, watchdog, cache)"] --> BE
+    BE -- "servers, credentials" --> API[("NordVPN API")]
+    BE -- "WireGuard interface + peer" --> NET["/etc/config/network"]
+    BE -- "zones, rules, marks" --> FW["/etc/config/firewall"]
+    BE -- "domain → nft set" --> DNS["/etc/config/dhcp (dnsmasq)"]
 ```
-nordvpn-wireguard/                         # backend package (packages feed)
-├── Makefile
-├── test.sh                                # CI version smoke test
-├── files/etc/config/nordvpn               # non-secret settings (owns config)
-├── files/etc/init.d/nordvpn               # consolidated procd service
-├── files/etc/uci-defaults/90-nordvpn-migrate
-├── files/usr/bin/nordvpn-service          # uloop scheduler daemon
-├── files/usr/bin/nordvpn-cache-update     # one-shot cache worker
-├── files/usr/bin/nordvpn-rotate           # one-shot rotation worker
-├── files/usr/share/rpcd/ucode/nordvpn.uc  # ubus object 'nordvpn'
-├── files/usr/share/ucode/nordvpn/*.uc     # shared ucode modules
-└── tests/                                 # offline ucode fixture/unit tests
 
-luci-app-nordvpn/                          # LuCI frontend (luci feed)
-├── Makefile
-├── htdocs/luci-static/resources/view/nordvpn/overview.js
-├── po/templates/nordvpn.pot
-└── root/usr/share/{luci/menu.d,rpcd/acl.d}/luci-app-nordvpn.json
+The project ships as **two packages**:
 
-docs/screenshots/                          # LuCI page screenshots (README)
-```
-
-## Supported releases
-
-- **Primary:** current OpenWrt master / snapshots (uses `apk`).
-- **Secondary:** OpenWrt 25.12 where APIs and dependencies match.
-- Older releases only via a separately maintained downstream build.
+- **`nordvpn-wireguard`**, the backend (ucode, procd and an rpcd/ubus
+  object). It handles credentials, the server-list cache, WireGuard setup,
+  verification, rotation, routing and status. It works without LuCI.
+- **`luci-app-nordvpn`**, the web page. It's a thin JavaScript view that only
+  calls the backend over ubus and does nothing privileged itself.
 
 ## Installation
 
-### From the signed package feed (recommended)
+Supported: **OpenWrt snapshots** and **OpenWrt 25.12** (both use `apk`).
 
-CI publishes signed, architecture-independent packages for every release to
-<https://aladex.github.io/nordvpn-luci/>.
+### Prebuilt packages from this fork
 
-**OpenWrt 24.10 (opkg):**
-
-```sh
-wget -O /etc/opkg/keys/6bf1f0b6d25ceaad \
-  https://aladex.github.io/nordvpn-luci/keys/6bf1f0b6d25ceaad
-echo 'src/gz nordvpn_luci https://aladex.github.io/nordvpn-luci/packages/opkg' \
-  >> /etc/opkg/customfeeds.conf
-opkg update
-opkg install luci-app-nordvpn        # or just nordvpn-wireguard for headless
-```
-
-**OpenWrt snapshots / 25.x (apk):**
+Every CI run builds architecture-independent `.apk` packages. Download the
+`nordvpn-packages` artifact from a run on the
+[Actions page](https://github.com/I-press-buttons/nordvpn-luci-extras/actions),
+or from [Releases](https://github.com/I-press-buttons/nordvpn-luci-extras/releases)
+once a tagged version is published. Then, on the router:
 
 ```sh
-wget -O /etc/apk/keys/nordvpn-luci-apk.pem \
-  https://aladex.github.io/nordvpn-luci/keys/nordvpn-luci-apk.pem
-echo 'https://aladex.github.io/nordvpn-luci/packages/apk/packages.adb' \
-  >> /etc/apk/repositories.d/customfeeds.list
-apk update
-apk add luci-app-nordvpn
+apk add --allow-untrusted ./nordvpn-wireguard-*.apk ./luci-app-nordvpn-*.apk
 ```
 
-Log out of LuCI and back in after installing, then open **VPN → NordVPN**.
+Log out of LuCI and back in, then open **VPN → NordVPN**. Installing only
+`nordvpn-wireguard` gives you a headless CLI/ubus service.
 
-### From a package feed / snapshot build
+> The signed package feed at `aladex.github.io/nordvpn-luci` belongs to the
+> original project and serves the **upstream** packages, without this fork's
+> additions.
 
-Build with the OpenWrt SDK for your target. The backend is a plain packages-feed
-package; the LuCI app builds inside an `openwrt/luci` checkout.
+### Build from source
+
+Build with the OpenWrt SDK for your target:
 
 ```bash
 # backend (packages feed style)
@@ -111,71 +187,41 @@ cp -r luci-app-nordvpn openwrt-luci/applications/luci-app-nordvpn
 # build via the luci feed as usual
 ```
 
-Install the resulting packages on the router:
+### Optional: domain steering
 
-```bash
-apk add ./nordvpn-wireguard-*.apk ./luci-app-nordvpn-*.apk   # 25.x / snapshots
-# or: opkg install ./nordvpn-wireguard_*.ipk ./luci-app-nordvpn_*.ipk   # 24.10
+Steered domains need a dnsmasq that can fill nftables sets. Replace the
+stock one with the full build. Download it first, because removing dnsmasq
+also stops the router's own DNS:
+
+```sh
+cd /tmp && apk update && apk fetch dnsmasq-full
+apk del dnsmasq && apk add ./dnsmasq-full-*.apk
 ```
 
-Installing `nordvpn-wireguard` alone gives a working CLI/service; add
-`luci-app-nordvpn` for the web UI.
-
-## Usage
+## Quick start
 
 1. Open LuCI → **VPN → NordVPN**.
-2. Click **Set credentials** and paste your 64-character NordVPN access token.
-   It is exchanged once for the WireGuard private key and is **never stored**.
+2. Click **Set credentials** and paste your 64-character access token. To get
+   one, go to
+   <https://my.nordaccount.com/dashboard/nordvpn/manual-configuration/> →
+   **Generate new token** (a non-expiring token is fine).
+3. Choose a **Hop mode** and add one or more **Locations**.
+4. Leave **Server** on *Automatic*, or pin a specific server.
+5. Optionally turn on **Automatic rotation** and choose what to route under
+   **Traffic routing**.
+6. Click **Save and reconnect**.
 
-   ![Credentials dialog](docs/screenshots/credentials-modal.png)
+The page shows *configured* and *connected* as separate states: it only
+reports *Connected* once a real WireGuard handshake has happened.
 
-3. Pick a **Hop mode**:
-   - **Single hop** — a regular VPN server.
-   - **Multihop** (Double VPN) — the selected country is the **exit** country
-     (your visible IP); traffic enters through the partner country shown in the
-     server name ("United Kingdom - Netherlands #10" enters in the UK and exits
-     in the Netherlands).
-   - **Onion over VPN** — traffic leaves the VPN server through the Tor
-     network. Noticeably slower, and some sites block Tor exit nodes. These
-     servers never appear in the other modes, so Tor is always an explicit
-     choice.
+## Reference
 
-   ![Onion over VPN mode](docs/screenshots/onion-mode.png)
+<details>
+<summary><b>Configuration file (<code>/etc/config/nordvpn</code>)</b></summary>
 
-4. Build a **location set** — the countries (and optionally specific cities)
-   this instance connects and rotates across. Pick a country to add the whole
-   country; open its chip to narrow it to specific cities. Both the initial
-   connect and the rotation pick within this set.
-
-   ![Choosing locations](docs/screenshots/locations.gif)
-
-5. Leave **Server** on *Automatic* (recommended) to let rotation choose, or open
-   the picker to pin a specific server. The list is grouped by country and
-   sorted by load, with a one-click **Lowest load**. Pinning a server disables
-   automatic rotation.
-
-   ![Picking a server](docs/screenshots/server.gif)
-
-6. Optionally enable **Automatic rotation** and a schedule. When rotation is
-   active the page shows the concrete **Next rotation** time (router-scheduled,
-   shown in your browser's local time zone).
-
-   ![Automatic rotation](docs/screenshots/rotation.png)
-
-7. Click **Save and reconnect**.
-
-Get a token at
-<https://my.nordaccount.com/dashboard/nordvpn/manual-configuration/> →
-**Generate new token** (a non-expiring token is fine).
-
-A saved configuration and an established tunnel are shown as **different
-states** — the page never claims "Connected" just because settings were saved.
-
-## Configuration (`/etc/config/nordvpn`)
-
-The backend owns non-secret settings here; a fresh install ships **disabled**.
-One `config instance` section per VPN instance ('main' is the default and also
-carries the shared cache options).
+The backend owns the non-secret settings. A fresh install ships **disabled**.
+There's one `config instance` section per tunnel. `main` is the default
+instance and also holds the shared cache options.
 
 ```
 config instance 'main'
@@ -184,6 +230,7 @@ config instance 'main'
 	option routing_table ''
 	option mtu ''                     # empty = default 1420; UI recommends WAN-80
 	option hop_mode 'single'          # 'multihop' (Double VPN) / 'onion' (via Tor)
+	option server_group ''            # '' = any, 'p2p' = P2P servers only (single hop)
 	option country_code 'ee'         # legacy single-country fallback, used only
 	option city_code 'ee-tallinn'    #   when 'locations' below is empty
 	list locations 'ee'              # location set: countries and/or 'cc-city',
@@ -195,12 +242,14 @@ config instance 'main'
 	option rotation_time '04:30'     # HH:MM, router local time
 	option verify_timeout '8'        # seconds to wait for a WG handshake
 	option max_retries '10'          # candidate servers per rotation
+	option selection 'balanced'      # server order: balanced | least_load | random
 	option watchdog '0'              # auto-reconnect a stale tunnel (off when pinned)
 	option egress_probe '0'          # ping through the tunnel every 30 s (internet check)
 	list probe_target '1.1.1.1'      # IPv4 probe targets; default 1.1.1.1 + 8.8.8.8
 	option auto_routing '1'          # route all LAN traffic via the VPN
-	list source_network 'media'      # or: steer only these networks (see below)
+	list source_network 'media'      # or: steer only these networks
 	list source_device 'aa:bb:cc:dd:ee:ff'  # and/or individual devices, by MAC
+	list steer_domain 'example.com'  # and/or domains (+ subdomains); needs dnsmasq-full
 	option killswitch '0'            # block steered traffic while VPN is down
 	option block_ipv6 '1'            # block direct IPv6 (leak prevention)
 	option vpn_dns 'off'             # off | standard | threat (NordVPN resolvers)
@@ -208,25 +257,23 @@ config instance 'main'
 	option cache_refresh_interval '21600'   # seconds, background refresh
 ```
 
-All of these are editable from the LuCI page (most under **Advanced settings**):
+The generated WireGuard interface and peer live in `/etc/config/network` and
+are owned by the backend. The private key is stored there for netifd, but it
+never appears in any status or ubus response.
 
-![Advanced settings](docs/screenshots/advanced.png)
+**MTU** stays at netifd's WireGuard default (1420) unless you set it. The page
+recommends `WAN MTU − 80` (for example 1412 on a 1492 PPPoE line) and offers
+a one-click **Use recommended**. Lower it if pages hang or throughput is
+poor. LTE/5G uplinks often need less. TCP MSS clamping stays on as a
+backstop.
 
-**MTU** is left to netifd's WireGuard default (1420) unless you set it. The page
-computes a recommendation from your WAN's MTU (`WAN − 80`, the WireGuard/UDP/IPv4
-overhead plus a safety margin — e.g. 1412 on a 1492 PPPoE line, matching what
-NordLynx uses) and offers a one-click **Use recommended**. Lower it if pages or
-Gmail hang, or throughput is poor; LTE/5G uplinks often need less. TCP MSS
-clamping (`mtu_fix`) stays on as a backstop.
+</details>
 
-The generated WireGuard interface/peer live in `/etc/config/network` and are
-backend-owned. The private key is stored there for netifd but never appears in
-any status/ubus response.
+<details>
+<summary><b>ubus API</b></summary>
 
-## ubus API
-
-All methods are on the `nordvpn` object. Read methods never mutate; secrets are
-never returned.
+All methods are on the `nordvpn` object. Read methods never change anything,
+and secrets are never returned.
 
 ```bash
 ubus call nordvpn status            # runtime state, location, handshake age
@@ -236,7 +283,7 @@ ubus call nordvpn history '{"instance":"main"}'  # recent events, newest first
 ubus call nordvpn disconnect        # take the tunnel down, pause rotation
 ubus call nordvpn clear_credentials # forget the stored WireGuard key
 ubus call nordvpn locations         # cached country/city tree (+ per-city counts)
-ubus call nordvpn servers '{"locations":["de","nl-amsterdam"],"hop_mode":"single"}'
+ubus call nordvpn servers '{"locations":["de","nl-amsterdam"],"hop_mode":"single","server_group":"p2p"}'
 ubus call nordvpn refresh_status    # cache-refresh job progress
 ubus call nordvpn set_credentials '{"token":"<64-hex-token>"}'
 ubus call nordvpn apply             # rebuild the peer and bring the tunnel up
@@ -244,84 +291,114 @@ ubus call nordvpn rotate_now        # one-shot rotation
 ubus call nordvpn refresh_locations # start an async server-list refresh
 ```
 
-`status` distinguishes *configured* from *connected*: `connected` requires a
-WireGuard handshake fresher than 3 minutes, `degraded` means the interface is
-up but the handshake went stale, and `rotation.next_run` is the epoch of the
-next scheduled rotation (`null` when rotation cannot run). It also reports the
-administrative `enabled` flag (a disabled instance is deliberately down, not
-merely disconnected) and `fixed` (a server is pinned, so rotation is off); the
-LuCI page keys its action buttons on both — showing a single Enable/Disable
-toggle and hiding "Rotate now" for a pinned tunnel. With the internet check on,
-`no_egress` means the handshake is fresh but the tunnel forwards no traffic
-(see below), and `egress` carries the last check's outcome. While the interface
-is up, `uptime` is the seconds since netifd brought it up and `transfer`
-(`rx_bytes`/`tx_bytes`) the bytes through the tunnel since then; the LuCI page
-shows both, plus the current throughput.
+`status`, `apply`, `rotate_now` and `set_credentials` accept an `instance`
+argument (default `main`). `create_instance` and `delete_instance` manage
+instances, and `nordvpn-rotate <name>` rotates one instance from the CLI.
 
-### Multiple VPN instances
+`status` reports these states:
 
-`/etc/config/nordvpn` may contain several `config instance '<name>'` sections
-('main' is the default). Each instance runs its own tunnel on its own
-interface with its own credentials and rotation schedule — e.g. the main
-route through Germany and a media network through Serbia. Issue a separate
-NordVPN access token per instance: reusing one key from several places has
-reportedly led to NordVPN locking it. `status`, `apply`, `rotate_now` and
-`set_credentials` accept an `instance` argument (default `main`);
-`create_instance`/`delete_instance` manage the lifecycle, and
-`nordvpn-rotate <name>` rotates one instance from the CLI. The server-list
-cache is shared.
+- `connected` means a WireGuard handshake happened in the last 3 minutes.
+- `degraded` means the interface is up but the handshake went stale.
+- `no_egress` means the handshake is fresh but nothing gets through (only
+  reported with the internet check on).
 
-The LuCI page lists every instance with its state, server and next rotation;
-clicking a row selects it and the whole form (credentials, country, rotation,
-routing) applies to the selected instance. **Add instance** creates one (it
-gets interface `nv_<name>`), **Delete** tears the tunnel down and removes its
-interface, stamped firewall objects and settings; for 'main' the button is
-**Reset** — the section stays but every option returns to its default. The
-status band shows the connected server's actual city and the public IP seen
-through the tunnel, and offers **Disconnect** (tunnel down, rotation paused
-until the next connect). Credentials can be removed without deleting the
-instance.
+It also reports `enabled`, `fixed` (a server is pinned), `rotation.next_run`,
+and, while the tunnel is up, `uptime` and `transfer`.
 
-To steer only some networks through an instance, pick them under **Steered
-networks** in its Traffic routing panel: the backend maintains stamped policy
-rules (`in <network> lookup <table>`, priority 20000) plus prohibit rules that
-act as a per-network kill switch (optional) and IPv6 leak block (default on) —
-they fire only when the tunnel's table cannot serve the traffic. So that the
-steered default does not swallow local destinations, the backend also mirrors
-every local IPv4 subnet into the instance's table (interface subnets, static
-routes and the allowed-IPs of your own WireGuard links; your own routes for
-the same subnet always win). Or keep using your own policy-routing rules
-(manual mode is detected and left alone).
+Access is gated by the `luci-app-nordvpn` ACL. A read-only LuCI account can't
+call the write methods.
 
-### Steering individual devices
+</details>
 
-Below the networks, **Steered devices** picks single clients instead (or as
-well). The section is collapsed by default; opening it loads the known clients
-(DHCP leases, static leases and the neighbour table) into a searchable list.
-The search is case-insensitive and matches the name, any IP, or the MAC with or
-without separators (`aabb`, `aa:bb` and `AA-BB` all find `aa:bb:…`); a full
-MAC that is not listed can be added by hand. Click a row (or press Space) to
-route that device through this instance; selected rows are highlighted and
-*Selected only* narrows the list to them.
+<details>
+<summary><b>Server verification, rotation and selection</b></summary>
 
-Devices are matched by **MAC address** (`list source_device`), so a new DHCP
-lease keeps them on the tunnel. The backend adds a stamped fw4 rule per device
-that marks its packets, plus one `mark … lookup <table>` rule (priority 19000,
-above the network rules, so a device choice beats its network's), and the same
-kill-switch / IPv6 prohibit rules as networks. The mark is the table id in the
-top byte (`0xff000000` mask, clear of mwan3 and pbr), so device steering needs
-a routing table with an id of 1–255 — the default, a table named after the
-interface, gets one automatically. A device belongs to one tunnel: a MAC already
-steered by another enabled instance is shown locked in the picker and skipped
-by the backend. The list is hidden while *Route all LAN traffic* is on.
+All WireGuard servers in a country share one public key, so a dead endpoint
+still brings the interface "up" without an error. Both **apply** and
+**rotation** therefore wait up to `verify_timeout` seconds for a real
+handshake (`wg show latest-handshakes`) before accepting a server.
 
-![VPN instances](docs/screenshots/instances.png)
+- **Rotation always changes server.** The current server is excluded. Up to
+  `max_retries` candidates are tried, and if none completes a handshake the
+  last working server is restored. If nothing but the current server
+  matches, rotation leaves the working tunnel alone.
+- **Try order** comes from `option selection`:
+  - `balanced` (the default) is a shuffle weighted by `101 − load`.
+  - `least_load` tries servers strictly by load.
+  - `random` ignores load.
 
-Access is gated by the `luci-app-nordvpn` ACL: read methods for read sessions,
-write methods for write sessions. A read-only LuCI account cannot call the write
-methods, and the raw private key is not reachable through UCI or ubus.
+  Load figures come from the cached server list, so they're at most
+  `cache_refresh_interval` (6 h by default) old.
+- **Rotation stays within the hop mode.** Multihop rotates among Double VPN
+  servers with the same exit country. Onion rotates among onion servers
+  only. With `server_group 'p2p'`, single hop rotates among P2P servers only.
+  The smaller pools may have only one server in a location, and then there
+  is nothing to rotate to.
+- **Scheduling.** The rotation clock is saved in
+  `/tmp/nordvpn_rotate_state.json`, so a daemon restart neither resets the
+  schedule nor triggers an extra rotation.
 
-## Services and logs
+</details>
+
+<details>
+<summary><b>Watchdog and internet check</b></summary>
+
+- **Watchdog** (`option watchdog '1'`) is off by default. If a tunnel stays
+  `connecting`, `degraded` or `disconnected` for 60 s, the watchdog rotates
+  to another verified server. Retries back off from 120 s, doubling up to
+  900 s, and the backoff resets once the tunnel reconnects. It never runs
+  while a server is pinned, and it shares a lock with scheduled rotation.
+- **Internet check** (`option egress_probe '1'`) pings the probe targets
+  through the tunnel device every 30 s. It uses IPv4 literals, so no DNS is
+  needed. After 3 failures in a row the state becomes `no_egress`, and the
+  watchdog, if it's on, treats that like a stale handshake. The failure count
+  starts over whenever the server changes.
+
+</details>
+
+<details>
+<summary><b>Traffic routing and firewall details</b></summary>
+
+On every apply the backend first works out which routing mode applies:
+
+- **Manual.** Your own routes or rules reference the VPN interface or its
+  table. The app then doesn't touch routing or the firewall. It only warns
+  if IPv6 could leak.
+- **Automatic** (*Route all LAN traffic*). The backend sets
+  `route_allowed_ips` on the peer, creates a masquerading zone and a
+  LAN → VPN forwarding, and adds optional REJECT rules for the kill switch
+  and IPv6, plus the DNS override.
+- **Steered.** Policy rules send only the selected traffic into the
+  instance's routing table:
+  - **Networks:** `in <network> lookup <table>` at priority 20000.
+  - **Devices:** an fw4 MARK rule per MAC, and one `mark … lookup <table>`
+    rule at priority 19000. The mark is the table id in the top byte
+    (`0xff000000`), which keeps clear of mwan3 and pbr, so the table id must
+    be 1–255. The default table gets one automatically.
+  - **Domains:**
+    - dnsmasq resolves the listed domains into an fw4 nft set
+      (`nv_<interface>_dom`), using a tagged `config ipset` in
+      `/etc/config/dhcp`.
+    - One MARK rule gives LAN traffic to those addresses the device mark.
+    - This needs `dnsmasq-full`; without it nothing is created and the page
+      warns. It's IPv4 only, at most 64 domains per instance, and only works
+      for clients that use the router's DNS (DNS-over-HTTPS bypasses it).
+    - A firewall reload empties the set. The backend restarts dnsmasq after
+      its own changes; otherwise the set refills as clients look the names up
+      again.
+
+  Prohibit rules (priority 21000) act as the kill switch and IPv6 block.
+  They only fire when the tunnel's table can't serve the traffic. Every local
+  IPv4 subnet is mirrored into the table so LAN and VLAN traffic stays local.
+
+Everything the app creates is tagged `nordvpn_managed`. Turning a toggle off
+removes exactly those objects. User zones, forwardings, routes, rules and
+dnsmasq sections are never modified.
+
+</details>
+
+<details>
+<summary><b>Services, logs and cache</b></summary>
 
 ```bash
 service nordvpn status
@@ -329,199 +406,67 @@ service nordvpn version        # installed version
 logread -e nordvpn
 ```
 
-One procd-supervised daemon (`nordvpn-service`) refreshes the cache and runs
-scheduled rotation, re-reading `/etc/config/nordvpn` on every 30-second tick; a
-config change restarts it. The rotation clock is persisted in
-`/tmp/nordvpn_rotate_state.json`, so daemon restarts do not reset the schedule
-or trigger a spurious rotation.
+One procd-supervised daemon (`nordvpn-service`) re-reads the config every
+30 s. It refreshes the server list every `cache_refresh_interval`, and also
+on its first tick if the cache is older than 24 h or was written by an older
+version. **Refresh server list** in the UI runs the same worker on demand.
+Cache writes are atomic and locked, and a failed refresh keeps the previous
+cache.
 
-### Server verification (apply and rotation)
+The last 50 events per instance are kept in `/tmp/nordvpn_events*.json` and
+are cleared on reboot.
 
-NordVPN's server list includes dead endpoints, and all WireGuard servers in a
-country share one public key — so a bad endpoint still brings the interface
-"up" without error. Both **apply** and **rotation** therefore verify each
-candidate by waiting up to `verify_timeout` seconds for an actual **WireGuard
-handshake** (`wg show latest-handshakes`), not by pinging through the tunnel.
-Rotation only ever moves to a **different** server: the current gateway is
-excluded from the candidate set, so a rotation reported as successful has always
-changed the server. It tries up to `max_retries` shuffled candidates and, if none
-complete a handshake, restores the last working peer rather than leaving a dead
-tunnel. When the selection matches no server other than the current one, rotation
-is a no-op and keeps the working tunnel. Apply behaves the same way for automatic
-selections. (`max_retries` is a deliberate bound: a rotation worker must finish
-well within the lock's staleness window so the next scheduled tick cannot start a
-second, overlapping rotation.)
-
-### Rotation across hop modes
-
-Rotation is hop-mode aware — it only considers servers of the instance's own
-kind. A **Multihop** instance rotates among Double VPN servers with the same
-**exit** country (the entry country may change between rotations); an **Onion
-over VPN** instance rotates among onion servers only; single-hop never mixes in
-either. Because the Double VPN and Onion pools are far smaller than the
-single-hop pool, a country — or a pinned city — may expose only one server of
-that kind, in which case there is nothing to rotate to and the current tunnel is
-kept. Onion over VPN exists in only a handful of countries at all, so pairing it
-with a country that has none leaves rotation with no candidates.
-
-### Auto-reconnect (watchdog)
-
-An optional per-instance **watchdog** recovers a tunnel that dies between
-scheduled rotations. Enable it under **Advanced settings → Auto-reconnect
-(watchdog)** or with `option watchdog '1'` (default off; instances that leave
-it off are never even probed). Once enabled, the daemon checks the tunnel
-state on every 30-second tick, and when the state stays `connecting`,
-`degraded`, or `disconnected` for at least 60 seconds (a grace window that
-absorbs both normal connection setup and transient rekeys) it recovers by
-rotating to another verified server. Attempts are
-spaced by an exponential backoff — 120 s, doubling per failed attempt, capped
-at 900 s — that resets as soon as the tunnel is connected again, so a dead
-server pool is not hammered. On its own, detection is **handshake-based**: the
-watchdog notices a dead or unresponsive server (a stale WireGuard handshake),
-but a server whose handshake is alive while it forwards nothing needs the
-internet check below. Like rotation, the
-watchdog never fires while a specific server is pinned (the LuCI checkbox is
-hidden then), and its recovery runs under the same per-instance lock as
-scheduled rotation, so the two never race.
-
-### Internet check (egress probe)
-
-A fresh handshake only proves the server answers WireGuard, not that it
-forwards traffic. The optional **internet check** (**Advanced settings →
-Internet check**, or `option egress_probe '1'`; default off) pings the probe
-targets through the tunnel every 30 seconds — bound to the tunnel device, so
-it tests the VPN path even with policy routing, and IPv4 literals only, so it
-needs no DNS. A reply from any target is a pass. After **3 failed checks in a
-row** the instance's state becomes `no_egress` (shown as "No internet"), and
-when the watchdog is on it treats that like a stale handshake: after its
-60-second grace window it rotates to another server, with the same backoff.
-Failures belong to the server they were measured on, so a rotation starts the
-count over. The check runs in a child process and never blocks the daemon.
-Targets default to 1.1.1.1 and 8.8.8.8; set your own with
-`list probe_target` (or the **Check targets** field). The check also runs for
-a pinned server, for display; only the watchdog stays off then.
-
-### Event history
-
-The backend keeps the last 50 events per instance — connects and failed
-connects, rotations (scheduled, manual or watchdog, with the old and new
-server), skipped and failed rotations, watchdog recoveries, lost and restored
-internet, disables and credential changes — in `/tmp/nordvpn_events*.json`
-(runtime state, cleared on reboot). The LuCI page shows them under **Recent
-events**; from the CLI use `ubus call nordvpn history '{"instance":"main"}'`
-(optional `limit`). Deleting or resetting an instance clears its history.
-
-### Server-list cache
-
-The daemon refreshes the cache automatically: on its first tick after start it
-refreshes if the on-disk cache is older than 24 h, and afterwards every
-`cache_refresh_interval` seconds (6 h by default). The **Refresh server list**
-button in the UI starts the same one-shot worker (`nordvpn-cache-update`)
-asynchronously. Cache writes are atomic (temp file + rename), refreshes are
-serialized with a lock, and a failed refresh keeps the previous good cache.
-
-## Traffic routing & firewall
-
-The **Traffic routing** panel decides how traffic reaches the tunnel.
-On every apply the backend first *detects* the current scheme:
-
-- **Manual** — unstamped routes/rules referencing the VPN interface (or living
-  in the instance's routing table) exist. The package then never touches
-  routing or firewall; the panel is purely informational (with an IPv6-leak
-  warning when the WAN has IPv6). A routing table on its own is **not** manual —
-  tick it a **Steered network** to use it, or add your own policy rules.
-
-  ![Manual routing detected](docs/screenshots/routing-manual.png)
-
-- **Automatic** — *Route all LAN traffic through the VPN* is enabled (the
-  default on fresh installs) and no manual scheme is detected. The backend
-  then maintains: `route_allowed_ips` on the peer (netifd installs the default
-  route via the tunnel and removes it when the interface goes down — the WAN
-  default is never modified), a masquerading firewall zone for the interface,
-  and a forwarding from the LAN zone. Optional toggles add a **kill switch**
-  (a REJECT rule LAN→WAN, so LAN clients get no internet while the VPN is
-  down), an **IPv6 block** (family-ipv6 REJECT LAN→WAN, on by default —
-  NordLynx is IPv4-only inside, so direct IPv6 would bypass the tunnel), and a
-  **DNS override** on the interface: `standard` pushes NordVPN's plain resolver
-  (103.86.96.100 / 99.100), `threat` pushes NordVPN Threat Protection
-  (103.86.96.96 / 99.99, blocking ads and malware at the DNS level). Both only
-  resolve through the tunnel; `off` keeps the system/WAN resolver.
-
-- **Steered** — specific networks are ticked under *Steered networks*
-  (`list source_network`). Only their traffic is policy-routed into the
-  instance's table; the router's own traffic and other networks are untouched.
-  The kill switch / IPv6 toggles become per-network prohibit rules that fire
-  only when the tunnel cannot serve the traffic, and every local IPv4 subnet
-  is mirrored into the table so VLAN-to-VLAN and local services stay
-  reachable (your own routes for a subnet always win).
-
-  ![Steered networks](docs/screenshots/routing-steered.png)
-
-Everything the automatic mode creates is stamped with `nordvpn_managed`;
-disabling a toggle (or automatic mode) removes exactly the stamped objects and
-nothing else. User-created zones, forwardings, routes and rules are never
-modified. Upgrades from the legacy Lua app keep `auto_routing '0'`.
-
-### Custom routing tables (manual mode)
-
-Set **Routing table** (Advanced) to route VPN traffic through a separate table
-(`ip4table`/`ip6table` on the interface), then add rules under
-**Network → Routing → Policy Routing**. The panel switches to *Manual* once
-those rules exist; a table with no rules and no steered network is left in
-*none* mode (the app does nothing) rather than manual, so the routing controls
-stay visible.
+</details>
 
 ## Security
 
-- The access token is exchanged for the private key through an anonymous pipe
-  (curl reads it from a config on `/proc/self/fd`); it never appears in argv, an
-  environment variable, a temp file, or logs, and is never persisted.
-- Every external command is built from an argv list with each argument
-  single-quoted for the shell, and every interpolated value (interface names,
-  hostnames, schedules, cache paths) is whitelist-validated first, so no shell
-  syntax can be injected.
-- All ubus inputs have a fixed schema and are range/format validated.
-- Cache writes are atomic (temp file + rename) and refreshes are serialized by a
-  lock; a failed refresh keeps the last good cache.
+- The access token reaches curl only through an anonymous pipe. It never
+  appears in argv, environment variables, temp files or logs, and it's never
+  saved.
+- External commands are built from argument lists, and every interpolated
+  value (interfaces, hostnames, domains, schedules, paths) is validated
+  against an allow-list first.
+- Every ubus input has a fixed schema and is validated for format and range.
+- The browser never receives the token or the WireGuard private key.
 
-## Upgrade / downgrade
+## Upgrading
 
-Upgrading from the legacy Lua `luci-app-nordvpn` runs a one-time, idempotent
-migration (`uci-defaults`) that copies non-secret settings into
-`/etc/config/nordvpn`, preserves the existing private key and active peer,
-removes any stored token, and drops old cron entries. It does not disconnect a
-working tunnel. Downgrading to the legacy Lua package is not supported (the new
-config layout is not read by it).
+Upgrading from the legacy Lua `luci-app-nordvpn` runs a one-time migration.
+It copies your settings, keeps the existing key and tunnel, and removes any
+stored token and old cron jobs. Downgrading to the Lua package isn't
+supported.
 
 ## Related projects
 
-- [**NordVPN Lite**](https://nordvpn.com/blog/nordvpn-for-openwrt-routers/) —
-  the official, deliberately minimal OpenWrt client: one NordLynx connection,
-  CLI/basic LuCI setup. This project is the power-user alternative: multiple
-  parallel instances with separate credentials, per-network steering with kill
-  switch and IPv6 leak protection, scheduled rotation verified by WireGuard
-  handshake, Double VPN / Onion over VPN as explicit modes, and detection-first
-  safety around hand-built routing.
+- [**Aladex/nordvpn-luci**](https://github.com/Aladex/nordvpn-luci) is the
+  original project this fork is based on, and it has its own signed package
+  feed at <https://aladex.github.io/nordvpn-luci/>.
+- [**NordVPN Lite**](https://nordvpn.com/blog/nordvpn-for-openwrt-routers/) is
+  the official, deliberately minimal OpenWrt client: one NordLynx connection
+  with a basic setup.
 - [**NordVPN-Easy-OpenWrt**](https://github.com/tis24dev/NordVPN-Easy-OpenWrt)
-  — a shell-based community integration with health checks and recovery. This
-  project instead uses native ucode/rpcd/procd with an offline test suite, and
-  covers multi-instance, steering and rotation.
-- Config generators (e.g.
-  [NordVPN-WireGuard-Config-Generator](https://github.com/mustafachyi/NordVPN-WireGuard-Config-Generator))
-  produce static `.conf` files and leave routing, rotation and recovery to you.
+  is a shell-based community integration with health checks and recovery.
+- Config generators such as
+  [NordVPN-WireGuard-Config-Generator](https://github.com/mustafachyi/NordVPN-WireGuard-Config-Generator)
+  produce static `.conf` files and leave routing, rotation and recovery to
+  you.
 
 ## Development
 
-Offline ucode tests (no account or network needed):
+The offline ucode tests need no account and no network:
 
 ```bash
 # with ucode + ucode-mod-fs + ucode-mod-math available
 sh nordvpn-wireguard/tests/run.sh
 ```
 
-CI runs shell/JSON static checks, LuCI ESLint on the JS view, the ucode tests,
-and a snapshot-SDK build of the backend. See `.github/workflows/build.yml`.
+CI (`.github/workflows/build.yml`) runs shell and JSON checks, ESLint on the
+LuCI view, the ucode tests, and a snapshot-SDK build of both packages.
 
-## License
+## Credits and license
 
-[MIT](LICENSE) — do whatever you want with it, just keep the copyright notice.
+Originally created by **Andrey Aleksandrov** ([@Aladex](https://github.com/Aladex))
+as [nordvpn-luci](https://github.com/Aladex/nordvpn-luci). This fork adds
+load-aware selection, the P2P server filter and domain steering on top.
+
+[MIT](LICENSE). Do whatever you want with it, just keep the copyright notice.

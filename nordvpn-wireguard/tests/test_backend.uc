@@ -12,7 +12,8 @@ const normalize = _cache.normalize, write_cache = _cache.write_cache;
 const _select = require('nordvpn.select');
 const candidates = _select.candidates, by_hostname = _select.by_hostname, pick = _select.pick,
       location_candidates = _select.location_candidates,
-      selection_candidates = _select.selection_candidates;
+      selection_candidates = _select.selection_candidates,
+      order_candidates = _select.order_candidates;
 const parse_credentials = require('nordvpn.api').parse_credentials;
 const write_relay = require('nordvpn.apply').write_relay;
 const _apply = require('nordvpn.apply');
@@ -226,6 +227,73 @@ write_cache(cache, cpath);
 	eq('plan uses the location set', length(plan_candidates(cache, { ...sl, max_retries: 10 }, null, 10)), 2);
 	eq('plan set excludes current gateway', plan_candidates(cache, { ...sl, max_retries: 10 }, 'ee70.nordvpn.com', 10)[0].hostname, 'us9999.nordvpn.com');
 	eq('plan falls back when set missing', length(plan_candidates(cache, { ...sg, max_retries: 10 }, null, 10)), 1);
+}
+
+// 6d. load-aware ordering: the selection strategy decides which candidates are
+//     tried first by apply and rotation.
+{
+	let pool = [ { hostname: 'a', load: 95 }, { hostname: 'b', load: 5 },
+		{ hostname: 'c', load: 50 }, { hostname: 'd', load: 5 }, { hostname: 'e' } ];
+
+	let ll = order_candidates(pool, 'least_load');
+	eq('least_load puts the lowest loads first', sort([ ll[0].hostname, ll[1].hostname ]), [ 'b', 'd' ]);
+	eq('least_load puts the highest load last', ll[4].hostname, 'a');
+	eq('least_load treats a missing load as 50', ll[2].hostname == 'c' || ll[2].hostname == 'e', true);
+	eq('order keeps every candidate', length(order_candidates(pool, 'random')), 5);
+	eq('order does not mutate input', pool[0].hostname, 'a');
+	eq('order tolerates garbage', order_candidates(null, 'balanced'), []);
+
+	// balanced: a 5%-load server leads far more often than a 95%-load one,
+	// but the busy one is not starved entirely.
+	let two = [ { hostname: 'busy', load: 95 }, { hostname: 'idle', load: 5 } ];
+	let idle_first = 0, n = 2000;
+	for (let i = 0; i < n; i++)
+		if (order_candidates(two, 'balanced')[0].hostname == 'idle')
+			idle_first++;
+	ok('balanced favours the idle server', idle_first > n * 0.85);
+	ok('balanced still spreads load', idle_first < n);
+	let rnd_first = 0;
+	for (let i = 0; i < n; i++)
+		if (order_candidates(two, 'random')[0].hostname == 'idle')
+			rnd_first++;
+	ok('random ignores load', rnd_first > n * 0.35 && rnd_first < n * 0.65);
+
+	// Settings: default balanced, garbage falls back.
+	global.MOCK_UCI = { nordvpn: { main: { '.type': 'instance', interface: 'nordvpn' } }, network: {} };
+	eq('selection defaults to balanced', load_settings(cursor()).selection, 'balanced');
+	global.MOCK_UCI = { nordvpn: { main: { '.type': 'instance', interface: 'nordvpn', selection: 'least_load' } }, network: {} };
+	eq('selection parses least_load', load_settings(cursor()).selection, 'least_load');
+	global.MOCK_UCI = { nordvpn: { main: { '.type': 'instance', interface: 'nordvpn', selection: 'bogus' } }, network: {} };
+	eq('selection rejects garbage', load_settings(cursor()).selection, 'balanced');
+}
+
+// 6e. server groups: a P2P instance only picks P2P servers; Dedicated IP
+//     servers are never automatic candidates but can still be pinned.
+{
+	let k = cache.countries[0].cities[0].relays[0].public_key;
+	let mk = function(host, groups) {
+		return { hostname: host, station: '192.0.2.60', name: 'Germany', load: 10,
+			locations: [ { country: { name: 'Germany', code: 'DE', city: { name: 'Berlin' } } } ],
+			technologies: [ { identifier: 'wireguard_udp', metadata: [ { name: 'public_key', value: k } ] } ],
+			groups: map(groups, function(g) { return { identifier: g }; }) };
+	};
+	let gc = normalize([ mk('de1.nordvpn.com', [ 'legacy_p2p' ]), mk('de2.nordvpn.com', [ 'legacy_standard' ]),
+		mk('de3.nordvpn.com', [ 'legacy_dedicated_ip' ]) ]);
+	let hosts = function(l) { return sort(map(l, function(r) { return r.hostname; })); };
+	eq('any group excludes dedicated', hosts(candidates(gc, 'de', '', 'single', '')), [ 'de1.nordvpn.com', 'de2.nordvpn.com' ]);
+	eq('p2p group narrows', hosts(candidates(gc, 'de', '', 'single', 'p2p')), [ 'de1.nordvpn.com' ]);
+	eq('p2p through a location set', hosts(selection_candidates(gc,
+		{ locations: [ 'de-berlin' ], hop_mode: 'single', server_group: 'p2p' })), [ 'de1.nordvpn.com' ]);
+	eq('p2p via legacy selection', hosts(selection_candidates(gc,
+		{ country_code: 'de', city_code: '', hop_mode: 'single', server_group: 'p2p' })), [ 'de1.nordvpn.com' ]);
+	eq('dedicated still pinnable', by_hostname(gc, 'de3.nordvpn.com').hostname, 'de3.nordvpn.com');
+
+	global.MOCK_UCI = { nordvpn: { main: { '.type': 'instance', interface: 'nordvpn' } }, network: {} };
+	eq('server_group defaults to any', load_settings(cursor()).server_group, '');
+	global.MOCK_UCI = { nordvpn: { main: { '.type': 'instance', interface: 'nordvpn', server_group: 'p2p' } }, network: {} };
+	eq('server_group parses p2p', load_settings(cursor()).server_group, 'p2p');
+	global.MOCK_UCI = { nordvpn: { main: { '.type': 'instance', interface: 'nordvpn', server_group: 'dedicated' } }, network: {} };
+	eq('server_group rejects others', load_settings(cursor()).server_group, '');
 }
 
 // 7. scheduler decisions (pure)
@@ -910,6 +978,138 @@ write_cache(cache, cpath);
 	ok('delete_instance removes device objects',
 		_apply.delete_instance(uci, 'media').ok == true &&
 		length(count('firewall', 'device_mark')) == 0 && length(count('network', 'dev_lookup')) == 0);
+}
+
+// 9b. domain steering: dnsmasq resolves the listed domains into a stamped fw4
+//     nft set, one MARK rule gives them the instance's device mark, and the
+//     device lookup / prohibit rules route them. Needs dnsmasq nftset support.
+{
+	eq('domain: normalized', _cmn.validate_domain('*.Example.COM.'), 'example.com');
+	eq('domain: leading dot dropped', _cmn.validate_domain('.netflix.com'), 'netflix.com');
+	eq('domain: single label ok', _cmn.validate_domain('lan'), 'lan');
+	eq('domain: slash refused', _cmn.validate_domain('a/b.com'), null);
+	eq('domain: dnsmasq separator refused', _cmn.validate_domain('a.com#1'), null);
+	eq('domain: newline refused', _cmn.validate_domain('a.com\nb.com'), null);
+	eq('domain: hyphen edge refused', _cmn.validate_domain('-a.com'), null);
+	eq('domain: empty refused', _cmn.validate_domain('*.'), null);
+
+	global.MOCK_UCI = { nordvpn: { main: { '.type': 'instance', enabled: '1',
+		steer_domain: [ 'Example.com', 'example.com.', 'bad domain', 'b.org' ] } } };
+	eq('load_settings: domains validated + deduped', load_settings(cursor()).source_domains, [ 'example.com', 'b.org' ]);
+	let many = [];
+	for (let i = 0; i < 80; i++)
+		push(many, 'd' + i + '.com');
+	global.MOCK_UCI.nordvpn.main.steer_domain = many;
+	eq('load_settings: domains capped', length(load_settings(cursor()).source_domains), _cmn.MAX_STEER_DOMAINS);
+
+	let msteer = function(over) {
+		let base = { name: 'media', enabled: true, interface: 'nordvpn_rs', routing_table: '100',
+			auto_routing: false, killswitch: true, block_ipv6: true, use_vpn_dns: false,
+			source_networks: [], source_devices: [], source_domains: [ 'example.com', 'b.org' ] };
+		for (let k in over)
+			base[k] = over[k];
+		return base;
+	};
+	let count = function(conf, role) {
+		let n = [];
+		for (let k in global.MOCK_UCI[conf] || {})
+			if (global.MOCK_UCI[conf][k].nordvpn_role == role)
+				push(n, global.MOCK_UCI[conf][k]);
+		return n;
+	};
+	global.MOCK_UCI = { nordvpn: {
+		main: { '.type': 'instance', interface: 'nordvpn', enabled: '1' },
+		media: { '.type': 'instance', interface: 'nordvpn_rs', enabled: '1' }
+	}, network: {
+		nordvpn_rs: { '.type': 'interface', proto: 'wireguard', private_key: KEY, vpn_type: 'nordvpn' },
+		lan: { '.type': 'interface', proto: 'static', ipaddr: '192.168.1.1/24' }
+	}, firewall: {
+		zlan: { '.type': 'zone', name: 'lan', network: [ 'lan' ] },
+		zwan: { '.type': 'zone', name: 'wan', masq: '1', network: [ 'wan' ] }
+	}, dhcp: {
+		user: { '.type': 'ipset', name: [ 'mine' ], domain: [ 'user.example' ] }
+	} };
+	let uci = cursor();
+	let yes = { nftset: true };
+	eq('domains alone make the instance steered', detect_routing(uci, msteer({}), false).mode, 'steered');
+	let res = enforce_routing(uci, msteer({}), yes);
+	ok('domain steering changes network + firewall + dhcp',
+		res.changed_network && res.changed_firewall && res.changed_dhcp && res.domains_active);
+	let sets = count('firewall', 'domain_set');
+	ok('one fw4 ipset', length(sets) == 1 && sets[0]['.type'] == 'ipset' &&
+		sets[0].name == 'nv_nordvpn_rs_dom' && sets[0].family == 'ipv4' &&
+		sprintf('%J', sets[0].match) == sprintf('%J', [ 'dest_ip' ]));
+	let mr = count('firewall', 'domain_mark');
+	ok('one MARK rule on the set', length(mr) == 1 && mr[0].ipset == 'nv_nordvpn_rs_dom' &&
+		mr[0].target == 'MARK' && mr[0].src == 'lan' && mr[0].set_xmark == '0x64000000/0xff000000');
+	let dd = count('dhcp', 'domain_dns');
+	ok('one dnsmasq nftset section', length(dd) == 1 && dd[0]['.type'] == 'ipset' &&
+		sprintf('%J', dd[0].name) == sprintf('%J', [ 'nv_nordvpn_rs_dom' ]) &&
+		sprintf('%J', dd[0].domain) == sprintf('%J', [ 'example.com', 'b.org' ]) &&
+		dd[0].table == 'fw4' && dd[0].table_family == 'inet' && dd[0].family == '4');
+	let lk = count('network', 'dev_lookup');
+	ok('mark lookup rule shared with devices', length(lk) == 1 && lk[0].lookup == '100' && lk[0].priority == '19000');
+	eq('kill switch prohibit on the mark', length(count('network', 'dev_ks')), 1);
+	eq('LAN zone forwards into the VPN zone', length(filter(count('firewall', 'forwarding'),
+		(f) => f.src == 'lan' && f.dest == 'nordvpn_rs')), 1);
+	ok('user dnsmasq ipset untouched', global.MOCK_UCI.dhcp.user != null && global.MOCK_UCI.dhcp.user.domain[0] == 'user.example');
+
+	res = enforce_routing(uci, msteer({}), yes);
+	ok('domain steering is idempotent', !res.changed_network && !res.changed_firewall && !res.changed_dhcp);
+
+	res = enforce_routing(uci, msteer({ source_domains: [ 'b.org' ] }), yes);
+	dd = count('dhcp', 'domain_dns');
+	ok('editing domains rewrites the one section', res.changed_dhcp && !res.changed_firewall &&
+		length(dd) == 1 && sprintf('%J', dd[0].domain) == sprintf('%J', [ 'b.org' ]));
+
+	res = enforce_routing(uci, msteer({ source_devices: [ 'aa:bb:cc:dd:ee:01' ] }), yes);
+	ok('devices and domains share one lookup rule', length(count('network', 'dev_lookup')) == 1 &&
+		length(count('firewall', 'device_mark')) == 1 && length(count('firewall', 'domain_mark')) == 1);
+
+	res = enforce_routing(uci, msteer({ routing_table: '101' }), yes);
+	ok('a table change moves the domain mark', count('firewall', 'domain_mark')[0].set_xmark == '0x65000000/0xff000000');
+
+	res = enforce_routing(uci, msteer({}), { nftset: false });
+	ok('unsupported dnsmasq: no domain objects', length(count('firewall', 'domain_set')) == 0 &&
+		length(count('firewall', 'domain_mark')) == 0 && length(count('dhcp', 'domain_dns')) == 0 &&
+		length(count('network', 'dev_lookup')) == 0);
+	ok('unsupported dnsmasq: note', length(filter(res.notes, (n) => index(n, 'dnsmasq-full') >= 0)) == 1);
+
+	enforce_routing(uci, msteer({}), yes);
+	res = enforce_routing(uci, msteer({ routing_table: '1000' }), yes);
+	ok('table id > 255: no domain objects', length(count('firewall', 'domain_mark')) == 0 &&
+		length(count('dhcp', 'domain_dns')) == 0);
+
+	let zl = global.MOCK_UCI.firewall.zlan;
+	delete global.MOCK_UCI.firewall.zlan;
+	res = enforce_routing(uci, msteer({}), yes);
+	ok('no LAN zone: no domain objects + note', length(count('dhcp', 'domain_dns')) == 0 &&
+		length(filter(res.notes, (n) => index(n, 'LAN zone') >= 0)) >= 1);
+	global.MOCK_UCI.firewall.zlan = zl;
+
+	enforce_routing(uci, msteer({}), yes);
+	enforce_routing(uci, msteer({ source_domains: [] }), yes);
+	ok('clearing domains removes every domain object', length(count('firewall', 'domain_set')) == 0 &&
+		length(count('firewall', 'domain_mark')) == 0 && length(count('dhcp', 'domain_dns')) == 0 &&
+		length(count('network', 'dev_lookup')) == 0 && global.MOCK_UCI.dhcp.user != null);
+
+	enforce_routing(uci, msteer({}), yes);
+	enforce_routing(uci, msteer({ auto_routing: true }), yes);
+	ok('auto routing drops domain steering', length(count('dhcp', 'domain_dns')) == 0 &&
+		length(count('firewall', 'domain_mark')) == 0);
+
+	enforce_routing(uci, msteer({}), yes);
+	enforce_routing(uci, msteer({ enabled: false }), yes);
+	ok('disabling the instance releases domain objects', length(count('dhcp', 'domain_dns')) == 0 &&
+		length(count('firewall', 'domain_set')) == 0);
+
+	enforce_routing(uci, msteer({}), yes);
+	global.MOCK_UCI.nordvpn.media.steer_domain = [ 'example.com' ];
+	global.MOCK_UCI.nordvpn.media.routing_table = '100';
+	ok('delete_instance removes domain objects',
+		_apply.delete_instance(uci, 'media').ok == true &&
+		length(count('dhcp', 'domain_dns')) == 0 && length(count('firewall', 'domain_set')) == 0 &&
+		length(count('firewall', 'domain_mark')) == 0 && global.MOCK_UCI.dhcp.user != null);
 }
 
 // 10. MTU recommendation (pure): WAN MTU minus 80, clamped to [1280, 1420].

@@ -28,7 +28,7 @@ var E = function(html, attr, data) {
 
 var callInstances = rpc.declare({ object: 'nordvpn', method: 'instances' });
 var callLocations = rpc.declare({ object: 'nordvpn', method: 'locations' });
-var callServers = rpc.declare({ object: 'nordvpn', method: 'servers', params: [ 'locations', 'hop_mode' ] });
+var callServers = rpc.declare({ object: 'nordvpn', method: 'servers', params: [ 'locations', 'hop_mode', 'server_group' ] });
 var callRefreshStatus = rpc.declare({ object: 'nordvpn', method: 'refresh_status' });
 var callSetCredentials = rpc.declare({ object: 'nordvpn', method: 'set_credentials', params: [ 'token', 'instance' ] });
 // LuCI's uci.apply() arms a rollback (10s by default) and confirms it from a
@@ -160,6 +160,7 @@ var STYLE = '' +
 	'.nv-dot-hi{background:#c0392b}' +
 	'.nv-srv-load{color:var(--text-color-medium,#888);font-variant-numeric:tabular-nums;flex:none}' +
 	'.nv-srv-cur{color:#3c8c3c;font-weight:600;flex:none}' +
+	'.nv-srv-tag{flex:none;font-size:.8em;padding:0 .4em;border:1px solid currentColor;border-radius:3px;color:var(--text-color-medium,#888)}' +
 	'.nv-srv-grp{font-weight:600;padding:.35em .5em .15em;color:var(--text-color-medium,#888)}' +
 	'.nv-pool-row.nv-srv-quick{font-weight:600}' +
 	// Plain flex rows (no LuCI .table classes), so the theme's own responsive
@@ -946,6 +947,13 @@ return view.extend({
 			return b;
 		}, this)));
 		this.hopNote = E('div', { class: 'cbi-value-description' });
+
+		// Server group (single hop only): P2P-optimised servers.
+		this.p2pBox = E('input', { type: 'checkbox', change: L.bind(this.onHopChange, this) });
+		this.p2pBox.checked = (uci.get('nordvpn', this.instance, 'server_group') === 'p2p');
+		this.p2pRow = this.row(_('Server type'), [
+			E('label', { class: 'nv-check' }, [ this.p2pBox, _('P2P servers only') ])
+		], _('Limits this instance to NordVPN servers optimised for peer-to-peer (file sharing). Single hop only.'));
 		this.updateHopButtons();
 
 		// Location set editor: a combined country/city picker feeding removable
@@ -1006,6 +1014,7 @@ return view.extend({
 			E('div', { class: 'cbi-section-node' }, [
 				this.row(_('Credentials'), [ E('div', { class: 'nv-inline' }, [ credState, credBtn, credClearBtn ]) ]),
 				this.row(_('Hop mode'), [ seg, this.hopNote ]),
+				this.p2pRow,
 				this.row(_('Locations'), [
 					E('div', {}, [ this.poolChips ]),
 					this.poolWrap,
@@ -1033,6 +1042,8 @@ return view.extend({
 		this.steerRow = null;
 		this.devRow = null;
 		this.devList = null;
+		this.domRow = null;
+		this.domArea = null;
 
 		// Read-only context: the interface and table this instance uses, so the
 		// firewall/routing wiring is visible right here — not only in Advanced.
@@ -1101,6 +1112,8 @@ return view.extend({
 				body.appendChild(this.steerRow);
 			this.devRow = this.buildDevicePicker();
 			body.appendChild(this.devRow);
+			this.domRow = this.buildDomainEditor(rt);
+			body.appendChild(this.domRow);
 			this.ksRow = this.row(_('Kill switch'), [
 				E('label', { class: 'nv-check' }, [ this.ksBox, _('Block LAN internet access while the VPN is down') ])
 			]);
@@ -1120,6 +1133,62 @@ return view.extend({
 			E('legend', {}, _('Traffic routing')),
 			body
 		]);
+	},
+
+	/* ---- per-domain steering ------------------------------------------- */
+
+	// Mirror of the backend's validate_domain(): lower-case, drop a leading
+	// '*.'/'.' and a trailing '.'; null when it is not a plain DNS name.
+	normDomain: function(s) {
+		var d = String(s || '').trim().toLowerCase().replace(/^\*?\./, '').replace(/\.$/, '');
+		if (!d || d.length > 253)
+			return null;
+		return /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$/.test(d) ? d : null;
+	},
+
+	// Split the editor text into { valid (deduped), invalid } entries.
+	parseDomains: function() {
+		var valid = [], invalid = [];
+		var raw = this.domArea ? (this.domArea.value || '').split(/[\s,]+/).filter(Boolean) : [];
+		raw.forEach(L.bind(function(x) {
+			var d = this.normDomain(x);
+			if (!d)
+				invalid.push(x);
+			else if (valid.indexOf(d) < 0)
+				valid.push(d);
+		}, this));
+		return { valid: valid.slice(0, 64), invalid: invalid, capped: valid.length > 64 };
+	},
+
+	steeredDomains: function() {
+		return this.parseDomains().valid;
+	},
+
+	updateDomainNote: function() {
+		if (!this.domNote)
+			return;
+		var p = this.parseDomains();
+		var msgs = [];
+		if (p.invalid.length)
+			msgs.push(_('Ignored (not a domain name): %s').format(p.invalid.join(' ')));
+		if (p.capped)
+			msgs.push(_('Only the first 64 domains are used.'));
+		dom.content(this.domNote, msgs.join(' '));
+		this.domNote.classList.toggle('hidden', !msgs.length);
+	},
+
+	buildDomainEditor: function(rt) {
+		var cur = L.toArray(uci.get('nordvpn', this.instance, 'steer_domain'));
+		this.domArea = E('textarea', { class: 'cbi-input-textarea', rows: 3, style: 'width:100%;max-width:420px',
+			placeholder: 'example.com\nvideo.example.org',
+			input: L.bind(function() { this.updateDomainNote(); this.onRoutingToggle(); }, this) }, cur.join('\n'));
+		this.domNote = E('div', { class: 'cbi-value-description nv-inline-note hidden' });
+		var unsupported = (rt.domain_steering === 'unsupported')
+			? E('div', { class: 'cbi-value-description nv-inline-note' },
+				_('⚠ The installed dnsmasq cannot fill nftables sets, so these domains are not steered. Install dnsmasq-full (replacing dnsmasq) and save again.'))
+			: '';
+		return this.row(_('Steered domains'), [ this.domArea, this.domNote, unsupported ],
+			_('Route only traffic to these domains (and their subdomains) through this instance, one per line. Works for clients that use this router for DNS; apps with their own encrypted DNS bypass it. IPv4 only; needs dnsmasq-full.'));
 	},
 
 	/* ---- per-device steering picker ------------------------------------ */
@@ -1359,9 +1428,11 @@ return view.extend({
 		if (init !== true)
 			this.markDirty();
 		var auto = this.autoRouting && this.autoRouting.checked;
-		var on = auto || this.steeredNetworks().length > 0 || this.steeredDevices().length > 0;
+		var on = auto || this.steeredNetworks().length > 0 || this.steeredDevices().length > 0 ||
+			this.steeredDomains().length > 0;
 		if (this.steerRow) this.steerRow.classList.toggle('hidden', !!auto);
 		if (this.devRow) this.devRow.classList.toggle('hidden', !!auto);
+		if (this.domRow) this.domRow.classList.toggle('hidden', !!auto);
 		if (this.ksRow) this.ksRow.classList.toggle('hidden', !on);
 		if (this.v6Row) this.v6Row.classList.toggle('hidden', !on);
 		if (this.dnsRow) this.dnsRow.classList.toggle('hidden', !on);
@@ -1841,6 +1912,15 @@ return view.extend({
 				? _('Recommended %d for your WAN (MTU %d). Empty = the default (1420). Lower it if sites/Gmail hang or throughput is poor — LTE/5G often need less.').format(recMtu, rtx.wan_mtu || 0)
 				: _('WireGuard interface MTU. Empty = the netifd default (1420).'));
 
+		this.selSel = E('select', { class: 'cbi-input-select', change: L.bind(this.markDirty, this) }, [
+			E('option', { value: 'balanced' }, _('Balanced — prefer lightly loaded servers')),
+			E('option', { value: 'least_load' }, _('Lowest load first')),
+			E('option', { value: 'random' }, _('Random'))
+		]);
+		this.selSel.value = g('selection', 'balanced');
+		if (!this.selSel.value)
+			this.selSel.value = 'balanced';
+
 		this.wdBox = E('input', { type: 'checkbox', change: L.bind(this.markDirty, this) });
 		this.wdBox.checked = (g('watchdog', '0') === '1');
 
@@ -1861,6 +1941,8 @@ return view.extend({
 				_('How long to wait for a WireGuard handshake before giving up on a server')),
 			this.maxRetriesRow = this.row(_('Max server attempts'), [ this.input('max_retries', 'number', g('max_retries', '10'), { min: 1, max: 50, style: 'width:80px' }) ],
 				_('How many candidate servers a rotation may try')),
+			this.selRow = this.row(_('Server selection'), [ this.selSel ],
+				_('Order in which automatic connects and rotations try servers. Balanced favours lightly loaded servers but still spreads out; load figures come from the cached server list.')),
 			this.wdRow = this.row(_('Auto-reconnect (watchdog)'), [
 				E('label', { class: 'nv-check' }, [ this.wdBox, _('Reconnect automatically when the tunnel goes stale') ])
 			], _('Switches to another server when the handshake goes stale — or, with the internet check on, when the tunnel stops forwarding traffic. Off when a specific server is pinned.')),
@@ -1884,6 +1966,7 @@ return view.extend({
 		// before this row exists — sync the initial visibility.
 		if (this._serverChosen) {
 			this.maxRetriesRow.classList.add('hidden');
+			this.selRow.classList.add('hidden');
 			this.wdRow.classList.add('hidden');
 		}
 		if (!this.probeBox.checked)
@@ -1929,9 +2012,16 @@ return view.extend({
 		return this.hopValue || 'single';
 	},
 
+	// Server group the instance is limited to ('p2p' or ''); single hop only.
+	serverGroup: function() {
+		return (this.hopMode() === 'single' && this.p2pBox && this.p2pBox.checked) ? 'p2p' : '';
+	},
+
 	// Key of the per-mode gateway counters in the locations tree.
 	hopCountKey: function() {
 		var m = this.hopMode();
+		if (m === 'single' && this.serverGroup() === 'p2p')
+			return 'p2p';
 		return m === 'multihop' ? 'multi' : (m === 'onion' ? 'onion' : 'single');
 	},
 
@@ -1954,6 +2044,8 @@ return view.extend({
 			dom.content(this.hopNote, [ notes[mode] || '' ]);
 			this.hopNote.classList.toggle('hidden', !notes[mode]);
 		}
+		if (this.p2pRow)
+			this.p2pRow.classList.toggle('hidden', mode !== 'single');
 	},
 
 	filteredCountries: function() {
@@ -1987,7 +2079,7 @@ return view.extend({
 			this.srvRenderTrigger();
 			return;
 		}
-		callServers(codes, this.hopMode()).then(L.bind(function(res) {
+		callServers(codes, this.hopMode(), this.serverGroup()).then(L.bind(function(res) {
 			if (req !== this._serversReq)
 				return; // a newer rebuild superseded this response
 			this._serverData = { relays: ((res && res.relays) || []).slice() };
@@ -2024,7 +2116,7 @@ return view.extend({
 	srvLowestLoad: function() {
 		var best = null;
 		((this._serverData && this._serverData.relays) || []).forEach(function(r) {
-			if (typeof r.load !== 'number') return;
+			if (typeof r.load !== 'number' || r.dedicated) return;
 			if (!best || r.load < best.load) best = r;
 		});
 		return best;
@@ -2174,6 +2266,8 @@ return view.extend({
 					click: L.bind(function(ev) { ev.stopPropagation(); this.srvSetChosen(r.hostname); }, this) }, [
 						E('span', { class: 'nv-dot ' + this.srvLoadClass(r.load) }),
 						E('span', { class: 'grow' }, '%s / %s'.format(r.city || '?', r.name || r.hostname)),
+						r.p2p ? E('span', { class: 'nv-srv-tag' }, _('P2P')) : '',
+						r.dedicated ? E('span', { class: 'nv-srv-tag', title: _('Only works for the account this Dedicated IP is assigned to') }, _('Dedicated IP')) : '',
 						isCur ? E('span', { class: 'nv-srv-cur' }, '● ' + _('current')) : '',
 						E('span', { class: 'nv-srv-load' }, r.load != null ? '%d%%'.format(r.load) : '')
 					]));
@@ -2205,6 +2299,8 @@ return view.extend({
 		// With a pinned server there are no candidates to try.
 		if (this.maxRetriesRow)
 			this.maxRetriesRow.classList.toggle('hidden', !!fixed);
+		if (this.selRow)
+			this.selRow.classList.toggle('hidden', !!fixed);
 		// The watchdog never fires with a pinned server either.
 		if (this.wdRow)
 			this.wdRow.classList.toggle('hidden', !!fixed);
@@ -2257,6 +2353,9 @@ return view.extend({
 			setv('cache_dir', (this.refs.cache_dir.value || '').trim(), 'main');
 
 		setv('hop_mode', this.hopMode());
+		setv('server_group', this.serverGroup());
+		if (this.selSel)
+			setv('selection', this.selSel.value === 'balanced' ? '' : this.selSel.value);
 
 		// The location set is the single source of truth; the legacy
 		// country/city options are cleared so both paths agree.
@@ -2291,7 +2390,12 @@ return view.extend({
 				uci.set('nordvpn', inst, 'source_network', steered);
 			else
 				uci.unset('nordvpn', inst, 'source_network');
-			if (steered.length || devices.length) {
+			var domains = autoOn ? [] : this.steeredDomains();
+			if (domains.length)
+				uci.set('nordvpn', inst, 'steer_domain', domains);
+			else if (this.domArea)
+				uci.unset('nordvpn', inst, 'steer_domain');
+			if (steered.length || devices.length || domains.length) {
 				// Steering needs a routing table; default to the interface name.
 				var rtb = this.refs.routing_table ? (this.refs.routing_table.value || '').trim()
 					: (uci.get('nordvpn', inst, 'routing_table') || '');
