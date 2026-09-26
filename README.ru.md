@@ -201,6 +201,7 @@ config instance 'main'
 	option rotation_time '04:30'     # HH:MM, router local time
 	option verify_timeout '8'        # seconds to wait for a WG handshake
 	option max_retries '10'          # candidate servers per rotation
+	option selection 'balanced'      # server order: balanced | least_load | random
 	option watchdog '0'              # auto-reconnect a stale tunnel (off when pinned)
 	option egress_probe '0'          # ping through the tunnel every 30 s (internet check)
 	list probe_target '1.1.1.1'      # IPv4 probe targets; default 1.1.1.1 + 8.8.8.8
@@ -334,7 +335,7 @@ logread -e nordvpn
 **handshake WireGuard** (`wg show latest-handshakes`), а не через пинг сквозь
 туннель. Ротация всегда переходит только на **другой** сервер: текущий шлюз
 исключается из набора кандидатов, поэтому ротация, о которой сообщено как об
-успешной, всегда сменила сервер. Она пробует до `max_retries` перемешанных
+успешной, всегда сменила сервер. Она пробует до `max_retries`
 кандидатов и, если ни один не завершил handshake, восстанавливает последний
 рабочий пир, а не оставляет мёртвый туннель. Когда выбор не соответствует ни
 одному серверу, кроме текущего, ротация становится no-op и сохраняет рабочий
@@ -342,6 +343,15 @@ logread -e nordvpn
 намеренное ограничение: воркер ротации должен завершиться заметно раньше окна
 устаревания блокировки, чтобы следующий запланированный тик не мог запустить
 вторую, перекрывающуюся ротацию.)
+
+Порядок перебора кандидатов задаёт **выбор сервера** инстанса
+(**Advanced settings → Server selection**, `option selection`):
+`balanced` (по умолчанию) — перемешивание с весом `101 − load`, так что
+малонагруженные серверы обычно пробуются первыми, но разные инстансы и
+роутеры всё равно распределяются, а не садятся все на один самый свободный
+сервер; `least_load` — строго по возрастанию нагрузки; `random` игнорирует
+нагрузку. Значения нагрузки берутся из кэша списка серверов, поэтому они не
+старше `cache_refresh_interval` (по умолчанию 6 ч).
 
 ### Ротация между режимами переходов
 

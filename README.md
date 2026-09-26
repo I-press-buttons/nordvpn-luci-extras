@@ -195,6 +195,7 @@ config instance 'main'
 	option rotation_time '04:30'     # HH:MM, router local time
 	option verify_timeout '8'        # seconds to wait for a WG handshake
 	option max_retries '10'          # candidate servers per rotation
+	option selection 'balanced'      # server order: balanced | least_load | random
 	option watchdog '0'              # auto-reconnect a stale tunnel (off when pinned)
 	option egress_probe '0'          # ping through the tunnel every 30 s (internet check)
 	list probe_target '1.1.1.1'      # IPv4 probe targets; default 1.1.1.1 + 8.8.8.8
@@ -344,13 +345,22 @@ candidate by waiting up to `verify_timeout` seconds for an actual **WireGuard
 handshake** (`wg show latest-handshakes`), not by pinging through the tunnel.
 Rotation only ever moves to a **different** server: the current gateway is
 excluded from the candidate set, so a rotation reported as successful has always
-changed the server. It tries up to `max_retries` shuffled candidates and, if none
+changed the server. It tries up to `max_retries` candidates and, if none
 complete a handshake, restores the last working peer rather than leaving a dead
 tunnel. When the selection matches no server other than the current one, rotation
 is a no-op and keeps the working tunnel. Apply behaves the same way for automatic
 selections. (`max_retries` is a deliberate bound: a rotation worker must finish
 well within the lock's staleness window so the next scheduled tick cannot start a
 second, overlapping rotation.)
+
+The order in which candidates are tried is the instance's **server selection**
+(**Advanced settings → Server selection**, `option selection`):
+`balanced` (the default) is a shuffle weighted by `101 − load`, so lightly
+loaded servers are usually tried first while separate instances and routers
+still spread out instead of all landing on the one emptiest server;
+`least_load` tries strictly by ascending load; `random` ignores load. Load
+figures come from the cached server list, so they are at most
+`cache_refresh_interval` (6 h by default) old.
 
 ### Rotation across hop modes
 

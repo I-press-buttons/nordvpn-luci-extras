@@ -12,7 +12,8 @@ const normalize = _cache.normalize, write_cache = _cache.write_cache;
 const _select = require('nordvpn.select');
 const candidates = _select.candidates, by_hostname = _select.by_hostname, pick = _select.pick,
       location_candidates = _select.location_candidates,
-      selection_candidates = _select.selection_candidates;
+      selection_candidates = _select.selection_candidates,
+      order_candidates = _select.order_candidates;
 const parse_credentials = require('nordvpn.api').parse_credentials;
 const write_relay = require('nordvpn.apply').write_relay;
 const _apply = require('nordvpn.apply');
@@ -226,6 +227,44 @@ write_cache(cache, cpath);
 	eq('plan uses the location set', length(plan_candidates(cache, { ...sl, max_retries: 10 }, null, 10)), 2);
 	eq('plan set excludes current gateway', plan_candidates(cache, { ...sl, max_retries: 10 }, 'ee70.nordvpn.com', 10)[0].hostname, 'us9999.nordvpn.com');
 	eq('plan falls back when set missing', length(plan_candidates(cache, { ...sg, max_retries: 10 }, null, 10)), 1);
+}
+
+// 6d. load-aware ordering: the selection strategy decides which candidates are
+//     tried first by apply and rotation.
+{
+	let pool = [ { hostname: 'a', load: 95 }, { hostname: 'b', load: 5 },
+		{ hostname: 'c', load: 50 }, { hostname: 'd', load: 5 }, { hostname: 'e' } ];
+
+	let ll = order_candidates(pool, 'least_load');
+	eq('least_load puts the lowest loads first', sort([ ll[0].hostname, ll[1].hostname ]), [ 'b', 'd' ]);
+	eq('least_load puts the highest load last', ll[4].hostname, 'a');
+	eq('least_load treats a missing load as 50', ll[2].hostname == 'c' || ll[2].hostname == 'e', true);
+	eq('order keeps every candidate', length(order_candidates(pool, 'random')), 5);
+	eq('order does not mutate input', pool[0].hostname, 'a');
+	eq('order tolerates garbage', order_candidates(null, 'balanced'), []);
+
+	// balanced: a 5%-load server leads far more often than a 95%-load one,
+	// but the busy one is not starved entirely.
+	let two = [ { hostname: 'busy', load: 95 }, { hostname: 'idle', load: 5 } ];
+	let idle_first = 0, n = 2000;
+	for (let i = 0; i < n; i++)
+		if (order_candidates(two, 'balanced')[0].hostname == 'idle')
+			idle_first++;
+	ok('balanced favours the idle server', idle_first > n * 0.85);
+	ok('balanced still spreads load', idle_first < n);
+	let rnd_first = 0;
+	for (let i = 0; i < n; i++)
+		if (order_candidates(two, 'random')[0].hostname == 'idle')
+			rnd_first++;
+	ok('random ignores load', rnd_first > n * 0.35 && rnd_first < n * 0.65);
+
+	// Settings: default balanced, garbage falls back.
+	global.MOCK_UCI = { nordvpn: { main: { '.type': 'instance', interface: 'nordvpn' } }, network: {} };
+	eq('selection defaults to balanced', load_settings(cursor()).selection, 'balanced');
+	global.MOCK_UCI = { nordvpn: { main: { '.type': 'instance', interface: 'nordvpn', selection: 'least_load' } }, network: {} };
+	eq('selection parses least_load', load_settings(cursor()).selection, 'least_load');
+	global.MOCK_UCI = { nordvpn: { main: { '.type': 'instance', interface: 'nordvpn', selection: 'bogus' } }, network: {} };
+	eq('selection rejects garbage', load_settings(cursor()).selection, 'balanced');
 }
 
 // 7. scheduler decisions (pure)

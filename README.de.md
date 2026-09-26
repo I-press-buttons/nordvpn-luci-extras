@@ -204,6 +204,7 @@ config instance 'main'
 	option rotation_time '04:30'     # HH:MM, router local time
 	option verify_timeout '8'        # seconds to wait for a WG handshake
 	option max_retries '10'          # candidate servers per rotation
+	option selection 'balanced'      # server order: balanced | least_load | random
 	option watchdog '0'              # auto-reconnect a stale tunnel (off when pinned)
 	option egress_probe '0'          # ping through the tunnel every 30 s (internet check)
 	list probe_target '1.1.1.1'      # IPv4 probe targets; default 1.1.1.1 + 8.8.8.8
@@ -342,7 +343,7 @@ Endpunkt das Interface trotzdem fehlerfrei „hoch“. Sowohl **apply** als auch
 Die Rotation wechselt immer nur zu einem **anderen** Server: das aktuelle Gateway
 wird aus der Kandidatenmenge ausgeschlossen, sodass eine als erfolgreich
 gemeldete Rotation den Server stets gewechselt hat. Sie probiert bis zu
-`max_retries` gemischte Kandidaten und stellt, falls keiner einen Handshake
+`max_retries` Kandidaten und stellt, falls keiner einen Handshake
 abschließt, den zuletzt funktionierenden Peer wieder her, anstatt einen toten
 Tunnel zu hinterlassen. Wenn die Auswahl auf keinen anderen Server als den
 aktuellen passt, ist die Rotation ein No-Op und behält den funktionierenden
@@ -350,6 +351,16 @@ Tunnel. Apply verhält sich bei automatischen Auswahlen genauso. (`max_retries`
 ist eine bewusste Schranke: ein Rotations-Worker muss deutlich innerhalb des
 Staleness-Fensters des Locks fertig werden, damit der nächste geplante Tick
 keine zweite, überlappende Rotation starten kann.)
+
+In welcher Reihenfolge die Kandidaten probiert werden, bestimmt die
+**Server-Auswahl** der Instanz (**Advanced settings → Server selection**,
+`option selection`): `balanced` (Standard) mischt gewichtet mit `101 − Last`,
+sodass wenig ausgelastete Server meist zuerst drankommen, getrennte Instanzen
+und Router sich aber trotzdem verteilen, statt alle auf dem einen leersten
+Server zu landen; `least_load` probiert strikt nach aufsteigender Last;
+`random` ignoriert die Last. Die Lastwerte stammen aus dem zwischengespeicherten
+Serverlisten-Cache und sind daher höchstens `cache_refresh_interval`
+(standardmäßig 6 h) alt.
 
 ### Rotation über Hop-Modi hinweg
 

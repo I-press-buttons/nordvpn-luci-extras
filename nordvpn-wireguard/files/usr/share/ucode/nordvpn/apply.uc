@@ -4,7 +4,7 @@
 
 'use strict';
 
-import { rand, srand } from 'math';
+import { srand } from 'math';
 import { readfile, unlink, stat } from 'fs';
 import { cursor } from 'uci';
 const _common = require('nordvpn.common');
@@ -29,7 +29,8 @@ const read_cache = _cache.read_cache;
 const _select = require('nordvpn.select');
 const selection_candidates = _select.selection_candidates,
       by_hostname = _select.by_hostname,
-      pick = _select.pick;
+      pick = _select.pick,
+      order_candidates = _select.order_candidates;
 const _api = require('nordvpn.api');
 const get_private_key = _api.get_private_key;
 const _routing = require('nordvpn.routing');
@@ -200,17 +201,6 @@ function verify_handshake(iface, seconds) {
 	return false;
 }
 
-function shuffle(list) {
-	let a = [];
-	for (let x in list)
-		push(a, x);
-	for (let i = length(a) - 1; i > 0; i--) {
-		let j = rand() % (i + 1);
-		let t = a[i]; a[i] = a[j]; a[j] = t;
-	}
-	return a;
-}
-
 function connect_one(uci, iface, relay, s) {
 	if (!write_relay(uci, iface, relay, s))
 		return false;
@@ -327,7 +317,7 @@ function apply_inner(uci, instance) {
 	let list = selection_candidates(cache, s);
 	if (length(list) == 0)
 		return { state: 'failure', error: 'no matching server found for the current selection' };
-	list = shuffle(list);
+	list = order_candidates(list, s.selection);
 
 	let tries = length(list);
 	if (tries > 4)

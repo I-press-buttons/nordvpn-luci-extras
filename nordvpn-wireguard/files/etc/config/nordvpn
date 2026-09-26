@@ -40,6 +40,11 @@ config instance 'main'
 	# how many candidate servers a rotation may try before giving up.
 	option verify_timeout '8'
 	option max_retries '10'
+	# Order in which automatic connects and rotation try candidate servers:
+	# 'balanced' (default; shuffle weighted towards low load), 'least_load'
+	# (strictly by load) or 'random' (ignore load). Load comes from the
+	# cached server list, so it is at most cache_refresh_interval old.
+	# option selection 'balanced'
 	# Optional watchdog: when the tunnel stays connecting, degraded, or
 	# disconnected past a grace period, rotate to another server automatically.
 	# Detection is handshake-based only (no external egress probe); ignored

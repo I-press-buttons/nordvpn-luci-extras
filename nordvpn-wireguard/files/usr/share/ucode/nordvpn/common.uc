@@ -164,6 +164,11 @@ function relay_kind(r) {
 	return 'single';
 }
 
+// Server selection strategy for automatic connects and rotation.
+function validate_selection(m) {
+	return (m == 'balanced' || m == 'least_load' || m == 'random') ? m : null;
+}
+
 function validate_rotation_mode(m) {
 	return (m == 'interval' || m == 'time') ? m : null;
 }
@@ -419,6 +424,9 @@ function load_settings(uci, instance) {
 			return (v >= 1280 && v <= 1500) ? v : null;
 		})(),
 		hop_mode: validate_hop_mode(g('hop_mode', 'single')) || 'single',
+		// How automatic connects and rotation order candidate servers:
+		// 'balanced' (load-weighted shuffle), 'least_load' or 'random'.
+		selection: validate_selection(g('selection', 'balanced')) || 'balanced',
 		country_code: g('country_code', ''),
 		city_code: g('city_code', ''),
 		fixed_server: g('fixed_server', ''),
@@ -587,7 +595,7 @@ return {
 	WATCHDOG_GRACE, WATCHDOG_COOLDOWN_BASE, WATCHDOG_COOLDOWN_MAX,
 	PROBE_FAIL_THRESHOLD, PROBE_TIMEOUT, DEFAULT_PROBE_TARGETS, HISTORY_MAX,
 	full_match, bounded_int, validate_interface, validate_token, validate_wg_key, validate_hostname,
-	validate_port, validate_hop_mode, validate_dns_mode, relay_kind, validate_rotation_mode, validate_interval, validate_time,
+	validate_port, validate_hop_mode, validate_dns_mode, relay_kind, validate_selection, validate_rotation_mode, validate_interval, validate_time,
 	validate_country_code, validate_location_code, validate_instance, validate_routing_table, validate_dir,
 	validate_mac, clean_label, validate_ipv4,
 	managed_interface, load_settings, list_instances, globals_section, cache_file_path, iso_ts, redact, log,

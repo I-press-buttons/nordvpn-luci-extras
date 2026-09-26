@@ -4,7 +4,7 @@
 
 'use strict';
 
-import { rand } from 'math';
+import { rand, log } from 'math';
 const _common = require('nordvpn.common');
 const relay_kind = _common.relay_kind;
 
@@ -93,4 +93,41 @@ function pick(list, exclude_hostname) {
 	return pool[rand() % length(pool)];
 }
 
-return { candidates, location_candidates, selection_candidates, by_hostname, pick };
+// Uniform random number in (0, 1), never exactly 0 or 1 (log() stays finite).
+function unit_rand() {
+	return ((rand() % 1000000) + 1) / 1000002.0;
+}
+
+function relay_load(r) {
+	let l = r ? r.load : null;
+	return (type(l) == 'int' && l >= 0 && l <= 100) ? l : 50;
+}
+
+// Order a candidate list for trying, by selection strategy (in a copy):
+//  - 'least_load': ascending server load, ties broken at random;
+//  - 'random':     a uniform shuffle (the historic behaviour);
+//  - 'balanced' (default): a shuffle weighted by (101 - load), so lightly
+//    loaded servers are usually tried first while independent instances and
+//    routers still spread out instead of all landing on the one emptiest
+//    server (Efraimidis–Spirakis: key = log(u) / w, largest first).
+// Relays without a usable load count as 50. Pure/testable.
+function order_candidates(list, strategy) {
+	if (type(list) != 'array')
+		return [];
+	let deco = [];
+	for (let r in list) {
+		let u = unit_rand();
+		let k;
+		if (strategy == 'random')
+			k = u;
+		else if (strategy == 'least_load')
+			k = -relay_load(r) * 2 - u;   // load dominates; u breaks ties
+		else
+			k = log(u) / (101 - relay_load(r));
+		push(deco, { k: k, r: r });
+	}
+	sort(deco, function(a, b) { return (a.k > b.k) ? -1 : (a.k < b.k) ? 1 : 0; });
+	return map(deco, function(d) { return d.r; });
+}
+
+return { candidates, location_candidates, selection_candidates, by_hostname, pick, order_candidates };
