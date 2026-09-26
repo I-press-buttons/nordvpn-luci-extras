@@ -193,6 +193,7 @@ config instance 'main'
 	option routing_table ''
 	option mtu ''                     # leer = Standard 1420; UI empfiehlt WAN-80
 	option hop_mode 'single'          # 'multihop' (Double VPN) / 'onion' (via Tor)
+	option server_group ''            # '' = any, 'p2p' = P2P servers only (single hop)
 	option country_code 'ee'         # Legacy-Fallback auf ein Land, nur wenn
 	option city_code 'ee-tallinn'    #   'locations' unten leer ist
 	list locations 'ee'              # Standort-Set: Länder und/oder 'cc-city',
@@ -361,6 +362,20 @@ Server zu landen; `least_load` probiert strikt nach aufsteigender Last;
 `random` ignoriert die Last. Die Lastwerte stammen aus dem zwischengespeicherten
 Serverlisten-Cache und sind daher höchstens `cache_refresh_interval`
 (standardmäßig 6 h) alt.
+
+### P2P-Server und Dedicated IP
+
+Im Hop-Modus *Single hop* beschränkt **Server type → P2P servers only**
+(`option server_group 'p2p'`) die Instanz auf die Server, die NordVPN für
+Peer-to-Peer-Traffic optimiert: Verbindung, Rotation und Watchdog wählen nur
+unter ihnen, und die Standortauswahl zählt nur P2P-Server (Standorte ohne
+werden gestrichelt angezeigt). Die Servergruppen stammen aus der NordVPN-API;
+ein von einer älteren Version geschriebener Cache gilt als veraltet und wird
+beim ersten Tick des Daemons erneuert.
+
+**Dedicated-IP**-Server akzeptieren nur das Konto, dem sie zugewiesen sind,
+und werden daher nie automatisch gewählt. In der Serverauswahl erscheinen sie
+trotzdem (markiert als *Dedicated IP*), sodass du deinen eigenen pinnen kannst.
 
 ### Rotation über Hop-Modi hinweg
 

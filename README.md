@@ -184,6 +184,7 @@ config instance 'main'
 	option routing_table ''
 	option mtu ''                     # empty = default 1420; UI recommends WAN-80
 	option hop_mode 'single'          # 'multihop' (Double VPN) / 'onion' (via Tor)
+	option server_group ''            # '' = any, 'p2p' = P2P servers only (single hop)
 	option country_code 'ee'         # legacy single-country fallback, used only
 	option city_code 'ee-tallinn'    #   when 'locations' below is empty
 	list locations 'ee'              # location set: countries and/or 'cc-city',
@@ -361,6 +362,20 @@ still spread out instead of all landing on the one emptiest server;
 `least_load` tries strictly by ascending load; `random` ignores load. Load
 figures come from the cached server list, so they are at most
 `cache_refresh_interval` (6 h by default) old.
+
+### P2P servers and Dedicated IP
+
+With **Hop mode** on *Single hop*, **Server type → P2P servers only**
+(`option server_group 'p2p'`) limits the instance to the servers NordVPN
+optimises for peer-to-peer traffic: connect, rotation and the watchdog only
+pick among them, and the location picker counts only P2P servers (locations
+with none show dashed). The server groups come from the NordVPN API; a cache
+written by an older version reads as stale and is refreshed on the daemon's
+first tick.
+
+**Dedicated IP** servers only accept the account they are assigned to, so they
+are never picked automatically. They are still listed in the server picker
+(tagged *Dedicated IP*), so you can pin your own.
 
 ### Rotation across hop modes
 

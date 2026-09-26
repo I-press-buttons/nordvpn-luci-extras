@@ -131,6 +131,18 @@ function ensure_city(acc, country, loc_code, city_name, lat, lon, country_code) 
 	return acc.location_index[loc_code];
 }
 
+// Identifiers of the NordVPN server groups a server belongs to
+// ('legacy_p2p', 'legacy_dedicated_ip', 'legacy_double_vpn', ...).
+function group_ids(server) {
+	let out = {};
+	if (type(server.groups) != 'array')
+		return out;
+	for (let g in server.groups)
+		if (type(g) == 'object' && type(g.identifier) == 'string')
+			out[g.identifier] = true;
+	return out;
+}
+
 function extract_public_key(server) {
 	let techs = server.technologies;
 	if (type(techs) != 'array')
@@ -194,10 +206,14 @@ function add_server(acc, server) {
 			entry_name = trim(nm[1]);
 	}
 
+	let groups = group_ids(server);
+
 	let multihop = false;
 	if (entry_code && entry_code != country_code)
 		multihop = true;
 	else if (entry_name && lc(entry_name) != lc(country_name))
+		multihop = true;
+	else if (groups.legacy_double_vpn)
 		multihop = true;
 
 	// Onion Over VPN: hostname cc-onionNN.nordvpn.com (exit through Tor).
@@ -206,6 +222,8 @@ function add_server(acc, server) {
 	if (match(hostname, /^[a-z][a-z]-onion[0-9]+[.]nordvpn[.]com$/))
 		onion = true;
 	else if (friendly && match(friendly, / Onion #/))
+		onion = true;
+	else if (groups.legacy_onion_over_vpn && !multihop)
 		onion = true;
 
 	push(city.relays, {
@@ -219,6 +237,10 @@ function add_server(acc, server) {
 		active: true,
 		multihop: multihop,
 		onion: onion,
+		// P2P-optimised; Dedicated IP servers only accept the account they
+		// are assigned to, so they never enter an automatic pool.
+		p2p: !!groups.legacy_p2p,
+		dedicated: !!groups.legacy_dedicated_ip,
 		entry_country_code: entry_code,
 		entry_country: entry_name || (entry_code ? uc(entry_code) : null),
 		exit_country_code: country_code,
@@ -258,6 +280,10 @@ function finalize(acc) {
 	return {
 		countries: filtered,
 		stats: acc.stats,
+		// Relays carry the server-group flags (p2p, dedicated). A cache
+		// written before they existed reads as stale, so the daemon refreshes
+		// it on its first tick while the old one keeps serving.
+		groups: true,
 		source: SERVERS_URL,
 		generated_at: iso_ts()
 	};
@@ -270,36 +296,45 @@ function locations_tree(cache) {
 	if (!cache || type(cache.countries) != 'array')
 		return out;
 	for (let c in cache.countries) {
-		let cities = [], cs = 0, cm = 0, co = 0;
+		let cities = [], cs = 0, cm = 0, co = 0, cp = 0;
 		for (let city in c.cities) {
-			let s = 0, m = 0, o = 0;
+			let s = 0, m = 0, o = 0, p = 0;
 			for (let r in city.relays) {
+				if (r.dedicated)
+					continue;
 				let k = relay_kind(r);
 				if (k == 'multihop')
 					m++;
 				else if (k == 'onion')
 					o++;
-				else
+				else {
 					s++;
+					if (r.p2p)
+						p++;
+				}
 			}
-			push(cities, { code: city.code, name: city.name, single: s, multi: m, onion: o });
+			push(cities, { code: city.code, name: city.name, single: s, multi: m, onion: o, p2p: p });
 			cs += s;
 			cm += m;
 			co += o;
+			cp += p;
 		}
-		push(out, { code: c.code, name: c.name, single: cs, multi: cm, onion: co, cities: cities });
+		push(out, { code: c.code, name: c.name, single: cs, multi: cm, onion: co, p2p: cp, cities: cities });
 	}
 	return out;
 }
 
 // Union of relays over a location set (country codes and/or cc-city codes),
 // each entry carrying the grouping fields the UI needs (country_code,
-// city_code, city). Deduped by hostname; hop_mode filters the relay kind.
-function pool_relays(cache, locations, hop_mode) {
+// city_code, city). Deduped by hostname; hop_mode filters the relay kind and
+// server_group 'p2p' keeps only P2P servers (single-hop only). Dedicated IP
+// servers are listed (flagged) so their owner can pin one.
+function pool_relays(cache, locations, hop_mode, server_group) {
 	let out = [], seen = {};
 	if (!cache || type(cache.countries) != 'array' || type(locations) != 'array')
 		return out;
 	let want = (hop_mode == 'multihop' || hop_mode == 'onion') ? hop_mode : 'single';
+	let p2p_only = (want == 'single' && server_group == 'p2p');
 	let set = {};
 	for (let e in locations)
 		if (type(e) == 'string' && e != '')
@@ -310,11 +345,12 @@ function pool_relays(cache, locations, hop_mode) {
 				continue;
 			for (let r in city.relays) {
 				let k = relay_kind(r);
-				if (k != want || seen[r.hostname])
+				if (k != want || seen[r.hostname] || (p2p_only && !r.p2p))
 					continue;
 				seen[r.hostname] = true;
 				push(out, { hostname: r.hostname, name: r.name, load: r.load,
 					multihop: k == 'multihop', onion: k == 'onion',
+					p2p: !!r.p2p, dedicated: !!r.dedicated,
 					country_code: lc(c.code), city_code: city.code, city: city.name });
 			}
 		}
@@ -340,7 +376,8 @@ function city_relays(cache, country_code, city_code, hop_mode) {
 				let k = relay_kind(r);
 				if (want == null || k == want)
 					push(out, { hostname: r.hostname, name: r.name, load: r.load,
-						multihop: k == 'multihop', onion: k == 'onion' });
+						multihop: k == 'multihop', onion: k == 'onion',
+						p2p: !!r.p2p, dedicated: !!r.dedicated });
 			}
 			return out;
 		}
@@ -441,11 +478,11 @@ function read_cache(path) {
 	return obj;
 }
 
-// True when the cache is missing, unreadable, incompatible or older than the
-// staleness threshold.
+// True when the cache is missing, unreadable, incompatible, lacks the server
+// group flags or is older than the staleness threshold.
 function cache_is_stale(path) {
 	let obj = read_cache(path);
-	if (!obj || type(obj.cached_at) != 'int')
+	if (!obj || type(obj.cached_at) != 'int' || !obj.groups)
 		return true;
 	return (time() - obj.cached_at) > CACHE_MAX_AGE;
 }

@@ -17,6 +17,10 @@ config instance 'main'
 	option mtu ''
 	# 'single', 'multihop' (Double VPN) or 'onion' (Onion Over VPN via Tor).
 	option hop_mode 'single'
+	# Limit single-hop servers to a NordVPN server group: '' (any) or 'p2p'
+	# (P2P-optimised servers). Dedicated IP servers are never picked
+	# automatically; pin yours with fixed_server.
+	# option server_group ''
 	# Two-letter country code and 'cc-cityslug' city code for server selection.
 	option country_code ''
 	option city_code ''

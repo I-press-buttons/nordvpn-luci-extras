@@ -11,13 +11,16 @@ const relay_kind = _common.relay_kind;
 // All relays matching country/city/hop_mode. city_code '' means any city.
 // hop_mode 'multihop' and 'onion' select exactly that kind; anything else
 // selects plain single-hop relays (Onion Over VPN is never picked implicitly).
-function candidates(cache, country_code, city_code, hop_mode) {
+// server_group 'p2p' narrows single-hop to P2P servers. Dedicated IP servers
+// belong to one account each and are never an automatic candidate.
+function candidates(cache, country_code, city_code, hop_mode, server_group) {
 	let out = [];
 	if (!cache || type(cache.countries) != 'array')
 		return out;
 
 	let want = (hop_mode == 'multihop' || hop_mode == 'onion') ? hop_mode : 'single';
 	let cc = (country_code && country_code != '') ? lc(country_code) : null;
+	let p2p_only = (want == 'single' && server_group == 'p2p');
 
 	for (let country in cache.countries) {
 		if (cc && lc(country.code) != cc)
@@ -26,6 +29,8 @@ function candidates(cache, country_code, city_code, hop_mode) {
 			if (city_code && city_code != '' && city.code != city_code)
 				continue;
 			for (let relay in city.relays) {
+				if (relay.dedicated || (p2p_only && !relay.p2p))
+					continue;
 				if (relay_kind(relay) == want)
 					push(out, relay);
 			}
@@ -38,16 +43,16 @@ function candidates(cache, country_code, city_code, hop_mode) {
 // ('de') or city codes ('de-berlin', the country derived from the prefix).
 // Deduped by hostname so a city inside a set country appears once.
 // Garbage entries contribute nothing.
-function location_candidates(cache, locations, hop_mode) {
+function location_candidates(cache, locations, hop_mode, server_group) {
 	let out = [], seen = {};
 	if (type(locations) != 'array')
 		return out;
 	for (let entry in locations) {
 		let list = [];
 		if (_common.full_match(entry, /^[A-Za-z]{2}$/))
-			list = candidates(cache, entry, '', hop_mode);
+			list = candidates(cache, entry, '', hop_mode, server_group);
 		else if (type(entry) == 'string' && index(entry, '-') > 0)
-			list = candidates(cache, split(entry, '-')[0], entry, hop_mode);
+			list = candidates(cache, split(entry, '-')[0], entry, hop_mode, server_group);
 		for (let r in list) {
 			if (seen[r.hostname])
 				continue;
@@ -62,9 +67,10 @@ function location_candidates(cache, locations, hop_mode) {
 // location set wins; otherwise the legacy country/city selection.
 function selection_candidates(cache, settings) {
 	let loc = settings ? settings.locations : null;
+	let grp = settings ? settings.server_group : null;
 	if (loc && length(loc) > 0)
-		return location_candidates(cache, loc, settings.hop_mode);
-	return candidates(cache, settings.country_code, settings.city_code, settings.hop_mode);
+		return location_candidates(cache, loc, settings.hop_mode, grp);
+	return candidates(cache, settings.country_code, settings.city_code, settings.hop_mode, grp);
 }
 
 // Find a specific relay by its gateway hostname.

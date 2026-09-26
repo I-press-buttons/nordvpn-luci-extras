@@ -190,6 +190,7 @@ config instance 'main'
 	option routing_table ''
 	option mtu ''                     # пусто = дефолт 1420; UI советует WAN-80
 	option hop_mode 'single'          # 'multihop' (Double VPN) / 'onion' (via Tor)
+	option server_group ''            # '' = any, 'p2p' = P2P servers only (single hop)
 	option country_code 'ee'         # легаси-фолбэк на одну страну, только когда
 	option city_code 'ee-tallinn'    #   'locations' ниже пуст
 	list locations 'ee'              # набор локаций: страны и/или 'cc-city',
@@ -352,6 +353,20 @@ logread -e nordvpn
 сервер; `least_load` — строго по возрастанию нагрузки; `random` игнорирует
 нагрузку. Значения нагрузки берутся из кэша списка серверов, поэтому они не
 старше `cache_refresh_interval` (по умолчанию 6 ч).
+
+### P2P-серверы и Dedicated IP
+
+В режиме *Single hop* опция **Server type → P2P servers only**
+(`option server_group 'p2p'`) ограничивает инстанс серверами, которые NordVPN
+оптимизирует для peer-to-peer трафика: подключение, ротация и watchdog
+выбирают только среди них, а выбор локаций считает только P2P-серверы
+(локации без них показываются пунктиром). Группы серверов берутся из API
+NordVPN; кэш, записанный старой версией, считается устаревшим и обновляется
+на первом тике демона.
+
+Серверы **Dedicated IP** принимают только аккаунт, за которым закреплены,
+поэтому автоматически они никогда не выбираются. В списке серверов они всё
+равно видны (с пометкой *Dedicated IP*), так что свой можно закрепить.
 
 ### Ротация между режимами переходов
 

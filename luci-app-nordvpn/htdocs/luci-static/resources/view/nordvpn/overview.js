@@ -28,7 +28,7 @@ var E = function(html, attr, data) {
 
 var callInstances = rpc.declare({ object: 'nordvpn', method: 'instances' });
 var callLocations = rpc.declare({ object: 'nordvpn', method: 'locations' });
-var callServers = rpc.declare({ object: 'nordvpn', method: 'servers', params: [ 'locations', 'hop_mode' ] });
+var callServers = rpc.declare({ object: 'nordvpn', method: 'servers', params: [ 'locations', 'hop_mode', 'server_group' ] });
 var callRefreshStatus = rpc.declare({ object: 'nordvpn', method: 'refresh_status' });
 var callSetCredentials = rpc.declare({ object: 'nordvpn', method: 'set_credentials', params: [ 'token', 'instance' ] });
 // LuCI's uci.apply() arms a rollback (10s by default) and confirms it from a
@@ -160,6 +160,7 @@ var STYLE = '' +
 	'.nv-dot-hi{background:#c0392b}' +
 	'.nv-srv-load{color:var(--text-color-medium,#888);font-variant-numeric:tabular-nums;flex:none}' +
 	'.nv-srv-cur{color:#3c8c3c;font-weight:600;flex:none}' +
+	'.nv-srv-tag{flex:none;font-size:.8em;padding:0 .4em;border:1px solid currentColor;border-radius:3px;color:var(--text-color-medium,#888)}' +
 	'.nv-srv-grp{font-weight:600;padding:.35em .5em .15em;color:var(--text-color-medium,#888)}' +
 	'.nv-pool-row.nv-srv-quick{font-weight:600}' +
 	// Plain flex rows (no LuCI .table classes), so the theme's own responsive
@@ -946,6 +947,13 @@ return view.extend({
 			return b;
 		}, this)));
 		this.hopNote = E('div', { class: 'cbi-value-description' });
+
+		// Server group (single hop only): P2P-optimised servers.
+		this.p2pBox = E('input', { type: 'checkbox', change: L.bind(this.onHopChange, this) });
+		this.p2pBox.checked = (uci.get('nordvpn', this.instance, 'server_group') === 'p2p');
+		this.p2pRow = this.row(_('Server type'), [
+			E('label', { class: 'nv-check' }, [ this.p2pBox, _('P2P servers only') ])
+		], _('Limits this instance to NordVPN servers optimised for peer-to-peer (file sharing). Single hop only.'));
 		this.updateHopButtons();
 
 		// Location set editor: a combined country/city picker feeding removable
@@ -1006,6 +1014,7 @@ return view.extend({
 			E('div', { class: 'cbi-section-node' }, [
 				this.row(_('Credentials'), [ E('div', { class: 'nv-inline' }, [ credState, credBtn, credClearBtn ]) ]),
 				this.row(_('Hop mode'), [ seg, this.hopNote ]),
+				this.p2pRow,
 				this.row(_('Locations'), [
 					E('div', {}, [ this.poolChips ]),
 					this.poolWrap,
@@ -1941,9 +1950,16 @@ return view.extend({
 		return this.hopValue || 'single';
 	},
 
+	// Server group the instance is limited to ('p2p' or ''); single hop only.
+	serverGroup: function() {
+		return (this.hopMode() === 'single' && this.p2pBox && this.p2pBox.checked) ? 'p2p' : '';
+	},
+
 	// Key of the per-mode gateway counters in the locations tree.
 	hopCountKey: function() {
 		var m = this.hopMode();
+		if (m === 'single' && this.serverGroup() === 'p2p')
+			return 'p2p';
 		return m === 'multihop' ? 'multi' : (m === 'onion' ? 'onion' : 'single');
 	},
 
@@ -1966,6 +1982,8 @@ return view.extend({
 			dom.content(this.hopNote, [ notes[mode] || '' ]);
 			this.hopNote.classList.toggle('hidden', !notes[mode]);
 		}
+		if (this.p2pRow)
+			this.p2pRow.classList.toggle('hidden', mode !== 'single');
 	},
 
 	filteredCountries: function() {
@@ -1999,7 +2017,7 @@ return view.extend({
 			this.srvRenderTrigger();
 			return;
 		}
-		callServers(codes, this.hopMode()).then(L.bind(function(res) {
+		callServers(codes, this.hopMode(), this.serverGroup()).then(L.bind(function(res) {
 			if (req !== this._serversReq)
 				return; // a newer rebuild superseded this response
 			this._serverData = { relays: ((res && res.relays) || []).slice() };
@@ -2036,7 +2054,7 @@ return view.extend({
 	srvLowestLoad: function() {
 		var best = null;
 		((this._serverData && this._serverData.relays) || []).forEach(function(r) {
-			if (typeof r.load !== 'number') return;
+			if (typeof r.load !== 'number' || r.dedicated) return;
 			if (!best || r.load < best.load) best = r;
 		});
 		return best;
@@ -2186,6 +2204,8 @@ return view.extend({
 					click: L.bind(function(ev) { ev.stopPropagation(); this.srvSetChosen(r.hostname); }, this) }, [
 						E('span', { class: 'nv-dot ' + this.srvLoadClass(r.load) }),
 						E('span', { class: 'grow' }, '%s / %s'.format(r.city || '?', r.name || r.hostname)),
+						r.p2p ? E('span', { class: 'nv-srv-tag' }, _('P2P')) : '',
+						r.dedicated ? E('span', { class: 'nv-srv-tag', title: _('Only works for the account this Dedicated IP is assigned to') }, _('Dedicated IP')) : '',
 						isCur ? E('span', { class: 'nv-srv-cur' }, '● ' + _('current')) : '',
 						E('span', { class: 'nv-srv-load' }, r.load != null ? '%d%%'.format(r.load) : '')
 					]));
@@ -2271,6 +2291,7 @@ return view.extend({
 			setv('cache_dir', (this.refs.cache_dir.value || '').trim(), 'main');
 
 		setv('hop_mode', this.hopMode());
+		setv('server_group', this.serverGroup());
 		if (this.selSel)
 			setv('selection', this.selSel.value === 'balanced' ? '' : this.selSel.value);
 

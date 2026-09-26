@@ -113,7 +113,7 @@ methods.locations = {
 };
 
 methods.servers = {
-	args: { country: '', city: '', hop_mode: '', locations: [] },
+	args: { country: '', city: '', hop_mode: '', locations: [], server_group: '' },
 	call: function(request) {
 		let a = request.args || {};
 		let cache = read_cache(cache_file_path(load_settings(cursor())));
@@ -134,7 +134,7 @@ methods.servers = {
 				if (loc && index(loc, '-') > 0)
 					push(set, loc);
 			}
-			return { relays: pool_relays(cache, set, a.hop_mode) };
+			return { relays: pool_relays(cache, set, a.hop_mode, a.server_group) };
 		}
 		return { relays: city_relays(cache, a.country, a.city, a.hop_mode) };
 	}

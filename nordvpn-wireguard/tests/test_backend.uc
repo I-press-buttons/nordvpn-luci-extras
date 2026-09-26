@@ -267,6 +267,35 @@ write_cache(cache, cpath);
 	eq('selection rejects garbage', load_settings(cursor()).selection, 'balanced');
 }
 
+// 6e. server groups: a P2P instance only picks P2P servers; Dedicated IP
+//     servers are never automatic candidates but can still be pinned.
+{
+	let k = cache.countries[0].cities[0].relays[0].public_key;
+	let mk = function(host, groups) {
+		return { hostname: host, station: '192.0.2.60', name: 'Germany', load: 10,
+			locations: [ { country: { name: 'Germany', code: 'DE', city: { name: 'Berlin' } } } ],
+			technologies: [ { identifier: 'wireguard_udp', metadata: [ { name: 'public_key', value: k } ] } ],
+			groups: map(groups, function(g) { return { identifier: g }; }) };
+	};
+	let gc = normalize([ mk('de1.nordvpn.com', [ 'legacy_p2p' ]), mk('de2.nordvpn.com', [ 'legacy_standard' ]),
+		mk('de3.nordvpn.com', [ 'legacy_dedicated_ip' ]) ]);
+	let hosts = function(l) { return sort(map(l, function(r) { return r.hostname; })); };
+	eq('any group excludes dedicated', hosts(candidates(gc, 'de', '', 'single', '')), [ 'de1.nordvpn.com', 'de2.nordvpn.com' ]);
+	eq('p2p group narrows', hosts(candidates(gc, 'de', '', 'single', 'p2p')), [ 'de1.nordvpn.com' ]);
+	eq('p2p through a location set', hosts(selection_candidates(gc,
+		{ locations: [ 'de-berlin' ], hop_mode: 'single', server_group: 'p2p' })), [ 'de1.nordvpn.com' ]);
+	eq('p2p via legacy selection', hosts(selection_candidates(gc,
+		{ country_code: 'de', city_code: '', hop_mode: 'single', server_group: 'p2p' })), [ 'de1.nordvpn.com' ]);
+	eq('dedicated still pinnable', by_hostname(gc, 'de3.nordvpn.com').hostname, 'de3.nordvpn.com');
+
+	global.MOCK_UCI = { nordvpn: { main: { '.type': 'instance', interface: 'nordvpn' } }, network: {} };
+	eq('server_group defaults to any', load_settings(cursor()).server_group, '');
+	global.MOCK_UCI = { nordvpn: { main: { '.type': 'instance', interface: 'nordvpn', server_group: 'p2p' } }, network: {} };
+	eq('server_group parses p2p', load_settings(cursor()).server_group, 'p2p');
+	global.MOCK_UCI = { nordvpn: { main: { '.type': 'instance', interface: 'nordvpn', server_group: 'dedicated' } }, network: {} };
+	eq('server_group rejects others', load_settings(cursor()).server_group, '');
+}
+
 // 7. scheduler decisions (pure)
 {
 	let s = { cache_refresh_interval: 21600, enabled: true, rotation_enabled: true,
