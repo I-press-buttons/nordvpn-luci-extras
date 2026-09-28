@@ -150,6 +150,34 @@ ok('clear_credentials removes the key', global.MOCK_UCI.network.nordvpn.private_
 	eq('delete_instance keeps the foreign peer', global.MOCK_UCI.network.wanpeer, wanpeer);
 }
 
+// overview: the Status-page card's summary. Cheap (no routing detection) and,
+// like every read method, free of secrets.
+{
+	let saved_uci = global.MOCK_UCI, saved_ubus = global.MOCK_UBUS;
+	global.MOCK_UCI = { nordvpn: {
+			main: { '.type': 'instance', interface: 'nordvpn', cache_dir: cdir, enabled: '1' },
+			second: { '.type': 'instance', interface: 'nv_second', enabled: '0' } },
+		network: {
+			nordvpn: { '.type': 'interface', private_key: KEY, vpn_type: 'nordvpn',
+				nordvpn_country_code: 'ee', nordvpn_location: 'ee-tallinn' },
+			peer: { '.type': 'wireguard_nordvpn', interface: 'nordvpn',
+				nordvpn_gateway: 'ee70.nordvpn.com', public_key: KEY } } };
+	global.MOCK_UBUS = { 'network.interface.nordvpn~status': { up: true, l3_device: 'nordvpn', uptime: 42 } };
+	let open_before = global.MOCK_UBUS_OPEN || 0;
+	let ov = m.overview.call();
+	eq('overview: one entry per instance, main first', map(ov.instances, (i) => i.instance), [ 'main', 'second' ]);
+	let o = ov.instances[0];
+	eq('overview: runtime fields', [ o.configured, o.enabled, o.gateway, o.uptime, o.location ],
+		[ true, true, 'ee70.nordvpn.com', 42, { country: 'ee', city: 'ee-tallinn' } ]);
+	eq('overview: up without a handshake reads connecting', o.state, 'connecting');
+	eq('overview: unconfigured instance', [ ov.instances[1].state, ov.instances[1].configured ], [ 'not_configured', false ]);
+	ok('overview: no routing detection', o.routing == null && o.rotation == null);
+	ok('overview: no secret in the response', index(sprintf('%J', ov), KEY) < 0);
+	eq('overview: ubus connections closed', global.MOCK_UBUS_OPEN || 0, open_before);
+	global.MOCK_UCI = saved_uci;
+	global.MOCK_UBUS = saved_ubus;
+}
+
 // clients: read-only picker source; always an array (empty off-device).
 ok('clients method present', type(m.clients.call) == 'function');
 ok('clients returns an array', type(m.clients.call().clients) == 'array');

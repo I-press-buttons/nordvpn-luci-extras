@@ -95,6 +95,32 @@ methods.instances = {
 	}
 };
 
+// Lightweight summary for the Status → Overview card, which polls every few
+// seconds: each instance's runtime status without the routing detection that
+// `instances` runs (ubus dumps, `ip link`, `dnsmasq --version`). Read-only; no
+// network access beyond local ubus and `wg show`.
+methods.overview = {
+	call: function() {
+		let uci = cursor();
+		let out = [];
+		for (let name in list_instances(uci)) {
+			let st = status(uci, name);
+			push(out, {
+				instance: st.instance,
+				state: effective_state(load_settings(uci, name), st.state, read_state(name), st.gateway),
+				enabled: st.enabled,
+				configured: st.configured,
+				location: st.location,
+				gateway: st.gateway,
+				latest_handshake_seconds: st.latest_handshake_seconds,
+				uptime: st.uptime,
+				transfer: st.transfer
+			});
+		}
+		return { instances: out };
+	}
+};
+
 methods.locations = {
 	call: function() {
 		let s = load_settings(cursor());
