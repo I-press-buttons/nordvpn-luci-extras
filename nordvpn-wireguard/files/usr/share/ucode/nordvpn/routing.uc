@@ -793,17 +793,21 @@ function enforce(uci, s, opts) {
 		push(notes, 'steering needs a routing table; set one for this instance');
 		steer = false;
 	}
-	// "Route all LAN traffic" with exceptions runs as steering of the LAN
-	// zone's networks: its kill switch is prohibit rules, which the earlier
-	// exception rule gets past, whereas the automatic kill switch is a
-	// LAN→WAN REJECT that would block the excluded devices too.
+	// "Route all LAN traffic" runs as steering of the LAN zone's networks
+	// whenever the instance has a routing table. The tunnel's default route
+	// then lives in that table (ip4table), which the automatic path, built on
+	// the main table, never consults: LAN traffic would silently keep using
+	// the WAN. Exceptions need this path too, since its kill switch is
+	// prohibit rules, which the earlier exception rule gets past, whereas the
+	// automatic kill switch is a LAN→WAN REJECT that would block the excluded
+	// devices as well; load_settings() supplies a table for them.
 	let all_lan = false;
-	if (auto && det.exceptions) {
+	if (auto && (has_table || det.exceptions)) {
 		let lan_nets = det.lan_zone ? zone_networks(uci, det.lan_zone) : [];
 		if (!has_table)
 			push(notes, 'exceptions need a routing table; set one for this instance');
 		else if (!length(lan_nets))
-			push(notes, 'exceptions: could not determine the LAN networks');
+			push(notes, 'could not determine the LAN networks to route through table ' + s.routing_table);
 		else {
 			auto = false;
 			steer = true;
@@ -877,9 +881,11 @@ function enforce(uci, s, opts) {
 	//      with the same prohibit rules as networks. Priority 19000 sits above
 	//      the network lookups, so a device choice beats a network choice. A
 	//      MAC already owned by another instance is left to that instance.
+	// All-LAN mode already sends every LAN network through the table; steered
+	// devices and domains only mean something in steered mode.
 	let steer_devs = [];
 	let mark = null;
-	if (steer && length(s.source_devices || []) > 0) {
+	if (steer && !all_lan && length(s.source_devices || []) > 0) {
 		let owners = device_owners(uci);
 		for (let mac in s.source_devices) {
 			if (owners[mac] && s.name && owners[mac] != s.name)
@@ -900,7 +906,7 @@ function enforce(uci, s, opts) {
 	//       Only LAN-zone traffic is marked: that zone is the one given a
 	//       forwarding into the VPN zone below.
 	let steer_doms = [];
-	if (steer && length(s.source_domains || []) > 0) {
+	if (steer && !all_lan && length(s.source_domains || []) > 0) {
 		let supported = (opts && opts.nftset != null) ? !!opts.nftset : nftset_supported();
 		if (!mark)
 			mark = device_mark(rt_table_id(table));

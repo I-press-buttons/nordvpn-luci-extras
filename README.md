@@ -88,9 +88,9 @@ that adds the extra features marked **(fork)** below.
   through the tunnel, uptime, traffic and throughput, and the recent events
   (connects, rotations, recoveries) for each tunnel.
 - **Protection check (fork).** NordVPN itself confirms that it sees the tunnel
-  as protected, with the exit city and ISP. With *Route all LAN traffic* it
-  also checks the path your devices take, and warns if their traffic is
-  leaving through your ISP although the tunnel is up. A DNS line says whether
+  as protected, with the exit city and ISP. With *Route all LAN traffic* and
+  no routing table, it also checks the path your devices take, and warns if
+  their traffic is leaving through your ISP although the tunnel is up. A DNS line says whether
   lookups go to NordVPN or to your ISP's resolver.
 - **Status page card (fork).** Every tunnel's state, location, server, uptime
   and traffic also appear on LuCI's main **Status → Overview** page.
@@ -382,7 +382,10 @@ On every apply the backend first works out which routing mode applies:
 - **Automatic** (*Route all LAN traffic*). The backend sets
   `route_allowed_ips` on the peer, creates a masquerading zone and a
   LAN → VPN forwarding, and adds optional REJECT rules for the kill switch
-  and IPv6, plus the DNS override.
+  and IPv6, plus the DNS override. If the instance has a routing table, the
+  tunnel's default route lives in that table instead of the main one. The
+  backend then steers every network of the LAN zone into it, as described
+  under *Steered*, with the same result.
 - **Steered.** Policy rules send only the selected traffic into the
   instance's routing table:
   - **Networks:** `in <network> lookup <table>` at priority 20000.
@@ -413,10 +416,10 @@ On every apply the backend first works out which routing mode applies:
   table's id, `0xfe000000`, as their mark. One `mark … lookup main` rule per
   family at priority 18000 comes before every steering and prohibit rule,
   so excluded traffic skips the tunnel and the kill switch and keeps its
-  IPv6. With *Route all LAN traffic*, exceptions switch the instance to
-  steering every network of the LAN zone, because the automatic kill switch
-  would block excluded devices too. If no table is set, it uses one named
-  after the interface, which isn't written to the config.
+  IPv6. With *Route all LAN traffic*, exceptions need the LAN-zone steering
+  described under *Automatic*, because the REJECT kill switch would block
+  excluded devices too. If no table is set, the backend uses one named after
+  the interface, which isn't written to the config.
 
 Everything the app creates is tagged `nordvpn_managed`. Turning a toggle off
 removes exactly those objects. User zones, forwardings, routes, rules and
@@ -465,7 +468,8 @@ Outbound:
 - `api.nordvpn.com`: the one-time token exchange, the server list (every
   `cache_refresh_interval`, 6 h by default) and, while the LuCI page is open,
   the protection check. That check goes through the tunnel and, with *Route
-  all LAN traffic*, once more along the path the LAN takes.
+  all LAN traffic* and no routing table, once more along the path the LAN
+  takes.
 - The NordVPN WireGuard server you're connected to (UDP 51820).
 - Only if you turn them on: NordVPN's DNS resolvers (`vpn_dns`), and pings
   to the `probe_target`s (default `1.1.1.1` and `8.8.8.8`) through the tunnel

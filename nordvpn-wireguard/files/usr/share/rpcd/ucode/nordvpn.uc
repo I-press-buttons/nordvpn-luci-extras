@@ -206,11 +206,12 @@ function insights(extra) {
 
 // Public IP, location and NordVPN's "protected" verdict as seen through the
 // instance's tunnel. Bound to the interface so it reflects the VPN exit even
-// with policy routing. With "Route all LAN traffic" the LAN uses the main
-// table, the same one an unbound request from the router takes, so ask again
-// without binding: `lan_path.protected == false` means LAN traffic leaves
-// outside the VPN although the tunnel itself is up. (Steered clients use the
-// instance table, which the router's own traffic cannot reproduce.)
+// with policy routing. With "Route all LAN traffic" and no routing table the
+// LAN uses the main table, the same one an unbound request from the router
+// takes, so ask again without binding: `lan_path.protected == false` means
+// LAN traffic leaves outside the VPN although the tunnel itself is up. With
+// a table (set, or implied by exceptions) the LAN is steered into it, which
+// the router's own traffic cannot reproduce, as for steered clients.
 // Read-only network probe.
 methods.external_ip = {
 	args: { instance: '' },
@@ -224,7 +225,7 @@ methods.external_ip = {
 		if (!res)
 			return { error: 'could not determine the external IP' };
 		res.interface = s.interface;
-		if (s.enabled && detect_routing(uci, s, false).mode == 'auto') {
+		if (s.enabled && s.routing_table == '' && detect_routing(uci, s, false).mode == 'auto') {
 			let lan = insights([]);
 			res.lan_path = lan ? { protected: lan.protected, ip: lan.ip, isp: lan.isp } : null;
 		}

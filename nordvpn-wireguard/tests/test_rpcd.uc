@@ -203,6 +203,19 @@ ok('clear_credentials removes the key', global.MOCK_UCI.network.nordvpn.private_
 		{ protected: false, ip: '203.0.113.9', isp: 'Home ISP' });
 	eq('external_ip: only NordVPN is asked', uniq(urls), [ _common.IP_INSIGHTS_URL ]);
 
+	// With a table the LAN is steered into it; the router's own request would
+	// take the WAN and raise a false alarm, so no LAN-path probe.
+	urls = [];
+	global.MOCK_UCI.nordvpn.main.routing_table = '100';
+	r = m.external_ip.call({});
+	ok('external_ip: all-LAN with a table skips the LAN-path probe', r.lan_path == null && length(urls) == 1);
+	urls = [];
+	delete global.MOCK_UCI.nordvpn.main.routing_table;
+	global.MOCK_UCI.nordvpn.main.bypass_device = 'aa:bb:cc:dd:ee:01';
+	r = m.external_ip.call({});
+	ok('external_ip: ... also with the implicit table of exceptions', r.lan_path == null && length(urls) == 1);
+	delete global.MOCK_UCI.nordvpn.main.bypass_device;
+
 	urls = [];
 	global.MOCK_UCI.nordvpn.main.auto_routing = '0';
 	global.MOCK_UCI.nordvpn.main.source_network = 'lan';

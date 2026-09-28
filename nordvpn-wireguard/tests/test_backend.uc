@@ -1058,9 +1058,12 @@ write_cache(cache, cpath);
 	eq('dns: off removes the rules', length(count('network', 'dns_lookup')), 0);
 
 	enforce_routing(uci, sd({}));
-	enforce_routing(uci, sd({ auto_routing: true, source_networks: [] }));
-	eq('dns: auto mode needs none (the main table carries the tunnel)',
+	enforce_routing(uci, sd({ auto_routing: true, source_networks: [], routing_table: '' }));
+	eq('dns: automatic mode needs none (the main table carries the tunnel)',
 		length(count('network', 'dns_lookup')), 0);
+	enforce_routing(uci, sd({ auto_routing: true, source_networks: [] }));
+	eq('dns: all-LAN with a table keeps them (the tunnel lives in the table)',
+		length(count('network', 'dns_lookup')), 2);
 
 	enforce_routing(uci, sd({}));
 	enforce_routing(uci, sd({ enabled: false }));
@@ -1211,6 +1214,65 @@ write_cache(cache, cpath);
 		length(count('firewall', 'bypass_mark')) == 0 && length(count('network', 'bypass_lookup')) == 0 &&
 		length(count('network', 'bypass_lookup6')) == 0 && length(count('dhcp', 'bypass_dns')) == 0 &&
 		length(count('firewall', 'bypass_set')) == 0);
+}
+
+// 8f. "Route all LAN traffic" with a routing table: the tunnel's default route
+//     lives in that table, so the LAN zone's networks are steered into it
+//     (the automatic path only works through the main table).
+{
+	let count = function(conf, role) {
+		let n = [];
+		for (let k in global.MOCK_UCI[conf])
+			if (global.MOCK_UCI[conf][k].nordvpn_role == role)
+				push(n, global.MOCK_UCI[conf][k]);
+		return n;
+	};
+	let at = function(over) {
+		let base = { name: 'main', enabled: true, interface: 'nordvpn', routing_table: '100',
+			auto_routing: true, killswitch: true, block_ipv6: true, vpn_dns: 'off',
+			source_networks: [], source_devices: [], source_domains: [],
+			bypass_devices: [], bypass_domains: [] };
+		for (let k in over)
+			base[k] = over[k];
+		return base;
+	};
+	global.MOCK_UCI = { nordvpn: { main: { '.type': 'instance', interface: 'nordvpn', enabled: '1' } },
+		network: {
+			nordvpn: { '.type': 'interface', proto: 'wireguard', private_key: KEY, vpn_type: 'nordvpn' },
+			lan: { '.type': 'interface', proto: 'static', ipaddr: '192.168.1.1/24' } },
+		firewall: {
+			zlan: { '.type': 'zone', name: 'lan', network: [ 'lan' ] },
+			zwan: { '.type': 'zone', name: 'wan', masq: '1', network: [ 'wan' ] } } };
+	let uci = cursor();
+
+	// Before the fix: a REJECT kill switch and no rule into the table, so
+	// the LAN kept using the WAN while the status said "connected".
+	enforce_routing(uci, at({}));
+	eq('all-LAN + table: reads as automatic', detect_routing(uci, at({}), false).mode, 'auto');
+	eq('all-LAN + table: LAN steered into the table',
+		map(count('network', 'steer_lookup'), (r) => [ r['in'], r.lookup, r.priority ]), [ [ 'lan', '100', '20000' ] ]);
+	ok('all-LAN + table: prohibit kill switch, not the REJECT rule',
+		length(count('network', 'steer_ks')) == 1 && length(count('firewall', 'killswitch')) == 0);
+	eq('all-LAN + table: LAN zone forwards into the VPN zone', length(filter(count('firewall', 'forwarding'),
+		(f) => f.src == 'lan' && f.dest == 'nordvpn')), 1);
+	ok('all-LAN + table: idempotent', !enforce_routing(uci, at({})).changed_network);
+
+	// Clearing the table goes back to the main-table path, cleanly.
+	enforce_routing(uci, at({ routing_table: '' }));
+	ok('all-LAN without a table: automatic path again',
+		length(count('network', 'steer_lookup')) == 0 && length(count('network', 'steer_ks')) == 0 &&
+		length(count('firewall', 'killswitch')) == 1);
+
+	// Leftover steered devices/domains are not applied on top of all-LAN.
+	enforce_routing(uci, at({ source_devices: [ 'aa:bb:cc:dd:ee:01' ], source_domains: [ 'example.com' ] }),
+		{ nftset: true });
+	ok('all-LAN + table: no per-device or per-domain steering',
+		length(count('firewall', 'device_mark')) == 0 && length(count('firewall', 'domain_mark')) == 0 &&
+		length(count('network', 'dev_lookup')) == 0);
+
+	// A hand-made rule into the table still means "manual: hands off".
+	global.MOCK_UCI.network.userroute = { '.type': 'route', interface: 'lan', target: '10.0.0.0/8', table: '100' };
+	eq('all-LAN + table + own route: manual', detect_routing(uci, at({}), false).mode, 'manual');
 }
 
 // 9b. domain steering: dnsmasq resolves the listed domains into a stamped fw4
