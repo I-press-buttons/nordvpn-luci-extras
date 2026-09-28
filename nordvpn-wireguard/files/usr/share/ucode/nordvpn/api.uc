@@ -9,6 +9,7 @@ import { pipe } from 'fs';
 const _common = require('nordvpn.common');
 const CREDS_URL = _common.CREDS_URL,
       open_cmd = _common.open_cmd,
+      full_match = _common.full_match,
       validate_token = _common.validate_token,
       validate_wg_key = _common.validate_wg_key;
 
@@ -27,6 +28,22 @@ function parse_credentials(body) {
 	if (!validate_wg_key(key))
 		return { error: 'no valid private key in credential response' };
 	return { private_key: key };
+}
+
+// Pure: the public IP from NordVPN's IP-insights JSON ({ "ip": ..., ... }),
+// or null. Exported so it can be unit-tested without any network access.
+function parse_ip_insights(body) {
+	let data;
+	try {
+		data = json(body);
+	} catch (e) {
+		return null;
+	}
+	let ip = (type(data) == 'object') ? data.ip : null;
+	if (type(ip) != 'string' || length(ip) < 2 || length(ip) > 45 ||
+	    !full_match(ip, /^[0-9a-fA-F:.]+$/))
+		return null;
+	return ip;
 }
 
 // Exchange a 64-hex token for the NordLynx WireGuard private key.
@@ -76,4 +93,4 @@ function get_private_key(token) {
 	return parse_credentials(body);
 }
 
-return { parse_credentials, get_private_key };
+return { parse_credentials, parse_ip_insights, get_private_key };

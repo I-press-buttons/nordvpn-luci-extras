@@ -43,8 +43,15 @@ var callSetCredentials = rpc.declare({ object: 'nordvpn', method: 'set_credentia
 // The protection was illusory anyway: what can lock an admin out is the
 // routing and firewall state, which the backend commits itself, outside this
 // transaction — rolling the settings file back would not restore access.
-var callUciApply = rpc.declare({
-	object: 'uci', method: 'apply', params: [ 'timeout', 'rollback' ]
+//
+// Commit only this app's own config, though. `uci apply` without a rollback
+// commits EVERY change staged in the session — pending network or firewall
+// edits from other pages included — and those do need the rollback. rpcd's
+// `commit` fires the same config-change reload trigger, for one package. It
+// is refused while another session's rollback is pending; `reject` surfaces
+// that as "Save failed" instead of reconnecting with the old settings.
+var callUciCommit = rpc.declare({
+	object: 'uci', method: 'commit', params: [ 'config' ], reject: true
 });
 
 // An apply rewrites the peer and then waits for a real WireGuard handshake per
@@ -571,9 +578,10 @@ return view.extend({
 			details.push(_('Kill switch is blocking LAN traffic'));
 		if (s.state === 'connected') {
 			var ipKey = this.instance + '|' + (s.gateway || '');
-			if (this.extIp && this.extIp.key === ipKey)
-				details.push(_('Public IP: %s').format(this.extIp.ip));
-			else
+			if (this.extIp && this.extIp.key === ipKey) {
+				if (this.extIp.ip)
+					details.push(_('Public IP: %s').format(this.extIp.ip));
+			} else
 				this.maybeFetchExternalIp(ipKey);
 		}
 		if (s.rotation && s.rotation.enabled)
@@ -599,6 +607,7 @@ return view.extend({
 
 	// Fetch the tunnel's public IP once per instance+gateway combination (the
 	// status poll runs every 5 s; external services would rate-limit that).
+	// A failed lookup is remembered too, so it is not retried on every poll.
 	maybeFetchExternalIp: function(key) {
 		if (this._extIpPending === key)
 			return;
@@ -607,10 +616,9 @@ return view.extend({
 			if (this._extIpPending !== key)
 				return;
 			this._extIpPending = null;
-			if (res && res.ip) {
-				this.extIp = { key: key, ip: res.ip };
+			this.extIp = { key: key, ip: (res && res.ip) ? res.ip : null };
+			if (this.extIp.ip)
 				this.updateStatusBand();
-			}
 		}, this)).catch(L.bind(function() {
 			this._extIpPending = null;
 		}, this));
@@ -1173,7 +1181,9 @@ return view.extend({
 			msgs.push(_('Ignored (not a domain name): %s').format(p.invalid.join(' ')));
 		if (p.capped)
 			msgs.push(_('Only the first 64 domains are used.'));
-		dom.content(this.domNote, msgs.join(' '));
+		// Array-wrapped: a bare string goes to innerHTML, and the ignored
+		// entries are raw editor/UCI text (see the E() note at the top).
+		dom.content(this.domNote, [ msgs.join(' ') ]);
 		this.domNote.classList.toggle('hidden', !msgs.length);
 	},
 
@@ -2456,7 +2466,7 @@ return view.extend({
 		var p = this.notice(_('Saving configuration…'), 'info');
 
 		return uci.save()
-			.then(function() { return callUciApply(0, false); })
+			.then(function() { return callUciCommit('nordvpn'); })
 			.then(L.bind(function() {
 				this.dirty = false;
 				this.clearChangeIndicator();
@@ -2615,13 +2625,14 @@ return view.extend({
 		} catch (e) {}
 	},
 
-	// Our custom save calls uci.apply() directly (the framework's apply would
-	// reload the page and abort the reconnect), so clear the global "Unsaved
-	// Changes" indicator ourselves once our commit has gone through.
+	// Our custom save commits directly (the framework's apply would reload the
+	// page and abort the reconnect), so refresh the global "Unsaved Changes"
+	// indicator ourselves once our commit has gone through. Re-read rather
+	// than zeroed: changes staged on other pages are still pending.
 	clearChangeIndicator: function() {
 		try {
 			if (L.ui && L.ui.changes)
-				L.ui.changes.setIndicator(0);
+				Promise.resolve(L.ui.changes.init()).catch(function() {});
 		} catch (e) {}
 	}
 });

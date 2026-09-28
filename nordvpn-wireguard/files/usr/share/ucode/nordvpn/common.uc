@@ -19,6 +19,9 @@ const VERSION = 'dev';
 const API_BASE = 'https://api.nordvpn.com/v1';
 const CREDS_URL = API_BASE + '/users/services/credentials';
 const SERVERS_URL = API_BASE + '/servers';
+// Public IP as NordVPN sees it. Keeps the external-IP check on the same host
+// as everything else, so the router contacts no third-party service.
+const IP_INSIGHTS_URL = API_BASE + '/helpers/ips/insights';
 
 const DEFAULT_INTERFACE = 'nordvpn';
 const DEFAULT_PORT = 51820;
@@ -137,6 +140,15 @@ function validate_hostname(h) {
 	if (type(h) != 'string' || length(h) < 1 || length(h) > 253)
 		return null;
 	return full_match(h, /^[A-Za-z0-9._:-]+$/) ? h : null;
+}
+
+// A NordVPN server hostname as the API publishes it ('<label>.nordvpn.com').
+// The tunnel endpoint must be one: the server list is a cache file, and a
+// tampered one must not be able to point the tunnel at a foreign server.
+function validate_nordvpn_host(h) {
+	if (!validate_hostname(h))
+		return null;
+	return full_match(h, /^[A-Za-z0-9-]+([.][A-Za-z0-9-]+)*[.]nordvpn[.]com$/) ? h : null;
 }
 
 function validate_port(p) {
@@ -622,7 +634,7 @@ function run(argv) {
 
 // CommonJS export (ucode on OpenWrt 24.10 does not support ES `export`).
 return {
-	VERSION, API_BASE, CREDS_URL, SERVERS_URL,
+	VERSION, API_BASE, CREDS_URL, SERVERS_URL, IP_INSIGHTS_URL,
 	DEFAULT_INTERFACE, DEFAULT_PORT, DEFAULT_KEEPALIVE, FIXED_ADDRESS,
 	CACHE_FILENAME, DEFAULT_CACHE_DIR, FETCH_STATUS_FILE, CACHE_LOCK_FILE,
 	APPLY_STATUS_FILE, APPLY_LOCK_FILE, APPLY_MAX_RUNTIME,
@@ -631,7 +643,7 @@ return {
 	MIN_VERIFY_TIMEOUT, MAX_VERIFY_TIMEOUT,
 	WATCHDOG_GRACE, WATCHDOG_COOLDOWN_BASE, WATCHDOG_COOLDOWN_MAX,
 	PROBE_FAIL_THRESHOLD, PROBE_TIMEOUT, DEFAULT_PROBE_TARGETS, HISTORY_MAX, MAX_STEER_DOMAINS,
-	full_match, bounded_int, validate_interface, validate_token, validate_wg_key, validate_hostname,
+	full_match, bounded_int, validate_interface, validate_token, validate_wg_key, validate_hostname, validate_nordvpn_host,
 	validate_port, validate_hop_mode, validate_dns_mode, relay_kind, validate_selection, validate_server_group, validate_rotation_mode, validate_interval, validate_time,
 	validate_country_code, validate_location_code, validate_instance, validate_routing_table, validate_dir,
 	validate_mac, validate_domain, clean_label, validate_ipv4,

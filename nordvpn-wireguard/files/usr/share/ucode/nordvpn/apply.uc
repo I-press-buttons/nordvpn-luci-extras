@@ -19,7 +19,7 @@ const FIXED_ADDRESS = _common.FIXED_ADDRESS,
       validate_interface = _common.validate_interface,
       validate_instance = _common.validate_instance,
       validate_wg_key = _common.validate_wg_key,
-      validate_hostname = _common.validate_hostname,
+      validate_nordvpn_host = _common.validate_nordvpn_host,
       validate_port = _common.validate_port,
       managed_interface = _common.managed_interface,
       iso_ts = _common.iso_ts,
@@ -110,9 +110,10 @@ function restore_peer(uci, iface, saved) {
 
 // Write the interface + peer for the chosen relay (no commit). The relay comes
 // from the cache file, so its endpoint and key are re-validated here before
-// they reach /etc/config/network. Returns false (nothing written) if invalid.
+// they reach /etc/config/network; the endpoint must be a NordVPN host. Returns
+// false (nothing written) if invalid.
 function write_relay(uci, iface, relay, s) {
-	if (!relay || !validate_hostname(relay.hostname) || !validate_wg_key(relay.public_key) ||
+	if (!relay || !validate_nordvpn_host(relay.hostname) || !validate_wg_key(relay.public_key) ||
 	    (relay.port != null && !validate_port(relay.port)))
 		return false;
 

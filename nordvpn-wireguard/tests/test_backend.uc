@@ -59,6 +59,16 @@ function eq(l, g, w) { ok(l, sprintf('%J', g) == sprintf('%J', w)); }
 	ok('parse rejects non-json', parse_credentials('not json').error != null);
 	ok('parse rejects missing key', parse_credentials('{"x":1}').error != null);
 	ok('parse rejects bad key', parse_credentials('{"nordlynx_private_key":"short"}').error != null);
+
+	let pii = require('nordvpn.api').parse_ip_insights;
+	eq('insights: ipv4', pii('{"ip":"203.0.113.7","country":"Germany","protected":true}'), '203.0.113.7');
+	eq('insights: ipv6', pii('{"ip":"2001:db8::1"}'), '2001:db8::1');
+	eq('insights: non-json', pii('<html>rate limited</html>'), null);
+	eq('insights: empty body', pii(''), null);
+	eq('insights: missing ip', pii('{"country":"Germany"}'), null);
+	eq('insights: ip not a string', pii('{"ip":42}'), null);
+	eq('insights: markup refused', pii('{"ip":"<b>1.2.3.4</b>"}'), null);
+	eq('insights: newline refused', pii('{"ip":"1.2.3.4\\nx"}'), null);
 }
 
 // Build a cache on disk from the fixture.
@@ -868,7 +878,14 @@ write_cache(cache, cpath);
 		{ hostname: 'a b', public_key: k, location: 'de-berlin' }, load_settings(uci)));
 	ok('write_relay refuses a bad key', !write_relay(uci, 'nordvpn',
 		{ hostname: 'de1.nordvpn.com', public_key: 'x', location: 'de-berlin' }, load_settings(uci)));
+	// A tampered cache must not point the tunnel outside NordVPN.
+	for (let h in [ '198.51.100.9', 'vpn.example.com', 'nordvpn.com.example.net',
+	                'evilnordvpn.com', 'de1.nordvpn.com.', 'de1.nordvpn.com\nx' ])
+		ok('write_relay refuses non-NordVPN endpoint ' + sprintf('%J', h), !write_relay(uci, 'nordvpn',
+			{ hostname: h, public_key: k, location: 'de-berlin' }, load_settings(uci)));
 	ok('nothing written for a refused relay', global.MOCK_UCI.network.nordvpn.nordvpn_gateway == null);
+	for (let h in [ 'de1.nordvpn.com', 'de-nl12.nordvpn.com', 'nl-onion1.nordvpn.com' ])
+		eq('nordvpn host accepted: ' + h, _cmn.validate_nordvpn_host(h), h);
 
 	ok('managed: missing section is claimable', _cmn.managed_interface(uci, 'nv_new'));
 	ok('managed: stamped interface', _cmn.managed_interface(uci, 'nordvpn'));

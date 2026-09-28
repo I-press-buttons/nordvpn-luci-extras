@@ -428,6 +428,24 @@ are cleared on reboot.
   against an allow-list first.
 - Every ubus input has a fixed schema and is validated for format and range.
 - The browser never receives the token or the WireGuard private key.
+- The tunnel endpoint must be a `*.nordvpn.com` server, so a tampered
+  server-list cache can't point the tunnel anywhere else.
+
+**What the router connects to.** Nothing listens on the network; the VPN
+firewall zone rejects all input and forwarding from the tunnel side.
+Outbound:
+
+- `api.nordvpn.com`: the one-time token exchange, the server list (every
+  `cache_refresh_interval`, 6 h by default) and, while the LuCI page is open,
+  the public-IP check (through the tunnel).
+- The NordVPN WireGuard server you're connected to (UDP 51820).
+- Only if you turn them on: NordVPN's DNS resolvers (`vpn_dns`), and pings
+  to the `probe_target`s (default `1.1.1.1` and `8.8.8.8`) through the tunnel
+  every 30 s for the internet check.
+
+Packages from CI artifacts and Releases are **unsigned**, which is why
+installing them needs `--allow-untrusted`. Only install packages you built
+yourself or downloaded from this repository over HTTPS.
 
 ## Upgrading
 

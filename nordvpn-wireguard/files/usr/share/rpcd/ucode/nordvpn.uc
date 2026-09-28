@@ -34,6 +34,7 @@ const next_rotation = _service.next_rotation,
       effective_state = _service.effective_state,
       egress_report = _service.egress_report;
 const read_events = require('nordvpn.history').read_events;
+const parse_ip_insights = require('nordvpn.api').parse_ip_insights;
 const list_clients = require('nordvpn.clients').clients;
 const detect_routing = require('nordvpn.routing').detect;
 const _cache = require('nordvpn.cache');
@@ -169,8 +170,9 @@ methods.refresh_status = {
 	}
 };
 
-// Public IP as seen through the instance's tunnel. Bound to the interface so
-// it reflects the VPN exit even with policy routing. Read-only network probe.
+// Public IP as seen through the instance's tunnel, asked of NordVPN's own API
+// (no third-party IP-echo service). Bound to the interface so it reflects the
+// VPN exit even with policy routing. Read-only network probe.
 methods.external_ip = {
 	args: { instance: '' },
 	call: function(request) {
@@ -179,12 +181,11 @@ methods.external_ip = {
 		if (!name)
 			return { error: 'no such instance' };
 		let iface = load_settings(uci, name).interface;
-		for (let url in [ 'https://api.ipify.org', 'https://ifconfig.me/ip' ]) {
-			let r = _common.run([ 'curl', '-s', '-m', '8', '--interface', iface, url ]);
-			let ip = trim(r.stdout || '');
-			if (r.code == 0 && length(ip) > 0 && length(ip) <= 45 && _common.full_match(ip, /^[0-9a-fA-F:.]+$/))
-				return { ip: ip, interface: iface };
-		}
+		let r = _common.run([ 'curl', '-s', '-m', '8', '--interface', iface,
+			'-H', 'Accept: application/json', _common.IP_INSIGHTS_URL ]);
+		let ip = (r.code == 0) ? parse_ip_insights(r.stdout) : null;
+		if (ip)
+			return { ip: ip, interface: iface };
 		return { error: 'could not determine the external IP' };
 	}
 };
