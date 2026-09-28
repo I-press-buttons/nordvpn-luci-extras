@@ -166,11 +166,13 @@ Supported: **OpenWrt snapshots** and **OpenWrt 25.12** (both use `apk`).
 
 ### Prebuilt packages from this fork
 
-Every CI run builds architecture-independent `.apk` packages. Download the
-`nordvpn-packages` artifact from a run on the
-[Actions page](https://github.com/I-press-buttons/nordvpn-luci-extras/actions),
-or from [Releases](https://github.com/I-press-buttons/nordvpn-luci-extras/releases)
-once a tagged version is published. Then, on the router:
+Every change merged into `master` is published on the
+[Releases page](https://github.com/I-press-buttons/nordvpn-luci-extras/releases/latest)
+as a release of its own, tagged `v<version>-<build>` (for example `v1.7.0-14`).
+Download both architecture-independent `.apk` files from the newest one.
+Pull request builds are available as the `nordvpn-packages` artifact on the
+[Actions page](https://github.com/I-press-buttons/nordvpn-luci-extras/actions).
+Then, on the router:
 
 ```sh
 apk add --allow-untrusted ./nordvpn-wireguard-*.apk ./luci-app-nordvpn-*.apk
@@ -511,7 +513,11 @@ sh nordvpn-wireguard/tests/run.sh
 ```
 
 CI (`.github/workflows/build.yml`) runs shell and JSON checks, ESLint on the
-LuCI view, the ucode tests, and a snapshot-SDK build of both packages.
+LuCI view, the ucode tests, and a snapshot-SDK build of both packages. Every
+push to `master` then publishes a GitHub release, tagged
+`v<PKG_VERSION>-<run number>`, with release notes generated from the merged
+changes. Pushing an annotated `v*` tag still publishes a release whose notes
+come from the tag message.
 
 ## Credits and license
 
