@@ -141,9 +141,26 @@ jobs:
           # Drop any package built by a previous run so the artifact glob only
           # picks up freshly built .apk files (warm SDK keeps old ones around).
           rm -f bin/packages/*/*/*nordvpn*.apk 2>/dev/null || true
+          # Fetch the feeds from OpenWrt's official GitHub mirrors (same
+          # commits): git.openwrt.org intermittently answers HTTP 500, notably
+          # to the full clone a new snapshot's base-feed pin triggers. Pinned
+          # ^commit / ;branch suffixes are kept.
+          sed -i \
+            -e 's#https://git\.openwrt\.org/openwrt/openwrt\.git#https://github.com/openwrt/openwrt.git#' \
+            -e 's#https://git\.openwrt\.org/feed/\([a-z0-9_-]*\)\.git#https://github.com/openwrt/\1.git#' \
+            -e 's#https://git\.openwrt\.org/project/luci\.git#https://github.com/openwrt/luci.git#' \
+            feeds.conf.default
+          grep '^src-' feeds.conf.default
           # Install every feed: luci-app-nordvpn pulls luci-base -> lucihttp,
           # whose Lua binding needs headers a narrowed install does not provide.
-          ./scripts/feeds update -a
+          # Retry transient fetch errors; `if` keeps bash -e from exiting early.
+          ok=0
+          for delay in 0 30 60; do
+            sleep "$delay"
+            if ./scripts/feeds update -a; then ok=1; break; fi
+            echo "feeds update failed; retrying" >&2
+          done
+          if [ "$ok" != 1 ]; then echo "::error::feeds update failed 3 times" >&2; exit 1; fi
           rm -rf package/nordvpn-wireguard
           cp -r "$GITHUB_WORKSPACE/nordvpn-wireguard" package/nordvpn-wireguard
           rm -rf feeds/luci/applications/luci-app-nordvpn
