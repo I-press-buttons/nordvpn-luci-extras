@@ -1067,6 +1067,23 @@ function enforce(uci, s, opts) {
 		cn = true;
 	}
 
+	// 5b. Steered mode keeps the tunnel's routes in the instance table, so the
+	//     router's own queries to those resolvers (dnsmasq forwards every
+	//     client's lookups to them) would follow the main table out of the WAN,
+	//     readable by the ISP. Send them into the instance table. netifd drops
+	//     the interface's DNS servers while the tunnel is down, so no prohibit
+	//     rule is needed. Keyed by resolver AND table, so a table change
+	//     replaces the rules instead of leaving a stale lookup.
+	let dns_keys = [];
+	if (steer && mode && VPN_DNS[mode])
+		for (let ip in split(VPN_DNS[mode], ' '))
+			push(dns_keys, ip + '/32 ' + table);
+	if (reconcile_rules(uci, 'rule', 'dns_lookup', iface, dns_keys, function(k) {
+		let p = split(k, ' ');
+		return { dest: p[0], lookup: p[1], priority: '19500', nordvpn_key: k };
+	}, 'nordvpn_key'))
+		cn = true;
+
 	return { changed_network: cn, changed_firewall: cf, changed_dhcp: cd,
 		domains_active: length(steer_doms) > 0, notes: notes };
 }

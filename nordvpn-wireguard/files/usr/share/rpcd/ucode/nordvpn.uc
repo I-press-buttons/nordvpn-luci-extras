@@ -34,7 +34,7 @@ const next_rotation = _service.next_rotation,
       effective_state = _service.effective_state,
       egress_report = _service.egress_report;
 const read_events = require('nordvpn.history').read_events;
-const parse_ip_insights = require('nordvpn.api').parse_ip_insights;
+const parse_insights = require('nordvpn.api').parse_insights;
 const list_clients = require('nordvpn.clients').clients;
 const detect_routing = require('nordvpn.routing').detect;
 const _cache = require('nordvpn.cache');
@@ -196,9 +196,22 @@ methods.refresh_status = {
 	}
 };
 
-// Public IP as seen through the instance's tunnel, asked of NordVPN's own API
-// (no third-party IP-echo service). Bound to the interface so it reflects the
-// VPN exit even with policy routing. Read-only network probe.
+// Ask NordVPN's own API how it sees a request from this router (no third-party
+// IP-echo service). `extra` is prepended curl arguments. Parsed or null.
+function insights(extra) {
+	let r = _common.run([ 'curl', '-s', '-m', '8', ...extra,
+		'-H', 'Accept: application/json', _common.IP_INSIGHTS_URL ]);
+	return (r.code == 0) ? parse_insights(r.stdout) : null;
+}
+
+// Public IP, location and NordVPN's "protected" verdict as seen through the
+// instance's tunnel. Bound to the interface so it reflects the VPN exit even
+// with policy routing. With "Route all LAN traffic" the LAN uses the main
+// table, the same one an unbound request from the router takes, so ask again
+// without binding: `lan_path.protected == false` means LAN traffic leaves
+// outside the VPN although the tunnel itself is up. (Steered clients use the
+// instance table, which the router's own traffic cannot reproduce.)
+// Read-only network probe.
 methods.external_ip = {
 	args: { instance: '' },
 	call: function(request) {
@@ -206,13 +219,16 @@ methods.external_ip = {
 		let name = req_instance(uci, request);
 		if (!name)
 			return { error: 'no such instance' };
-		let iface = load_settings(uci, name).interface;
-		let r = _common.run([ 'curl', '-s', '-m', '8', '--interface', iface,
-			'-H', 'Accept: application/json', _common.IP_INSIGHTS_URL ]);
-		let ip = (r.code == 0) ? parse_ip_insights(r.stdout) : null;
-		if (ip)
-			return { ip: ip, interface: iface };
-		return { error: 'could not determine the external IP' };
+		let s = load_settings(uci, name);
+		let res = insights([ '--interface', s.interface ]);
+		if (!res)
+			return { error: 'could not determine the external IP' };
+		res.interface = s.interface;
+		if (s.enabled && detect_routing(uci, s, false).mode == 'auto') {
+			let lan = insights([]);
+			res.lan_path = lan ? { protected: lan.protected, ip: lan.ip, isp: lan.isp } : null;
+		}
+		return res;
 	}
 };
 

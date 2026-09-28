@@ -576,12 +576,12 @@ return view.extend({
 			details.push(_('🧅 Onion over VPN'));
 		if (s.state !== 'connected' && s.state !== 'no_egress' && s.routing && s.routing.killswitch)
 			details.push(_('Kill switch is blocking LAN traffic'));
+		var protLine = null;
 		if (s.state === 'connected') {
 			var ipKey = this.instance + '|' + (s.gateway || '');
-			if (this.extIp && this.extIp.key === ipKey) {
-				if (this.extIp.ip)
-					details.push(_('Public IP: %s').format(this.extIp.ip));
-			} else
+			if (this.extIp && this.extIp.key === ipKey)
+				protLine = this.protectionLine(this.extIp.res);
+			else
 				this.maybeFetchExternalIp(ipKey);
 		}
 		if (s.rotation && s.rotation.enabled)
@@ -599,15 +599,17 @@ return view.extend({
 						E('span', {}, locText || '')
 					]),
 					E('div', { class: 'nv-status-details' }, details.join(' · ')),
+					protLine,
+					this.dnsLine(s),
 					E('div', { class: 'nv-status-actions' }, this.actionButtons(s))
 				])
 			])
 		]));
 	},
 
-	// Fetch the tunnel's public IP once per instance+gateway combination (the
-	// status poll runs every 5 s; external services would rate-limit that).
-	// A failed lookup is remembered too, so it is not retried on every poll.
+	// Ask NordVPN how it sees the tunnel once per instance+gateway combination
+	// (the status poll runs every 5 s; the API would rate-limit that). A
+	// failed lookup is remembered too, so it is not retried on every poll.
 	maybeFetchExternalIp: function(key) {
 		if (this._extIpPending === key)
 			return;
@@ -616,12 +618,57 @@ return view.extend({
 			if (this._extIpPending !== key)
 				return;
 			this._extIpPending = null;
-			this.extIp = { key: key, ip: (res && res.ip) ? res.ip : null };
-			if (this.extIp.ip)
+			this.extIp = { key: key, res: (res && !res.error) ? res : null };
+			if (this.extIp.res)
 				this.updateStatusBand();
 		}, this)).catch(L.bind(function() {
 			this._extIpPending = null;
 		}, this));
+	},
+
+	// NordVPN's own verdict on the tunnel's exit (and, with "Route all LAN
+	// traffic", on the path LAN traffic takes), or null before an answer.
+	protectionLine: function(r) {
+		if (!r)
+			return null;
+		var good = 'color:var(--success-color,#2d8f4e);font-weight:600';
+		var bad = 'color:var(--error-color,#c0392b);font-weight:600';
+		var kids = [];
+		if (r.protected === true)
+			kids.push(E('span', { style: good }, _('🛡 Protected by NordVPN')));
+		else if (r.protected === false)
+			kids.push(E('span', { style: bad }, _('⚠ NordVPN does not see this exit as one of its servers')));
+		var info = [
+			[ r.city, r.country ].filter(Boolean).join(', '),
+			r.ip ? _('Public IP: %s').format(r.ip) : '',
+			r.isp || ''
+		].filter(Boolean).join(' · ');
+		if (info)
+			kids.push((kids.length ? ' · ' : '') + info);
+		if (r.lan_path && r.lan_path.protected === false)
+			kids.push(E('div', { style: bad },
+				_('⚠ LAN traffic is not going through the VPN: NordVPN sees it coming from %s.')
+					.format(r.lan_path.isp || r.lan_path.ip || _('your normal connection'))));
+		return kids.length ? E('div', { class: 'nv-status-details' }, kids) : null;
+	},
+
+	// Which resolver clients use while this instance routes traffic: NordVPN's
+	// (through the tunnel), or the router's upstream, usually the ISP's, which
+	// sees every name looked up. Only shown while the tunnel carries traffic.
+	dnsLine: function(s) {
+		var rt = s.routing || {};
+		if (s.enabled === false || (s.state !== 'connected' && s.state !== 'no_egress') ||
+		    (rt.mode !== 'auto' && rt.mode !== 'steered'))
+			return null;
+		var mode = uci.get('nordvpn', this.instance, 'vpn_dns');
+		if (mode !== 'off' && mode !== 'standard' && mode !== 'threat')
+			mode = (uci.get('nordvpn', this.instance, 'use_vpn_dns') === '1') ? 'standard' : 'off';
+		if (mode === 'off')
+			return E('div', { class: 'nv-status-details', style: 'color:var(--warning-color,#b8860b)' },
+				_('DNS: the router\'s upstream resolver (usually your ISP), which can see every site looked up. Choose NordVPN DNS under Traffic routing to change that.'));
+		return E('div', { class: 'nv-status-details' }, (mode === 'threat')
+			? _('DNS: NordVPN Threat Protection, through the tunnel')
+			: _('DNS: NordVPN, through the tunnel'));
 	},
 
 	/* ---- event history ---------------------------------------------- */

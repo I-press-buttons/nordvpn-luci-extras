@@ -60,15 +60,26 @@ function eq(l, g, w) { ok(l, sprintf('%J', g) == sprintf('%J', w)); }
 	ok('parse rejects missing key', parse_credentials('{"x":1}').error != null);
 	ok('parse rejects bad key', parse_credentials('{"nordlynx_private_key":"short"}').error != null);
 
-	let pii = require('nordvpn.api').parse_ip_insights;
-	eq('insights: ipv4', pii('{"ip":"203.0.113.7","country":"Germany","protected":true}'), '203.0.113.7');
-	eq('insights: ipv6', pii('{"ip":"2001:db8::1"}'), '2001:db8::1');
-	eq('insights: non-json', pii('<html>rate limited</html>'), null);
-	eq('insights: empty body', pii(''), null);
-	eq('insights: missing ip', pii('{"country":"Germany"}'), null);
-	eq('insights: ip not a string', pii('{"ip":42}'), null);
-	eq('insights: markup refused', pii('{"ip":"<b>1.2.3.4</b>"}'), null);
-	eq('insights: newline refused', pii('{"ip":"1.2.3.4\\nx"}'), null);
+	let pi = require('nordvpn.api').parse_insights;
+	eq('insights: full answer', pi('{"ip":"203.0.113.7","city":"Frankfurt","country":"Germany",' +
+		'"country_code":"DE","isp":"Example GmbH","isp_asn":64500,"protected":true}'),
+		{ ip: '203.0.113.7', protected: true, country: 'Germany', country_code: 'de',
+		  city: 'Frankfurt', isp: 'Example GmbH' });
+	eq('insights: ipv6', pi('{"ip":"2001:db8::1"}').ip, '2001:db8::1');
+	eq('insights: without ip (NordVPN client shape)',
+		pi('{"city":"Tallinn","country":"Estonia","country_code":"EE","protected":false}'),
+		{ ip: null, protected: false, country: 'Estonia', country_code: 'ee', city: 'Tallinn', isp: null });
+	eq('insights: non-json', pi('<html>rate limited</html>'), null);
+	eq('insights: empty body', pi(''), null);
+	eq('insights: not an object', pi('[1,2]'), null);
+	eq('insights: neither ip nor verdict', pi('{"country":"Germany"}'), null);
+	eq('insights: ip not a string', pi('{"ip":42}'), null);
+	eq('insights: verdict must be a boolean', pi('{"protected":"yes"}'), null);
+	eq('insights: markup ip refused', pi('{"ip":"<b>1.2.3.4</b>"}'), null);
+	eq('insights: newline ip refused', pi('{"ip":"1.2.3.4\\nx"}'), null);
+	let hostile = pi('{"protected":true,"isp":"<img src=x onerror=alert(1)>","country_code":"<b>"}');
+	eq('insights: labels stripped of markup, bad code dropped', [ hostile.isp, hostile.country_code ],
+		[ 'img src=x onerror=alert(1)', null ]);
 }
 
 // Build a cache on disk from the fixture.
@@ -995,6 +1006,65 @@ write_cache(cache, cpath);
 	ok('delete_instance removes device objects',
 		_apply.delete_instance(uci, 'media').ok == true &&
 		length(count('firewall', 'device_mark')) == 0 && length(count('network', 'dev_lookup')) == 0);
+}
+
+// 8d. NordVPN DNS through the tunnel: in steered mode the tunnel's routes live
+//     in the instance table, so the router's own queries to the NordVPN
+//     resolvers get stamped `dest` rules into that table.
+{
+	let count = function(conf, role) {
+		let n = [];
+		for (let k in global.MOCK_UCI[conf])
+			if (global.MOCK_UCI[conf][k].nordvpn_role == role)
+				push(n, global.MOCK_UCI[conf][k]);
+		return sort(n, (a, b) => (a.dest < b.dest) ? -1 : (a.dest > b.dest) ? 1 : 0);
+	};
+	let sd = function(over) {
+		let base = { name: 'main', enabled: true, interface: 'nordvpn', routing_table: '100',
+			auto_routing: false, killswitch: false, block_ipv6: false, vpn_dns: 'standard',
+			source_networks: [ 'lan' ], source_devices: [], source_domains: [] };
+		for (let k in over)
+			base[k] = over[k];
+		return base;
+	};
+	global.MOCK_UCI = { nordvpn: { main: { '.type': 'instance', interface: 'nordvpn', enabled: '1' } },
+		network: {
+			nordvpn: { '.type': 'interface', proto: 'wireguard', private_key: KEY, vpn_type: 'nordvpn' },
+			lan: { '.type': 'interface', proto: 'static', ipaddr: '192.168.1.1/24' } },
+		firewall: {
+			zlan: { '.type': 'zone', name: 'lan', network: [ 'lan' ] },
+			zwan: { '.type': 'zone', name: 'wan', masq: '1', network: [ 'wan' ] } } };
+	let uci = cursor();
+	let shape = (l) => map(l, (r) => [ r.dest, r.lookup, r.priority ]);
+
+	enforce_routing(uci, sd({}));
+	eq('dns: a rule per standard resolver, into the table', shape(count('network', 'dns_lookup')),
+		[ [ '103.86.96.100/32', '100', '19500' ], [ '103.86.99.100/32', '100', '19500' ] ]);
+	eq('dns: the interface carries the resolvers', global.MOCK_UCI.network.nordvpn.dns,
+		[ '103.86.96.100', '103.86.99.100' ]);
+	eq('dns: the rules are stamped, not user rules', _routing.count_user_routes(uci, 'nordvpn', ''), 0);
+	eq('dns: still steered, not manual', detect_routing(uci, sd({}), false).mode, 'steered');
+	ok('dns: idempotent', !enforce_routing(uci, sd({})).changed_network);
+
+	enforce_routing(uci, sd({ vpn_dns: 'threat' }));
+	eq('dns: Threat Protection swaps the resolvers', shape(count('network', 'dns_lookup')),
+		[ [ '103.86.96.96/32', '100', '19500' ], [ '103.86.99.99/32', '100', '19500' ] ]);
+
+	enforce_routing(uci, sd({ vpn_dns: 'threat', routing_table: '101' }));
+	eq('dns: a table change re-points the rules', map(count('network', 'dns_lookup'), (r) => r.lookup),
+		[ '101', '101' ]);
+
+	enforce_routing(uci, sd({ vpn_dns: 'off' }));
+	eq('dns: off removes the rules', length(count('network', 'dns_lookup')), 0);
+
+	enforce_routing(uci, sd({}));
+	enforce_routing(uci, sd({ auto_routing: true, source_networks: [] }));
+	eq('dns: auto mode needs none (the main table carries the tunnel)',
+		length(count('network', 'dns_lookup')), 0);
+
+	enforce_routing(uci, sd({}));
+	enforce_routing(uci, sd({ enabled: false }));
+	eq('dns: a disabled instance releases them', length(count('network', 'dns_lookup')), 0);
 }
 
 // 9b. domain steering: dnsmasq resolves the listed domains into a stamped fw4
