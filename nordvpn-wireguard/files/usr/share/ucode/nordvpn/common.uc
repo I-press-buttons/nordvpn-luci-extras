@@ -420,6 +420,27 @@ function load_settings(uci, instance) {
 			push(steer_domains, d);
 	}
 
+	// `list bypass_device` / `list bypass_domain` — exceptions: devices and
+	// domains that always take the normal connection, even while the kill
+	// switch blocks the rest. An entry that is both steered and excluded
+	// counts as excluded.
+	let bd = uci.get('nordvpn', name, 'bypass_device');
+	let bypass_devices = [];
+	for (let x in ((type(bd) == 'array') ? bd : (bd != null ? [ bd ] : []))) {
+		let mac = validate_mac(x);
+		if (mac && index(bypass_devices, mac) < 0)
+			push(bypass_devices, mac);
+	}
+	let bdm = uci.get('nordvpn', name, 'bypass_domain');
+	let bypass_domains = [];
+	for (let x in ((type(bdm) == 'array') ? bdm : (bdm != null ? [ bdm ] : []))) {
+		let d = validate_domain(x);
+		if (d && index(bypass_domains, d) < 0 && length(bypass_domains) < MAX_STEER_DOMAINS)
+			push(bypass_domains, d);
+	}
+	source_devices = filter(source_devices, (m) => index(bypass_devices, m) < 0);
+	steer_domains = filter(steer_domains, (d) => index(bypass_domains, d) < 0);
+
 	// `list locations` — the instance's location set: countries ('de') and/or
 	// cities ('de-berlin') that both the initial connect and the rotation pick
 	// from. Empty = the legacy country_code/city_code selection. A city code
@@ -454,16 +475,28 @@ function load_settings(uci, instance) {
 	if (length(probe_targets) == 0)
 		probe_targets = [ ...DEFAULT_PROBE_TARGETS ];
 
+	let iface = validate_interface(g('interface', DEFAULT_INTERFACE)) || DEFAULT_INTERFACE;
+	// Invalid names fall back to the main table (see validate_routing_table).
+	let routing_table = validate_routing_table(g('routing_table', '')) || '';
+	// "Route all LAN traffic" with exceptions runs on the steered machinery,
+	// which needs a routing table: without a configured one, use the
+	// interface's name. Never written to the config, so removing the
+	// exceptions restores plain automatic routing through the main table.
+	if (routing_table == '' && g('auto_routing', '0') == '1' &&
+	    (length(bypass_devices) > 0 || length(bypass_domains) > 0))
+		routing_table = iface;
+
 	return {
 		name: name,
 		source_networks: source_networks,
 		source_devices: source_devices,
 		source_domains: steer_domains,
+		bypass_devices: bypass_devices,
+		bypass_domains: bypass_domains,
 		locations: locations,
 		enabled: g('enabled', '0') == '1',
-		interface: validate_interface(g('interface', DEFAULT_INTERFACE)) || DEFAULT_INTERFACE,
-		// Invalid names fall back to the main table (see validate_routing_table).
-		routing_table: validate_routing_table(g('routing_table', '')) || '',
+		interface: iface,
+		routing_table: routing_table,
 		// Optional WireGuard interface MTU override; null = keep the netifd
 		// default (1420). Clamped to the valid Ethernet/IPv6 range.
 		mtu: (function() {

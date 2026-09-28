@@ -642,6 +642,8 @@ function delete_instance(uci, name) {
 	s.source_networks = [];
 	s.source_devices = [];
 	s.source_domains = [];
+	s.bypass_devices = [];
+	s.bypass_domains = [];
 	let routing = enforce_routing(uci, s);
 	if (commit_routing(uci, routing))
 		uci = cursor(); // see apply(): committed deletions break iteration

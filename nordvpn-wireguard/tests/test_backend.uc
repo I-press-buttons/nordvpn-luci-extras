@@ -1067,6 +1067,152 @@ write_cache(cache, cpath);
 	eq('dns: a disabled instance releases them', length(count('network', 'dns_lookup')), 0);
 }
 
+// 8e. Exceptions: excluded devices and domains always take the main table,
+//     ahead of every steering and prohibit rule. With "Route all LAN traffic"
+//     they move the instance onto steering of the LAN zone's networks.
+{
+	let D1 = 'aa:bb:cc:dd:ee:01', D2 = 'aa:bb:cc:dd:ee:02', D3 = 'aa:bb:cc:dd:ee:03';
+	let BMARK = '0xfe000000/0xff000000';
+
+	// Settings: parsing, overlap, and the implicit table of all-LAN mode.
+	global.MOCK_UCI = { nordvpn: { main: { '.type': 'instance', interface: 'nordvpn', auto_routing: '1',
+		bypass_device: [ 'AA:BB:CC:DD:EE:01', 'aa-bb-cc-dd-ee-01', 'junk' ],
+		source_device: [ D1, D2 ],
+		bypass_domain: [ 'Bank.Example.com', 'not a domain!' ],
+		steer_domain: [ 'bank.example.com', 'video.example.org' ] } } };
+	let ls = load_settings(cursor());
+	eq('exceptions: devices validated + deduped', ls.bypass_devices, [ D1 ]);
+	eq('exceptions: domains validated + normalized', ls.bypass_domains, [ 'bank.example.com' ]);
+	eq('exceptions: an excluded device is not also steered', ls.source_devices, [ D2 ]);
+	eq('exceptions: an excluded domain is not also steered', ls.source_domains, [ 'video.example.org' ]);
+	eq('exceptions: all-LAN gets the interface as implicit table', ls.routing_table, 'nordvpn');
+	global.MOCK_UCI.nordvpn.main.routing_table = '100';
+	eq('exceptions: an explicit table wins', load_settings(cursor()).routing_table, '100');
+	delete global.MOCK_UCI.nordvpn.main.routing_table;
+	global.MOCK_UCI.nordvpn.main.auto_routing = '0';
+	eq('exceptions: no implicit table outside all-LAN', load_settings(cursor()).routing_table, '');
+	global.MOCK_UCI.nordvpn.main.auto_routing = '1';
+	delete global.MOCK_UCI.nordvpn.main.bypass_device;
+	delete global.MOCK_UCI.nordvpn.main.bypass_domain;
+	eq('exceptions: removing them drops the implicit table', load_settings(cursor()).routing_table, '');
+
+	let count = function(conf, role) {
+		let n = [];
+		for (let k in global.MOCK_UCI[conf])
+			if (global.MOCK_UCI[conf][k].nordvpn_role == role)
+				push(n, global.MOCK_UCI[conf][k]);
+		return n;
+	};
+	let ex = function(over) {
+		let base = { name: 'main', enabled: true, interface: 'nordvpn', routing_table: '100',
+			auto_routing: true, killswitch: true, block_ipv6: true, vpn_dns: 'off',
+			source_networks: [], source_devices: [], source_domains: [],
+			bypass_devices: [ D1 ], bypass_domains: [] };
+		for (let k in over)
+			base[k] = over[k];
+		return base;
+	};
+	let fresh = function() {
+		global.MOCK_UCI = { nordvpn: { main: { '.type': 'instance', interface: 'nordvpn', enabled: '1' } },
+			network: {
+				nordvpn: { '.type': 'interface', proto: 'wireguard', private_key: KEY, vpn_type: 'nordvpn' },
+				lan: { '.type': 'interface', proto: 'static', ipaddr: '192.168.1.1/24' },
+				iot: { '.type': 'interface', proto: 'static', ipaddr: '192.168.5.1/24' } },
+			firewall: {
+				zlan: { '.type': 'zone', name: 'lan', network: [ 'lan', 'iot' ] },
+				zwan: { '.type': 'zone', name: 'wan', masq: '1', network: [ 'wan' ] } },
+			dhcp: {} };
+		return cursor();
+	};
+	let yes = { nftset: true }, no = { nftset: false };
+
+	// detect: exceptions only count while traffic is routed at all.
+	let uci = fresh();
+	let det = detect_routing(uci, ex({}), false);
+	eq('exceptions: all-LAN still reads as auto', [ det.mode, det.exceptions ], [ 'auto', true ]);
+	det = detect_routing(uci, ex({ auto_routing: false }), false);
+	eq('exceptions: alone they route nothing', [ det.mode, det.exceptions ], [ 'none', false ]);
+
+	// All-LAN + an excluded device: steering of every LAN-zone network.
+	let res = enforce_routing(uci, ex({}), yes);
+	eq('exceptions: every LAN-zone network steered into the table',
+		sort(map(count('network', 'steer_lookup'), (r) => r['in'] + '>' + r.lookup)), [ 'iot>100', 'lan>100' ]);
+	eq('exceptions: no automatic REJECT kill switch', count('firewall', 'killswitch'), []);
+	eq('exceptions: kill switch as prohibit rules instead', length(count('network', 'steer_ks')), 2);
+	let bm = count('firewall', 'bypass_mark');
+	ok('exceptions: MARK rule for the excluded device', length(bm) == 1 && bm[0].src_mac == D1 &&
+		bm[0].src == '*' && bm[0].target == 'MARK' && bm[0].set_xmark == BMARK);
+	let bl = count('network', 'bypass_lookup'), bl6 = count('network', 'bypass_lookup6');
+	ok('exceptions: mark -> main table at 18000, both families',
+		length(bl) == 1 && bl[0].mark == BMARK && bl[0].lookup == 'main' && bl[0].priority == '18000' &&
+		length(bl6) == 1 && bl6[0]['.type'] == 'rule6' && bl6[0].lookup == 'main');
+	eq('exceptions: LAN zone forwards into the VPN zone', length(filter(count('firewall', 'forwarding'),
+		(f) => f.src == 'lan' && f.dest == 'nordvpn')), 1);
+	ok('exceptions: idempotent', !enforce_routing(uci, ex({}), yes).changed_firewall &&
+		!enforce_routing(uci, ex({}), yes).changed_network);
+	eq('exceptions: all-LAN objects are stamped, not manual', detect_routing(uci, ex({}), false).mode, 'auto');
+
+	// Excluded domains: a dnsmasq-filled set and a MARK rule from the LAN zone.
+	res = enforce_routing(uci, ex({ bypass_domains: [ 'bank.example.com' ] }), yes);
+	let bs = count('firewall', 'bypass_set'), bdm = count('firewall', 'bypass_domain_mark');
+	ok('exceptions: fw4 set for excluded domains', length(bs) == 1 && bs[0].name == 'nv_nordvpn_byp');
+	ok('exceptions: domain MARK rule from the LAN zone', length(bdm) == 1 && bdm[0].src == 'lan' &&
+		bdm[0].ipset == 'nv_nordvpn_byp' && bdm[0].set_xmark == BMARK);
+	let bd = count('dhcp', 'bypass_dns');
+	ok('exceptions: dnsmasq fills the set', length(bd) == 1 && bd[0].domain[0] == 'bank.example.com' &&
+		bd[0].name[0] == 'nv_nordvpn_byp');
+	ok('exceptions: dnsmasq restarted for the set', res.domains_active);
+	res = enforce_routing(uci, ex({ bypass_domains: [ 'bank.example.com' ] }), no);
+	ok('exceptions: no dnsmasq-full -> domain objects removed, with a note',
+		length(count('firewall', 'bypass_set')) == 0 && length(count('dhcp', 'bypass_dns')) == 0 &&
+		length(filter(res.notes, (n) => index(n, 'dnsmasq-full') >= 0)) == 1);
+	eq('exceptions: ... the excluded device stays', length(count('firewall', 'bypass_mark')), 1);
+
+	// Removing the exceptions returns to plain automatic routing.
+	enforce_routing(uci, ex({ bypass_devices: [], routing_table: '' }), yes);
+	ok('exceptions: removed -> back to automatic routing',
+		length(count('network', 'steer_lookup')) == 0 && length(count('firewall', 'killswitch')) == 1 &&
+		length(count('firewall', 'bypass_mark')) == 0 && length(count('network', 'bypass_lookup')) == 0 &&
+		length(count('network', 'bypass_lookup6')) == 0);
+
+	// Without a table all-LAN stays automatic (exceptions not applied).
+	uci = fresh();
+	res = enforce_routing(uci, ex({ routing_table: '' }), yes);
+	ok('exceptions: no table -> stays automatic, with a note',
+		length(count('firewall', 'killswitch')) == 1 && length(count('firewall', 'bypass_mark')) == 0 &&
+		length(filter(res.notes, (n) => index(n, 'need a routing table') >= 0)) == 1);
+
+	// The main table cannot carry steering and exceptions at once.
+	uci = fresh();
+	res = enforce_routing(uci, ex({ routing_table: '254' }), yes);
+	ok('exceptions: refused when the instance table is main',
+		length(count('firewall', 'bypass_mark')) == 0 &&
+		length(filter(res.notes, (n) => index(n, 'other than main') >= 0)) == 1);
+
+	// Steered mode: exceptions sit next to device steering, and must follow
+	// every steering MARK rule (fw4: the last matching MARK wins).
+	uci = fresh();
+	let st = (devs) => ex({ auto_routing: false, source_devices: devs });
+	enforce_routing(uci, st([ D2 ]), yes);
+	enforce_routing(uci, st([ D2, D3 ]), yes);
+	let order = [];
+	for (let k in global.MOCK_UCI.firewall) {
+		let r = global.MOCK_UCI.firewall[k].nordvpn_role;
+		if (r == 'device_mark' || r == 'bypass_mark')
+			push(order, r);
+	}
+	eq('exceptions: recreated after a later steering MARK rule', order,
+		[ 'device_mark', 'device_mark', 'bypass_mark' ]);
+	ok('exceptions: order stable once fixed', !enforce_routing(uci, st([ D2, D3 ]), yes).changed_firewall);
+
+	// Disabling the instance releases everything.
+	enforce_routing(uci, ex({ enabled: false, bypass_domains: [ 'bank.example.com' ] }), yes);
+	ok('exceptions: a disabled instance releases them',
+		length(count('firewall', 'bypass_mark')) == 0 && length(count('network', 'bypass_lookup')) == 0 &&
+		length(count('network', 'bypass_lookup6')) == 0 && length(count('dhcp', 'bypass_dns')) == 0 &&
+		length(count('firewall', 'bypass_set')) == 0);
+}
+
 // 9b. domain steering: dnsmasq resolves the listed domains into a stamped fw4
 //     nft set, one MARK rule gives them the instance's device mark, and the
 //     device lookup / prohibit rules route them. Needs dnsmasq nftset support.
