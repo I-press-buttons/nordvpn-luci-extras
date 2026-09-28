@@ -1275,6 +1275,50 @@ write_cache(cache, cpath);
 	eq('all-LAN + table + own route: manual', detect_routing(uci, at({}), false).mode, 'manual');
 }
 
+// 8g. A routing table change re-points the steering rules (they are keyed by
+//     network, so reconciliation alone would keep the old lookup).
+{
+	let count = function(conf, role) {
+		let n = [];
+		for (let k in global.MOCK_UCI[conf])
+			if (global.MOCK_UCI[conf][k].nordvpn_role == role)
+				push(n, global.MOCK_UCI[conf][k]);
+		return n;
+	};
+	let st = function(over) {
+		let base = { name: 'main', enabled: true, interface: 'nordvpn', routing_table: '100',
+			auto_routing: false, killswitch: true, block_ipv6: true, vpn_dns: 'off',
+			source_networks: [ 'lan', 'guest' ], source_devices: [], source_domains: [],
+			bypass_devices: [], bypass_domains: [] };
+		for (let k in over)
+			base[k] = over[k];
+		return base;
+	};
+	global.MOCK_UCI = { nordvpn: { main: { '.type': 'instance', interface: 'nordvpn', enabled: '1' } },
+		network: {
+			nordvpn: { '.type': 'interface', proto: 'wireguard', private_key: KEY, vpn_type: 'nordvpn' },
+			lan: { '.type': 'interface', proto: 'static', ipaddr: '192.168.1.1/24' },
+			guest: { '.type': 'interface', proto: 'static', ipaddr: '192.168.9.1/24' } },
+		firewall: {
+			zlan: { '.type': 'zone', name: 'lan', network: [ 'lan' ] },
+			zguest: { '.type': 'zone', name: 'guest', network: [ 'guest' ] },
+			zwan: { '.type': 'zone', name: 'wan', masq: '1', network: [ 'wan' ] } } };
+	let uci = cursor();
+	let lookups = () => sort(map(count('network', 'steer_lookup'), (r) => r['in'] + '>' + r.lookup));
+	let locals = () => sort(map(count('network', 'steer_local'), (r) => r.target + '>' + r.table));
+
+	enforce_routing(uci, st({}));
+	eq('table change: before', lookups(), [ 'guest>100', 'lan>100' ]);
+	let res = enforce_routing(uci, st({ routing_table: '101' }));
+	ok('table change: reported as a network change', res.changed_network);
+	eq('table change: every lookup re-pointed, none duplicated', lookups(), [ 'guest>101', 'lan>101' ]);
+	eq('table change: local bypass routes follow', locals(),
+		[ '192.168.1.0/24>101', '192.168.9.0/24>101' ]);
+	ok('table change: stable afterwards', !enforce_routing(uci, st({ routing_table: '101' })).changed_network);
+	enforce_routing(uci, st({ routing_table: '101', source_networks: [ 'lan' ] }));
+	eq('table change: deselecting still removes only that network', lookups(), [ 'lan>101' ]);
+}
+
 // 9b. domain steering: dnsmasq resolves the listed domains into a stamped fw4
 //     nft set, one MARK rule gives them the instance's device mark, and the
 //     device lookup / prohibit rules route them. Needs dnsmasq nftset support.

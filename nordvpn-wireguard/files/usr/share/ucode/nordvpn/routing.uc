@@ -500,6 +500,15 @@ function drop_rt_table(name) {
 		atomic_write(RT_TABLES, join('\n', kept));
 }
 
+// Is routing table `name` any instance's (effective) table? `skip` names an
+// instance to leave out, usually the caller's own.
+function table_in_use(uci, name, skip) {
+	for (let n in _common.list_instances(uci))
+		if (n != skip && _common.load_settings(uci, n).routing_table == name)
+			return true;
+	return false;
+}
+
 // True when the WAN has a default IPv6 route (potential leak path).
 function wan_has_ipv6() {
 	let r = run([ 'ip', '-6', 'route', 'show', 'default' ]);
@@ -853,20 +862,30 @@ function enforce(uci, s, opts) {
 	} else {
 		drop_rt_table(s.routing_table);
 		// The implicit table of all-LAN exceptions is named after the
-		// interface; release it too once no instance uses that name.
-		if (s.routing_table != iface) {
-			let used = false;
-			for (let n in _common.list_instances(uci))
-				if (n != s.name && _common.load_settings(uci, n).routing_table == iface)
-					used = true;
-			if (!used)
-				drop_rt_table(iface);
-		}
+		// interface; release it too once no other instance uses that name.
+		if (s.routing_table != iface && !table_in_use(uci, iface, s.name))
+			drop_rt_table(iface);
 	}
 	if (reconcile_rules(uci, 'rule', 'steer_lookup', iface, steer_nets, function(net) {
 		return { 'in': net, lookup: table, priority: '20000' };
 	}))
 		cn = true;
+	// Those rules are keyed by network, so a table change must re-point the
+	// existing ones, or they keep sending traffic to the old table. The old
+	// table's stamped rt_tables line goes once no instance uses it.
+	let old_tables = {};
+	if (steer)
+		uci.foreach('network', 'rule', function(sec) {
+			if (sec[MARK] == '1' && sec[ROLE] == 'steer_lookup' && sec.nordvpn_iface == iface &&
+			    sec.lookup != table) {
+				old_tables[sec.lookup] = true;
+				uci.set('network', sec['.name'], 'lookup', table);
+				cn = true;
+			}
+		});
+	for (let t in old_tables)
+		if (!table_in_use(uci, t))
+			drop_rt_table(t);
 	if (reconcile_rules(uci, 'rule', 'steer_ks', iface, (steer && s.killswitch) ? steer_nets : [], function(net) {
 		return { 'in': net, action: 'prohibit', priority: '21000' };
 	}))
