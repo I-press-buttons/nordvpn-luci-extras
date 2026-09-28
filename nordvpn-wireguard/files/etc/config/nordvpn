@@ -43,6 +43,11 @@ config instance 'main'
 	# Steering by destination: traffic to these domains (and subdomains) from
 	# LAN clients using the router's DNS. Needs dnsmasq-full (nftset support).
 	# list steer_domain 'example.com'
+	# Exceptions: these devices (by MAC) and domains always take the normal
+	# connection, even while the kill switch blocks the rest. Used together
+	# with auto_routing or steering; excluded domains need dnsmasq-full.
+	# list bypass_device 'aa:bb:cc:dd:ee:ff'
+	# list bypass_domain 'bank.example.com'
 	# Seconds to wait for a WireGuard handshake when verifying a server, and
 	# how many candidate servers a rotation may try before giving up.
 	option verify_timeout '8'

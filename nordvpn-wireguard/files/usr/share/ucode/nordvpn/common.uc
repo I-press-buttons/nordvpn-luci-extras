@@ -19,6 +19,9 @@ const VERSION = 'dev';
 const API_BASE = 'https://api.nordvpn.com/v1';
 const CREDS_URL = API_BASE + '/users/services/credentials';
 const SERVERS_URL = API_BASE + '/servers';
+// Public IP as NordVPN sees it. Keeps the external-IP check on the same host
+// as everything else, so the router contacts no third-party service.
+const IP_INSIGHTS_URL = API_BASE + '/helpers/ips/insights';
 
 const DEFAULT_INTERFACE = 'nordvpn';
 const DEFAULT_PORT = 51820;
@@ -137,6 +140,15 @@ function validate_hostname(h) {
 	if (type(h) != 'string' || length(h) < 1 || length(h) > 253)
 		return null;
 	return full_match(h, /^[A-Za-z0-9._:-]+$/) ? h : null;
+}
+
+// A NordVPN server hostname as the API publishes it ('<label>.nordvpn.com').
+// The tunnel endpoint must be one: the server list is a cache file, and a
+// tampered one must not be able to point the tunnel at a foreign server.
+function validate_nordvpn_host(h) {
+	if (!validate_hostname(h))
+		return null;
+	return full_match(h, /^[A-Za-z0-9-]+([.][A-Za-z0-9-]+)*[.]nordvpn[.]com$/) ? h : null;
 }
 
 function validate_port(p) {
@@ -408,6 +420,27 @@ function load_settings(uci, instance) {
 			push(steer_domains, d);
 	}
 
+	// `list bypass_device` / `list bypass_domain` — exceptions: devices and
+	// domains that always take the normal connection, even while the kill
+	// switch blocks the rest. An entry that is both steered and excluded
+	// counts as excluded.
+	let bd = uci.get('nordvpn', name, 'bypass_device');
+	let bypass_devices = [];
+	for (let x in ((type(bd) == 'array') ? bd : (bd != null ? [ bd ] : []))) {
+		let mac = validate_mac(x);
+		if (mac && index(bypass_devices, mac) < 0)
+			push(bypass_devices, mac);
+	}
+	let bdm = uci.get('nordvpn', name, 'bypass_domain');
+	let bypass_domains = [];
+	for (let x in ((type(bdm) == 'array') ? bdm : (bdm != null ? [ bdm ] : []))) {
+		let d = validate_domain(x);
+		if (d && index(bypass_domains, d) < 0 && length(bypass_domains) < MAX_STEER_DOMAINS)
+			push(bypass_domains, d);
+	}
+	source_devices = filter(source_devices, (m) => index(bypass_devices, m) < 0);
+	steer_domains = filter(steer_domains, (d) => index(bypass_domains, d) < 0);
+
 	// `list locations` — the instance's location set: countries ('de') and/or
 	// cities ('de-berlin') that both the initial connect and the rotation pick
 	// from. Empty = the legacy country_code/city_code selection. A city code
@@ -442,16 +475,28 @@ function load_settings(uci, instance) {
 	if (length(probe_targets) == 0)
 		probe_targets = [ ...DEFAULT_PROBE_TARGETS ];
 
+	let iface = validate_interface(g('interface', DEFAULT_INTERFACE)) || DEFAULT_INTERFACE;
+	// Invalid names fall back to the main table (see validate_routing_table).
+	let routing_table = validate_routing_table(g('routing_table', '')) || '';
+	// "Route all LAN traffic" with exceptions runs on the steered machinery,
+	// which needs a routing table: without a configured one, use the
+	// interface's name. Never written to the config, so removing the
+	// exceptions restores plain automatic routing through the main table.
+	if (routing_table == '' && g('auto_routing', '0') == '1' &&
+	    (length(bypass_devices) > 0 || length(bypass_domains) > 0))
+		routing_table = iface;
+
 	return {
 		name: name,
 		source_networks: source_networks,
 		source_devices: source_devices,
 		source_domains: steer_domains,
+		bypass_devices: bypass_devices,
+		bypass_domains: bypass_domains,
 		locations: locations,
 		enabled: g('enabled', '0') == '1',
-		interface: validate_interface(g('interface', DEFAULT_INTERFACE)) || DEFAULT_INTERFACE,
-		// Invalid names fall back to the main table (see validate_routing_table).
-		routing_table: validate_routing_table(g('routing_table', '')) || '',
+		interface: iface,
+		routing_table: routing_table,
 		// Optional WireGuard interface MTU override; null = keep the netifd
 		// default (1420). Clamped to the valid Ethernet/IPv6 range.
 		mtu: (function() {
@@ -622,7 +667,7 @@ function run(argv) {
 
 // CommonJS export (ucode on OpenWrt 24.10 does not support ES `export`).
 return {
-	VERSION, API_BASE, CREDS_URL, SERVERS_URL,
+	VERSION, API_BASE, CREDS_URL, SERVERS_URL, IP_INSIGHTS_URL,
 	DEFAULT_INTERFACE, DEFAULT_PORT, DEFAULT_KEEPALIVE, FIXED_ADDRESS,
 	CACHE_FILENAME, DEFAULT_CACHE_DIR, FETCH_STATUS_FILE, CACHE_LOCK_FILE,
 	APPLY_STATUS_FILE, APPLY_LOCK_FILE, APPLY_MAX_RUNTIME,
@@ -631,7 +676,7 @@ return {
 	MIN_VERIFY_TIMEOUT, MAX_VERIFY_TIMEOUT,
 	WATCHDOG_GRACE, WATCHDOG_COOLDOWN_BASE, WATCHDOG_COOLDOWN_MAX,
 	PROBE_FAIL_THRESHOLD, PROBE_TIMEOUT, DEFAULT_PROBE_TARGETS, HISTORY_MAX, MAX_STEER_DOMAINS,
-	full_match, bounded_int, validate_interface, validate_token, validate_wg_key, validate_hostname,
+	full_match, bounded_int, validate_interface, validate_token, validate_wg_key, validate_hostname, validate_nordvpn_host,
 	validate_port, validate_hop_mode, validate_dns_mode, relay_kind, validate_selection, validate_server_group, validate_rotation_mode, validate_interval, validate_time,
 	validate_country_code, validate_location_code, validate_instance, validate_routing_table, validate_dir,
 	validate_mac, validate_domain, clean_label, validate_ipv4,

@@ -59,6 +59,27 @@ function eq(l, g, w) { ok(l, sprintf('%J', g) == sprintf('%J', w)); }
 	ok('parse rejects non-json', parse_credentials('not json').error != null);
 	ok('parse rejects missing key', parse_credentials('{"x":1}').error != null);
 	ok('parse rejects bad key', parse_credentials('{"nordlynx_private_key":"short"}').error != null);
+
+	let pi = require('nordvpn.api').parse_insights;
+	eq('insights: full answer', pi('{"ip":"203.0.113.7","city":"Frankfurt","country":"Germany",' +
+		'"country_code":"DE","isp":"Example GmbH","isp_asn":64500,"protected":true}'),
+		{ ip: '203.0.113.7', protected: true, country: 'Germany', country_code: 'de',
+		  city: 'Frankfurt', isp: 'Example GmbH' });
+	eq('insights: ipv6', pi('{"ip":"2001:db8::1"}').ip, '2001:db8::1');
+	eq('insights: without ip (NordVPN client shape)',
+		pi('{"city":"Tallinn","country":"Estonia","country_code":"EE","protected":false}'),
+		{ ip: null, protected: false, country: 'Estonia', country_code: 'ee', city: 'Tallinn', isp: null });
+	eq('insights: non-json', pi('<html>rate limited</html>'), null);
+	eq('insights: empty body', pi(''), null);
+	eq('insights: not an object', pi('[1,2]'), null);
+	eq('insights: neither ip nor verdict', pi('{"country":"Germany"}'), null);
+	eq('insights: ip not a string', pi('{"ip":42}'), null);
+	eq('insights: verdict must be a boolean', pi('{"protected":"yes"}'), null);
+	eq('insights: markup ip refused', pi('{"ip":"<b>1.2.3.4</b>"}'), null);
+	eq('insights: newline ip refused', pi('{"ip":"1.2.3.4\\nx"}'), null);
+	let hostile = pi('{"protected":true,"isp":"<img src=x onerror=alert(1)>","country_code":"<b>"}');
+	eq('insights: labels stripped of markup, bad code dropped', [ hostile.isp, hostile.country_code ],
+		[ 'img src=x onerror=alert(1)', null ]);
 }
 
 // Build a cache on disk from the fixture.
@@ -868,7 +889,14 @@ write_cache(cache, cpath);
 		{ hostname: 'a b', public_key: k, location: 'de-berlin' }, load_settings(uci)));
 	ok('write_relay refuses a bad key', !write_relay(uci, 'nordvpn',
 		{ hostname: 'de1.nordvpn.com', public_key: 'x', location: 'de-berlin' }, load_settings(uci)));
+	// A tampered cache must not point the tunnel outside NordVPN.
+	for (let h in [ '198.51.100.9', 'vpn.example.com', 'nordvpn.com.example.net',
+	                'evilnordvpn.com', 'de1.nordvpn.com.', 'de1.nordvpn.com\nx' ])
+		ok('write_relay refuses non-NordVPN endpoint ' + sprintf('%J', h), !write_relay(uci, 'nordvpn',
+			{ hostname: h, public_key: k, location: 'de-berlin' }, load_settings(uci)));
 	ok('nothing written for a refused relay', global.MOCK_UCI.network.nordvpn.nordvpn_gateway == null);
+	for (let h in [ 'de1.nordvpn.com', 'de-nl12.nordvpn.com', 'nl-onion1.nordvpn.com' ])
+		eq('nordvpn host accepted: ' + h, _cmn.validate_nordvpn_host(h), h);
 
 	ok('managed: missing section is claimable', _cmn.managed_interface(uci, 'nv_new'));
 	ok('managed: stamped interface', _cmn.managed_interface(uci, 'nordvpn'));
@@ -978,6 +1006,317 @@ write_cache(cache, cpath);
 	ok('delete_instance removes device objects',
 		_apply.delete_instance(uci, 'media').ok == true &&
 		length(count('firewall', 'device_mark')) == 0 && length(count('network', 'dev_lookup')) == 0);
+}
+
+// 8d. NordVPN DNS through the tunnel: in steered mode the tunnel's routes live
+//     in the instance table, so the router's own queries to the NordVPN
+//     resolvers get stamped `dest` rules into that table.
+{
+	let count = function(conf, role) {
+		let n = [];
+		for (let k in global.MOCK_UCI[conf])
+			if (global.MOCK_UCI[conf][k].nordvpn_role == role)
+				push(n, global.MOCK_UCI[conf][k]);
+		return sort(n, (a, b) => (a.dest < b.dest) ? -1 : (a.dest > b.dest) ? 1 : 0);
+	};
+	let sd = function(over) {
+		let base = { name: 'main', enabled: true, interface: 'nordvpn', routing_table: '100',
+			auto_routing: false, killswitch: false, block_ipv6: false, vpn_dns: 'standard',
+			source_networks: [ 'lan' ], source_devices: [], source_domains: [] };
+		for (let k in over)
+			base[k] = over[k];
+		return base;
+	};
+	global.MOCK_UCI = { nordvpn: { main: { '.type': 'instance', interface: 'nordvpn', enabled: '1' } },
+		network: {
+			nordvpn: { '.type': 'interface', proto: 'wireguard', private_key: KEY, vpn_type: 'nordvpn' },
+			lan: { '.type': 'interface', proto: 'static', ipaddr: '192.168.1.1/24' } },
+		firewall: {
+			zlan: { '.type': 'zone', name: 'lan', network: [ 'lan' ] },
+			zwan: { '.type': 'zone', name: 'wan', masq: '1', network: [ 'wan' ] } } };
+	let uci = cursor();
+	let shape = (l) => map(l, (r) => [ r.dest, r.lookup, r.priority ]);
+
+	enforce_routing(uci, sd({}));
+	eq('dns: a rule per standard resolver, into the table', shape(count('network', 'dns_lookup')),
+		[ [ '103.86.96.100/32', '100', '19500' ], [ '103.86.99.100/32', '100', '19500' ] ]);
+	eq('dns: the interface carries the resolvers', global.MOCK_UCI.network.nordvpn.dns,
+		[ '103.86.96.100', '103.86.99.100' ]);
+	eq('dns: the rules are stamped, not user rules', _routing.count_user_routes(uci, 'nordvpn', ''), 0);
+	eq('dns: still steered, not manual', detect_routing(uci, sd({}), false).mode, 'steered');
+	ok('dns: idempotent', !enforce_routing(uci, sd({})).changed_network);
+
+	enforce_routing(uci, sd({ vpn_dns: 'threat' }));
+	eq('dns: Threat Protection swaps the resolvers', shape(count('network', 'dns_lookup')),
+		[ [ '103.86.96.96/32', '100', '19500' ], [ '103.86.99.99/32', '100', '19500' ] ]);
+
+	enforce_routing(uci, sd({ vpn_dns: 'threat', routing_table: '101' }));
+	eq('dns: a table change re-points the rules', map(count('network', 'dns_lookup'), (r) => r.lookup),
+		[ '101', '101' ]);
+
+	enforce_routing(uci, sd({ vpn_dns: 'off' }));
+	eq('dns: off removes the rules', length(count('network', 'dns_lookup')), 0);
+
+	enforce_routing(uci, sd({}));
+	enforce_routing(uci, sd({ auto_routing: true, source_networks: [], routing_table: '' }));
+	eq('dns: automatic mode needs none (the main table carries the tunnel)',
+		length(count('network', 'dns_lookup')), 0);
+	enforce_routing(uci, sd({ auto_routing: true, source_networks: [] }));
+	eq('dns: all-LAN with a table keeps them (the tunnel lives in the table)',
+		length(count('network', 'dns_lookup')), 2);
+
+	enforce_routing(uci, sd({}));
+	enforce_routing(uci, sd({ enabled: false }));
+	eq('dns: a disabled instance releases them', length(count('network', 'dns_lookup')), 0);
+}
+
+// 8e. Exceptions: excluded devices and domains always take the main table,
+//     ahead of every steering and prohibit rule. With "Route all LAN traffic"
+//     they move the instance onto steering of the LAN zone's networks.
+{
+	let D1 = 'aa:bb:cc:dd:ee:01', D2 = 'aa:bb:cc:dd:ee:02', D3 = 'aa:bb:cc:dd:ee:03';
+	let BMARK = '0xfe000000/0xff000000';
+
+	// Settings: parsing, overlap, and the implicit table of all-LAN mode.
+	global.MOCK_UCI = { nordvpn: { main: { '.type': 'instance', interface: 'nordvpn', auto_routing: '1',
+		bypass_device: [ 'AA:BB:CC:DD:EE:01', 'aa-bb-cc-dd-ee-01', 'junk' ],
+		source_device: [ D1, D2 ],
+		bypass_domain: [ 'Bank.Example.com', 'not a domain!' ],
+		steer_domain: [ 'bank.example.com', 'video.example.org' ] } } };
+	let ls = load_settings(cursor());
+	eq('exceptions: devices validated + deduped', ls.bypass_devices, [ D1 ]);
+	eq('exceptions: domains validated + normalized', ls.bypass_domains, [ 'bank.example.com' ]);
+	eq('exceptions: an excluded device is not also steered', ls.source_devices, [ D2 ]);
+	eq('exceptions: an excluded domain is not also steered', ls.source_domains, [ 'video.example.org' ]);
+	eq('exceptions: all-LAN gets the interface as implicit table', ls.routing_table, 'nordvpn');
+	global.MOCK_UCI.nordvpn.main.routing_table = '100';
+	eq('exceptions: an explicit table wins', load_settings(cursor()).routing_table, '100');
+	delete global.MOCK_UCI.nordvpn.main.routing_table;
+	global.MOCK_UCI.nordvpn.main.auto_routing = '0';
+	eq('exceptions: no implicit table outside all-LAN', load_settings(cursor()).routing_table, '');
+	global.MOCK_UCI.nordvpn.main.auto_routing = '1';
+	delete global.MOCK_UCI.nordvpn.main.bypass_device;
+	delete global.MOCK_UCI.nordvpn.main.bypass_domain;
+	eq('exceptions: removing them drops the implicit table', load_settings(cursor()).routing_table, '');
+
+	let count = function(conf, role) {
+		let n = [];
+		for (let k in global.MOCK_UCI[conf])
+			if (global.MOCK_UCI[conf][k].nordvpn_role == role)
+				push(n, global.MOCK_UCI[conf][k]);
+		return n;
+	};
+	let ex = function(over) {
+		let base = { name: 'main', enabled: true, interface: 'nordvpn', routing_table: '100',
+			auto_routing: true, killswitch: true, block_ipv6: true, vpn_dns: 'off',
+			source_networks: [], source_devices: [], source_domains: [],
+			bypass_devices: [ D1 ], bypass_domains: [] };
+		for (let k in over)
+			base[k] = over[k];
+		return base;
+	};
+	let fresh = function() {
+		global.MOCK_UCI = { nordvpn: { main: { '.type': 'instance', interface: 'nordvpn', enabled: '1' } },
+			network: {
+				nordvpn: { '.type': 'interface', proto: 'wireguard', private_key: KEY, vpn_type: 'nordvpn' },
+				lan: { '.type': 'interface', proto: 'static', ipaddr: '192.168.1.1/24' },
+				iot: { '.type': 'interface', proto: 'static', ipaddr: '192.168.5.1/24' } },
+			firewall: {
+				zlan: { '.type': 'zone', name: 'lan', network: [ 'lan', 'iot' ] },
+				zwan: { '.type': 'zone', name: 'wan', masq: '1', network: [ 'wan' ] } },
+			dhcp: {} };
+		return cursor();
+	};
+	let yes = { nftset: true }, no = { nftset: false };
+
+	// detect: exceptions only count while traffic is routed at all.
+	let uci = fresh();
+	let det = detect_routing(uci, ex({}), false);
+	eq('exceptions: all-LAN still reads as auto', [ det.mode, det.exceptions ], [ 'auto', true ]);
+	det = detect_routing(uci, ex({ auto_routing: false }), false);
+	eq('exceptions: alone they route nothing', [ det.mode, det.exceptions ], [ 'none', false ]);
+
+	// All-LAN + an excluded device: steering of every LAN-zone network.
+	let res = enforce_routing(uci, ex({}), yes);
+	eq('exceptions: every LAN-zone network steered into the table',
+		sort(map(count('network', 'steer_lookup'), (r) => r['in'] + '>' + r.lookup)), [ 'iot>100', 'lan>100' ]);
+	eq('exceptions: no automatic REJECT kill switch', count('firewall', 'killswitch'), []);
+	eq('exceptions: kill switch as prohibit rules instead', length(count('network', 'steer_ks')), 2);
+	let bm = count('firewall', 'bypass_mark');
+	ok('exceptions: MARK rule for the excluded device', length(bm) == 1 && bm[0].src_mac == D1 &&
+		bm[0].src == '*' && bm[0].target == 'MARK' && bm[0].set_xmark == BMARK);
+	let bl = count('network', 'bypass_lookup'), bl6 = count('network', 'bypass_lookup6');
+	ok('exceptions: mark -> main table at 18000, both families',
+		length(bl) == 1 && bl[0].mark == BMARK && bl[0].lookup == 'main' && bl[0].priority == '18000' &&
+		length(bl6) == 1 && bl6[0]['.type'] == 'rule6' && bl6[0].lookup == 'main');
+	eq('exceptions: LAN zone forwards into the VPN zone', length(filter(count('firewall', 'forwarding'),
+		(f) => f.src == 'lan' && f.dest == 'nordvpn')), 1);
+	ok('exceptions: idempotent', !enforce_routing(uci, ex({}), yes).changed_firewall &&
+		!enforce_routing(uci, ex({}), yes).changed_network);
+	eq('exceptions: all-LAN objects are stamped, not manual', detect_routing(uci, ex({}), false).mode, 'auto');
+
+	// Excluded domains: a dnsmasq-filled set and a MARK rule from the LAN zone.
+	res = enforce_routing(uci, ex({ bypass_domains: [ 'bank.example.com' ] }), yes);
+	let bs = count('firewall', 'bypass_set'), bdm = count('firewall', 'bypass_domain_mark');
+	ok('exceptions: fw4 set for excluded domains', length(bs) == 1 && bs[0].name == 'nv_nordvpn_byp');
+	ok('exceptions: domain MARK rule from the LAN zone', length(bdm) == 1 && bdm[0].src == 'lan' &&
+		bdm[0].ipset == 'nv_nordvpn_byp' && bdm[0].set_xmark == BMARK);
+	let bd = count('dhcp', 'bypass_dns');
+	ok('exceptions: dnsmasq fills the set', length(bd) == 1 && bd[0].domain[0] == 'bank.example.com' &&
+		bd[0].name[0] == 'nv_nordvpn_byp');
+	ok('exceptions: dnsmasq restarted for the set', res.domains_active);
+	res = enforce_routing(uci, ex({ bypass_domains: [ 'bank.example.com' ] }), no);
+	ok('exceptions: no dnsmasq-full -> domain objects removed, with a note',
+		length(count('firewall', 'bypass_set')) == 0 && length(count('dhcp', 'bypass_dns')) == 0 &&
+		length(filter(res.notes, (n) => index(n, 'dnsmasq-full') >= 0)) == 1);
+	eq('exceptions: ... the excluded device stays', length(count('firewall', 'bypass_mark')), 1);
+
+	// Removing the exceptions returns to plain automatic routing.
+	enforce_routing(uci, ex({ bypass_devices: [], routing_table: '' }), yes);
+	ok('exceptions: removed -> back to automatic routing',
+		length(count('network', 'steer_lookup')) == 0 && length(count('firewall', 'killswitch')) == 1 &&
+		length(count('firewall', 'bypass_mark')) == 0 && length(count('network', 'bypass_lookup')) == 0 &&
+		length(count('network', 'bypass_lookup6')) == 0);
+
+	// Without a table all-LAN stays automatic (exceptions not applied).
+	uci = fresh();
+	res = enforce_routing(uci, ex({ routing_table: '' }), yes);
+	ok('exceptions: no table -> stays automatic, with a note',
+		length(count('firewall', 'killswitch')) == 1 && length(count('firewall', 'bypass_mark')) == 0 &&
+		length(filter(res.notes, (n) => index(n, 'need a routing table') >= 0)) == 1);
+
+	// The main table cannot carry steering and exceptions at once.
+	uci = fresh();
+	res = enforce_routing(uci, ex({ routing_table: '254' }), yes);
+	ok('exceptions: refused when the instance table is main',
+		length(count('firewall', 'bypass_mark')) == 0 &&
+		length(filter(res.notes, (n) => index(n, 'other than main') >= 0)) == 1);
+
+	// Steered mode: exceptions sit next to device steering, and must follow
+	// every steering MARK rule (fw4: the last matching MARK wins).
+	uci = fresh();
+	let st = (devs) => ex({ auto_routing: false, source_devices: devs });
+	enforce_routing(uci, st([ D2 ]), yes);
+	enforce_routing(uci, st([ D2, D3 ]), yes);
+	let order = [];
+	for (let k in global.MOCK_UCI.firewall) {
+		let r = global.MOCK_UCI.firewall[k].nordvpn_role;
+		if (r == 'device_mark' || r == 'bypass_mark')
+			push(order, r);
+	}
+	eq('exceptions: recreated after a later steering MARK rule', order,
+		[ 'device_mark', 'device_mark', 'bypass_mark' ]);
+	ok('exceptions: order stable once fixed', !enforce_routing(uci, st([ D2, D3 ]), yes).changed_firewall);
+
+	// Disabling the instance releases everything.
+	enforce_routing(uci, ex({ enabled: false, bypass_domains: [ 'bank.example.com' ] }), yes);
+	ok('exceptions: a disabled instance releases them',
+		length(count('firewall', 'bypass_mark')) == 0 && length(count('network', 'bypass_lookup')) == 0 &&
+		length(count('network', 'bypass_lookup6')) == 0 && length(count('dhcp', 'bypass_dns')) == 0 &&
+		length(count('firewall', 'bypass_set')) == 0);
+}
+
+// 8f. "Route all LAN traffic" with a routing table: the tunnel's default route
+//     lives in that table, so the LAN zone's networks are steered into it
+//     (the automatic path only works through the main table).
+{
+	let count = function(conf, role) {
+		let n = [];
+		for (let k in global.MOCK_UCI[conf])
+			if (global.MOCK_UCI[conf][k].nordvpn_role == role)
+				push(n, global.MOCK_UCI[conf][k]);
+		return n;
+	};
+	let at = function(over) {
+		let base = { name: 'main', enabled: true, interface: 'nordvpn', routing_table: '100',
+			auto_routing: true, killswitch: true, block_ipv6: true, vpn_dns: 'off',
+			source_networks: [], source_devices: [], source_domains: [],
+			bypass_devices: [], bypass_domains: [] };
+		for (let k in over)
+			base[k] = over[k];
+		return base;
+	};
+	global.MOCK_UCI = { nordvpn: { main: { '.type': 'instance', interface: 'nordvpn', enabled: '1' } },
+		network: {
+			nordvpn: { '.type': 'interface', proto: 'wireguard', private_key: KEY, vpn_type: 'nordvpn' },
+			lan: { '.type': 'interface', proto: 'static', ipaddr: '192.168.1.1/24' } },
+		firewall: {
+			zlan: { '.type': 'zone', name: 'lan', network: [ 'lan' ] },
+			zwan: { '.type': 'zone', name: 'wan', masq: '1', network: [ 'wan' ] } } };
+	let uci = cursor();
+
+	// Before the fix: a REJECT kill switch and no rule into the table, so
+	// the LAN kept using the WAN while the status said "connected".
+	enforce_routing(uci, at({}));
+	eq('all-LAN + table: reads as automatic', detect_routing(uci, at({}), false).mode, 'auto');
+	eq('all-LAN + table: LAN steered into the table',
+		map(count('network', 'steer_lookup'), (r) => [ r['in'], r.lookup, r.priority ]), [ [ 'lan', '100', '20000' ] ]);
+	ok('all-LAN + table: prohibit kill switch, not the REJECT rule',
+		length(count('network', 'steer_ks')) == 1 && length(count('firewall', 'killswitch')) == 0);
+	eq('all-LAN + table: LAN zone forwards into the VPN zone', length(filter(count('firewall', 'forwarding'),
+		(f) => f.src == 'lan' && f.dest == 'nordvpn')), 1);
+	ok('all-LAN + table: idempotent', !enforce_routing(uci, at({})).changed_network);
+
+	// Clearing the table goes back to the main-table path, cleanly.
+	enforce_routing(uci, at({ routing_table: '' }));
+	ok('all-LAN without a table: automatic path again',
+		length(count('network', 'steer_lookup')) == 0 && length(count('network', 'steer_ks')) == 0 &&
+		length(count('firewall', 'killswitch')) == 1);
+
+	// Leftover steered devices/domains are not applied on top of all-LAN.
+	enforce_routing(uci, at({ source_devices: [ 'aa:bb:cc:dd:ee:01' ], source_domains: [ 'example.com' ] }),
+		{ nftset: true });
+	ok('all-LAN + table: no per-device or per-domain steering',
+		length(count('firewall', 'device_mark')) == 0 && length(count('firewall', 'domain_mark')) == 0 &&
+		length(count('network', 'dev_lookup')) == 0);
+
+	// A hand-made rule into the table still means "manual: hands off".
+	global.MOCK_UCI.network.userroute = { '.type': 'route', interface: 'lan', target: '10.0.0.0/8', table: '100' };
+	eq('all-LAN + table + own route: manual', detect_routing(uci, at({}), false).mode, 'manual');
+}
+
+// 8g. A routing table change re-points the steering rules (they are keyed by
+//     network, so reconciliation alone would keep the old lookup).
+{
+	let count = function(conf, role) {
+		let n = [];
+		for (let k in global.MOCK_UCI[conf])
+			if (global.MOCK_UCI[conf][k].nordvpn_role == role)
+				push(n, global.MOCK_UCI[conf][k]);
+		return n;
+	};
+	let st = function(over) {
+		let base = { name: 'main', enabled: true, interface: 'nordvpn', routing_table: '100',
+			auto_routing: false, killswitch: true, block_ipv6: true, vpn_dns: 'off',
+			source_networks: [ 'lan', 'guest' ], source_devices: [], source_domains: [],
+			bypass_devices: [], bypass_domains: [] };
+		for (let k in over)
+			base[k] = over[k];
+		return base;
+	};
+	global.MOCK_UCI = { nordvpn: { main: { '.type': 'instance', interface: 'nordvpn', enabled: '1' } },
+		network: {
+			nordvpn: { '.type': 'interface', proto: 'wireguard', private_key: KEY, vpn_type: 'nordvpn' },
+			lan: { '.type': 'interface', proto: 'static', ipaddr: '192.168.1.1/24' },
+			guest: { '.type': 'interface', proto: 'static', ipaddr: '192.168.9.1/24' } },
+		firewall: {
+			zlan: { '.type': 'zone', name: 'lan', network: [ 'lan' ] },
+			zguest: { '.type': 'zone', name: 'guest', network: [ 'guest' ] },
+			zwan: { '.type': 'zone', name: 'wan', masq: '1', network: [ 'wan' ] } } };
+	let uci = cursor();
+	let lookups = () => sort(map(count('network', 'steer_lookup'), (r) => r['in'] + '>' + r.lookup));
+	let locals = () => sort(map(count('network', 'steer_local'), (r) => r.target + '>' + r.table));
+
+	enforce_routing(uci, st({}));
+	eq('table change: before', lookups(), [ 'guest>100', 'lan>100' ]);
+	let res = enforce_routing(uci, st({ routing_table: '101' }));
+	ok('table change: reported as a network change', res.changed_network);
+	eq('table change: every lookup re-pointed, none duplicated', lookups(), [ 'guest>101', 'lan>101' ]);
+	eq('table change: local bypass routes follow', locals(),
+		[ '192.168.1.0/24>101', '192.168.9.0/24>101' ]);
+	ok('table change: stable afterwards', !enforce_routing(uci, st({ routing_table: '101' })).changed_network);
+	enforce_routing(uci, st({ routing_table: '101', source_networks: [ 'lan' ] }));
+	eq('table change: deselecting still removes only that network', lookups(), [ 'lan>101' ]);
 }
 
 // 9b. domain steering: dnsmasq resolves the listed domains into a stamped fw4

@@ -43,8 +43,15 @@ var callSetCredentials = rpc.declare({ object: 'nordvpn', method: 'set_credentia
 // The protection was illusory anyway: what can lock an admin out is the
 // routing and firewall state, which the backend commits itself, outside this
 // transaction — rolling the settings file back would not restore access.
-var callUciApply = rpc.declare({
-	object: 'uci', method: 'apply', params: [ 'timeout', 'rollback' ]
+//
+// Commit only this app's own config, though. `uci apply` without a rollback
+// commits EVERY change staged in the session — pending network or firewall
+// edits from other pages included — and those do need the rollback. rpcd's
+// `commit` fires the same config-change reload trigger, for one package. It
+// is refused while another session's rollback is pending; `reject` surfaces
+// that as "Save failed" instead of reconnecting with the old settings.
+var callUciCommit = rpc.declare({
+	object: 'uci', method: 'commit', params: [ 'config' ], reject: true
 });
 
 // An apply rewrites the peer and then waits for a real WireGuard handshake per
@@ -569,10 +576,11 @@ return view.extend({
 			details.push(_('🧅 Onion over VPN'));
 		if (s.state !== 'connected' && s.state !== 'no_egress' && s.routing && s.routing.killswitch)
 			details.push(_('Kill switch is blocking LAN traffic'));
+		var protLine = null;
 		if (s.state === 'connected') {
 			var ipKey = this.instance + '|' + (s.gateway || '');
 			if (this.extIp && this.extIp.key === ipKey)
-				details.push(_('Public IP: %s').format(this.extIp.ip));
+				protLine = this.protectionLine(this.extIp.res);
 			else
 				this.maybeFetchExternalIp(ipKey);
 		}
@@ -591,14 +599,17 @@ return view.extend({
 						E('span', {}, locText || '')
 					]),
 					E('div', { class: 'nv-status-details' }, details.join(' · ')),
+					protLine,
+					this.dnsLine(s),
 					E('div', { class: 'nv-status-actions' }, this.actionButtons(s))
 				])
 			])
 		]));
 	},
 
-	// Fetch the tunnel's public IP once per instance+gateway combination (the
-	// status poll runs every 5 s; external services would rate-limit that).
+	// Ask NordVPN how it sees the tunnel once per instance+gateway combination
+	// (the status poll runs every 5 s; the API would rate-limit that). A
+	// failed lookup is remembered too, so it is not retried on every poll.
 	maybeFetchExternalIp: function(key) {
 		if (this._extIpPending === key)
 			return;
@@ -607,13 +618,57 @@ return view.extend({
 			if (this._extIpPending !== key)
 				return;
 			this._extIpPending = null;
-			if (res && res.ip) {
-				this.extIp = { key: key, ip: res.ip };
+			this.extIp = { key: key, res: (res && !res.error) ? res : null };
+			if (this.extIp.res)
 				this.updateStatusBand();
-			}
 		}, this)).catch(L.bind(function() {
 			this._extIpPending = null;
 		}, this));
+	},
+
+	// NordVPN's own verdict on the tunnel's exit (and, with "Route all LAN
+	// traffic", on the path LAN traffic takes), or null before an answer.
+	protectionLine: function(r) {
+		if (!r)
+			return null;
+		var good = 'color:var(--success-color,#2d8f4e);font-weight:600';
+		var bad = 'color:var(--error-color,#c0392b);font-weight:600';
+		var kids = [];
+		if (r.protected === true)
+			kids.push(E('span', { style: good }, _('🛡 Protected by NordVPN')));
+		else if (r.protected === false)
+			kids.push(E('span', { style: bad }, _('⚠ NordVPN does not see this exit as one of its servers')));
+		var info = [
+			[ r.city, r.country ].filter(Boolean).join(', '),
+			r.ip ? _('Public IP: %s').format(r.ip) : '',
+			r.isp || ''
+		].filter(Boolean).join(' · ');
+		if (info)
+			kids.push((kids.length ? ' · ' : '') + info);
+		if (r.lan_path && r.lan_path.protected === false)
+			kids.push(E('div', { style: bad },
+				_('⚠ LAN traffic is not going through the VPN: NordVPN sees it coming from %s.')
+					.format(r.lan_path.isp || r.lan_path.ip || _('your normal connection'))));
+		return kids.length ? E('div', { class: 'nv-status-details' }, kids) : null;
+	},
+
+	// Which resolver clients use while this instance routes traffic: NordVPN's
+	// (through the tunnel), or the router's upstream, usually the ISP's, which
+	// sees every name looked up. Only shown while the tunnel carries traffic.
+	dnsLine: function(s) {
+		var rt = s.routing || {};
+		if (s.enabled === false || (s.state !== 'connected' && s.state !== 'no_egress') ||
+		    (rt.mode !== 'auto' && rt.mode !== 'steered'))
+			return null;
+		var mode = uci.get('nordvpn', this.instance, 'vpn_dns');
+		if (mode !== 'off' && mode !== 'standard' && mode !== 'threat')
+			mode = (uci.get('nordvpn', this.instance, 'use_vpn_dns') === '1') ? 'standard' : 'off';
+		if (mode === 'off')
+			return E('div', { class: 'nv-status-details', style: 'color:var(--warning-color,#b8860b)' },
+				_('DNS: the router\'s upstream resolver (usually your ISP), which can see every site looked up. Choose NordVPN DNS under Traffic routing to change that.'));
+		return E('div', { class: 'nv-status-details' }, (mode === 'threat')
+			? _('DNS: NordVPN Threat Protection, through the tunnel')
+			: _('DNS: NordVPN, through the tunnel'));
 	},
 
 	/* ---- event history ---------------------------------------------- */
@@ -1041,9 +1096,11 @@ return view.extend({
 		this.steerBoxes = {};
 		this.steerRow = null;
 		this.devRow = null;
-		this.devList = null;
 		this.domRow = null;
-		this.domArea = null;
+		this.bypDevRow = null;
+		this.bypDomRow = null;
+		this.pickers = {};
+		this.domEds = {};
 
 		// Read-only context: the interface and table this instance uses, so the
 		// firewall/routing wiring is visible right here — not only in Advanced.
@@ -1110,10 +1167,15 @@ return view.extend({
 				_('Or route only these networks through this instance — policy rules send their traffic into its routing table.'));
 			if (nets.length)
 				body.appendChild(this.steerRow);
-			this.devRow = this.buildDevicePicker();
+			this.devRow = this.buildDevicePicker('steer');
 			body.appendChild(this.devRow);
-			this.domRow = this.buildDomainEditor(rt);
+			this.domRow = this.buildDomainEditor(rt, 'steer');
 			body.appendChild(this.domRow);
+			// Exceptions: shown whenever traffic is routed (all-LAN or steered).
+			this.bypDevRow = this.buildDevicePicker('bypass');
+			body.appendChild(this.bypDevRow);
+			this.bypDomRow = this.buildDomainEditor(rt, 'bypass');
+			body.appendChild(this.bypDomRow);
 			this.ksRow = this.row(_('Kill switch'), [
 				E('label', { class: 'nv-check' }, [ this.ksBox, _('Block LAN internet access while the VPN is down') ])
 			]);
@@ -1146,10 +1208,10 @@ return view.extend({
 		return /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$/.test(d) ? d : null;
 	},
 
-	// Split the editor text into { valid (deduped), invalid } entries.
-	parseDomains: function() {
+	// Split an editor's text into { valid (deduped), invalid } entries.
+	parseDomains: function(ed) {
 		var valid = [], invalid = [];
-		var raw = this.domArea ? (this.domArea.value || '').split(/[\s,]+/).filter(Boolean) : [];
+		var raw = (ed && ed.area) ? (ed.area.value || '').split(/[\s,]+/).filter(Boolean) : [];
 		raw.forEach(L.bind(function(x) {
 			var d = this.normDomain(x);
 			if (!d)
@@ -1161,33 +1223,46 @@ return view.extend({
 	},
 
 	steeredDomains: function() {
-		return this.parseDomains().valid;
+		return this.parseDomains((this.domEds || {}).steer).valid;
 	},
 
-	updateDomainNote: function() {
-		if (!this.domNote)
+	excludedDomains: function() {
+		return this.parseDomains((this.domEds || {}).bypass).valid;
+	},
+
+	updateDomainNote: function(ed) {
+		if (!ed || !ed.note)
 			return;
-		var p = this.parseDomains();
+		var p = this.parseDomains(ed);
 		var msgs = [];
 		if (p.invalid.length)
 			msgs.push(_('Ignored (not a domain name): %s').format(p.invalid.join(' ')));
 		if (p.capped)
 			msgs.push(_('Only the first 64 domains are used.'));
-		dom.content(this.domNote, msgs.join(' '));
-		this.domNote.classList.toggle('hidden', !msgs.length);
+		// Array-wrapped: a bare string goes to innerHTML, and the ignored
+		// entries are raw editor/UCI text (see the E() note at the top).
+		dom.content(ed.note, [ msgs.join(' ') ]);
+		ed.note.classList.toggle('hidden', !msgs.length);
 	},
 
-	buildDomainEditor: function(rt) {
-		var cur = L.toArray(uci.get('nordvpn', this.instance, 'steer_domain'));
-		this.domArea = E('textarea', { class: 'cbi-input-textarea', rows: 3, style: 'width:100%;max-width:420px',
-			placeholder: 'example.com\nvideo.example.org',
-			input: L.bind(function() { this.updateDomainNote(); this.onRoutingToggle(); }, this) }, cur.join('\n'));
-		this.domNote = E('div', { class: 'cbi-value-description nv-inline-note hidden' });
-		var unsupported = (rt.domain_steering === 'unsupported')
+	// One domain editor per list: 'steer' (steer_domain) or 'bypass'
+	// (bypass_domain, always the normal connection).
+	buildDomainEditor: function(rt, kind) {
+		var ed = { kind: kind };
+		var cur = L.toArray(uci.get('nordvpn', this.instance, (kind === 'bypass') ? 'bypass_domain' : 'steer_domain'));
+		ed.area = E('textarea', { class: 'cbi-input-textarea', rows: 3, style: 'width:100%;max-width:420px',
+			placeholder: (kind === 'bypass') ? 'bank.example.com' : 'example.com\nvideo.example.org',
+			input: L.bind(function() { this.updateDomainNote(ed); this.onRoutingToggle(); }, this) }, cur.join('\n'));
+		ed.note = E('div', { class: 'cbi-value-description nv-inline-note hidden' });
+		this.domEds[kind] = ed;
+		var unsupported = (rt.domain_steering === 'unsupported' && cur.length)
 			? E('div', { class: 'cbi-value-description nv-inline-note' },
-				_('⚠ The installed dnsmasq cannot fill nftables sets, so these domains are not steered. Install dnsmasq-full (replacing dnsmasq) and save again.'))
+				_('⚠ The installed dnsmasq cannot fill nftables sets, so these domains are ignored. Install dnsmasq-full (replacing dnsmasq) and save again.'))
 			: '';
-		return this.row(_('Steered domains'), [ this.domArea, this.domNote, unsupported ],
+		if (kind === 'bypass')
+			return this.row(_('Excluded domains'), [ ed.area, ed.note, unsupported ],
+				_('Traffic to these domains (and their subdomains) always uses your normal connection, for example a bank or a streaming site that blocks VPNs. One per line. Works for clients that use this router for DNS; IPv4 only; needs dnsmasq-full.'));
+		return this.row(_('Steered domains'), [ ed.area, ed.note, unsupported ],
 			_('Route only traffic to these domains (and their subdomains) through this instance, one per line. Works for clients that use this router for DNS; apps with their own encrypted DNS bypass it. IPv4 only; needs dnsmasq-full.'));
 	},
 
@@ -1220,70 +1295,97 @@ return view.extend({
 		return owners;
 	},
 
-	buildDevicePicker: function() {
-		this.devSel = {};
-		var cur = uci.get('nordvpn', this.instance, 'source_device');
-		(Array.isArray(cur) ? cur : (cur ? [ cur ] : [])).forEach(L.bind(function(m) {
-			m = this.normMac(m);
-			if (m)
-				this.devSel[m] = true;
-		}, this));
-		this.devOwners = this.deviceOwners();
+	// One device picker per list: 'steer' (source_device, routed through this
+	// instance) or 'bypass' (bypass_device, always the normal connection). A
+	// MAC selected in one list is taken out of the other.
+	buildDevicePicker: function(kind) {
+		var p = { kind: kind, sel: {} };
+		L.toArray(uci.get('nordvpn', this.instance, (kind === 'bypass') ? 'bypass_device' : 'source_device'))
+			.forEach(L.bind(function(m) {
+				m = this.normMac(m);
+				if (m)
+					p.sel[m] = true;
+			}, this));
+		// Devices another instance steers are locked in the steering list only;
+		// excluding a device is always possible.
+		p.owners = (kind === 'bypass') ? {} : this.deviceOwners();
+		this.pickers[kind] = p;
+		this._pickOpen = this._pickOpen || {};
 
-		this.devSummary = E('summary', {});
-		this.devSearch = E('input', { type: 'search', class: 'cbi-input-text nv-dev-search',
+		p.summary = E('summary', {});
+		p.search = E('input', { type: 'search', class: 'cbi-input-text nv-dev-search',
 			placeholder: _('Search name, MAC or IP'), 'aria-label': _('Search devices'),
-			input: L.bind(this.renderDevices, this) });
-		this.devOnlySel = E('input', { type: 'checkbox', change: L.bind(this.renderDevices, this) });
-		this.devStatus = E('span', { class: 'nv-inline-note' });
-		this.devList = E('div', { class: 'nv-dev-list', role: 'listbox', 'aria-multiselectable': 'true' });
+			input: L.bind(this.renderDevices, this, p) });
+		p.onlySel = E('input', { type: 'checkbox', change: L.bind(this.renderDevices, this, p) });
+		p.status = E('span', { class: 'nv-inline-note' });
+		p.list = E('div', { class: 'nv-dev-list', role: 'listbox', 'aria-multiselectable': 'true' });
 		var refresh = E('button', { type: 'button', class: 'cbi-button', title: _('Reload the client list'),
 			click: L.bind(function(ev) { ev.preventDefault(); this.loadDevices(true); }, this) }, '↻');
 
-		this.devDetails = E('details', { class: 'nv-devices', toggle: L.bind(function() {
-			this._devOpen = this.devDetails.open;
-			if (this.devDetails.open)
+		p.details = E('details', { class: 'nv-devices', toggle: L.bind(function() {
+			this._pickOpen[kind] = p.details.open;
+			if (p.details.open)
 				this.loadDevices(false);
 		}, this) }, [
-			this.devSummary,
+			p.summary,
 			E('div', { class: 'nv-dev-tools' }, [
-				this.devSearch,
-				E('label', { class: 'nv-check' }, [ this.devOnlySel, _('Selected only') ]),
+				p.search,
+				E('label', { class: 'nv-check' }, [ p.onlySel, _('Selected only') ]),
 				refresh,
-				this.devStatus
+				p.status
 			]),
-			this.devList
+			p.list
 		]);
 		// Keep the section open across form rebuilds (save, discard).
-		if (this._devOpen)
-			this.devDetails.open = true;
-		this.updateDevSummary();
+		if (this._pickOpen[kind])
+			p.details.open = true;
+		this.updateDevSummary(p);
 
-		return this.row(_('Steered devices'), [ this.devDetails ],
+		if (kind === 'bypass')
+			return this.row(_('Excluded devices'), [ p.details ],
+				_('These devices always use your normal internet connection, even while the kill switch blocks the rest, for example a TV, a console or a work laptop. Matched by MAC address.'));
+		return this.row(_('Steered devices'), [ p.details ],
 			_('Or route individual devices through this instance, matched by MAC address so a new DHCP lease keeps them on the tunnel. A device choice takes precedence over its network.'));
 	},
 
-	// Fetch the client list once per page (↻ forces a reload).
+	// Fetch the client list once per page (↻ forces a reload); both pickers
+	// share it.
 	loadDevices: function(force) {
-		if (this.clients && !force)
-			return this.renderDevices();
-		dom.content(this.devStatus, [ _('Loading…') ]);
+		var pickers = this.pickers || {};
+		if (this.clients && !force) {
+			for (var k in pickers)
+				this.renderDevices(pickers[k]);
+			return Promise.resolve();
+		}
+		for (var j in pickers)
+			dom.content(pickers[j].status, [ _('Loading…') ]);
 		return callClients().then(L.bind(function(res) {
 			this.clients = (res && Array.isArray(res.clients)) ? res.clients : [];
-			this.renderDevices();
+			for (var k in pickers)
+				this.renderDevices(pickers[k]);
 		}, this)).catch(L.bind(function(e) {
 			this.clients = null;
-			dom.content(this.devStatus, [ _('Could not load clients: %s').format(e) ]);
+			for (var k in pickers)
+				dom.content(pickers[k].status, [ _('Could not load clients: %s').format(e) ]);
 		}, this));
 	},
 
-	steeredDevices: function() {
-		return Object.keys(this.devSel || {}).sort();
+	pickedDevices: function(kind) {
+		var p = (this.pickers || {})[kind];
+		return Object.keys(p ? p.sel : {}).sort();
 	},
 
-	updateDevSummary: function() {
-		var n = this.steeredDevices().length;
-		dom.content(this.devSummary, [ n
+	steeredDevices: function() {
+		return this.pickedDevices('steer');
+	},
+
+	otherPicker: function(p) {
+		return (this.pickers || {})[(p.kind === 'bypass') ? 'steer' : 'bypass'];
+	},
+
+	updateDevSummary: function(p) {
+		var n = Object.keys(p.sel).length;
+		dom.content(p.summary, [ n
 			? _('%d device(s) selected').format(n)
 			: _('No devices selected') ]);
 	},
@@ -1303,12 +1405,12 @@ return view.extend({
 		return /^[0-9a-f]+$/.test(hex) && c.mac.replace(/:/g, '').indexOf(hex) >= 0;
 	},
 
-	renderDevices: function() {
-		if (!this.devList)
+	renderDevices: function(p) {
+		if (!p || !p.list)
 			return;
-		var q = (this.devSearch.value || '').trim().toLowerCase();
-		var onlySel = this.devOnlySel.checked;
-		var sel = this.devSel, owners = this.devOwners;
+		var q = (p.search.value || '').trim().toLowerCase();
+		var onlySel = p.onlySel.checked;
+		var sel = p.sel;
 
 		// Known clients plus selected MACs not currently seen, so a device that
 		// is offline (or gone) can still be deselected.
@@ -1333,14 +1435,14 @@ return view.extend({
 				{ numeric: true, sensitivity: 'base' });
 		});
 
-		var nodes = rows.map(L.bind(this.deviceRow, this));
+		var nodes = rows.map(L.bind(this.deviceRow, this, p));
 		// A typed MAC that is not in the list can be added by hand.
 		var typed = this.normMac(q);
 		if (typed && !known[typed] && !sel[typed])
 			nodes.push(E('div', { class: 'nv-dev-row', role: 'option', tabindex: '0',
-				click: L.bind(this.addTypedDevice, this, typed),
+				click: L.bind(this.addTypedDevice, this, p, typed),
 				keydown: L.bind(function(ev) {
-					if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); this.addTypedDevice(typed); }
+					if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); this.addTypedDevice(p, typed); }
 				}, this) }, [
 				E('span', { class: 'box' }, '+'),
 				E('span', { class: 'nv-dev-name' }, _('Add %s').format(typed))
@@ -1348,15 +1450,16 @@ return view.extend({
 		if (!nodes.length)
 			nodes.push(E('div', { class: 'nv-dev-empty' }, this.clients
 				? _('No devices match.') : _('Client list not loaded.')));
-		dom.content(this.devList, nodes);
-		dom.content(this.devStatus, [ this.clients
+		dom.content(p.list, nodes);
+		dom.content(p.status, [ this.clients
 			? _('%d of %d shown').format(rows.length, total) : '' ]);
 	},
 
-	deviceRow: function(c) {
-		var on = !!this.devSel[c.mac];
-		var owner = this.devOwners[c.mac];
+	deviceRow: function(p, c) {
+		var on = !!p.sel[c.mac];
+		var owner = p.owners[c.mac];
 		var locked = !!owner && !on;
+		var other = this.otherPicker(p);
 		var meta = [ c.mac ];
 		if ((c.ips || []).length)
 			meta.push(c.ips.join(', '));
@@ -1366,6 +1469,8 @@ return view.extend({
 			meta.push(_('not seen'));
 		if (owner)
 			meta.push(_('in %s').format(owner));
+		if (other && other.sel[c.mac])
+			meta.push((p.kind === 'bypass') ? _('steered') : _('excluded'));
 		var row = E('div', {
 			class: 'nv-dev-row' + (on ? ' nv-dev-on' : '') + (locked ? ' nv-dev-locked' : ''),
 			role: 'option', 'aria-selected': on ? 'true' : 'false',
@@ -1382,38 +1487,52 @@ return view.extend({
 			])
 		]);
 		if (!locked) {
-			row.addEventListener('click', L.bind(this.toggleDevice, this, c.mac, row));
+			row.addEventListener('click', L.bind(this.toggleDevice, this, p, c.mac, row));
 			row.addEventListener('keydown', L.bind(function(ev) {
 				if (ev.key === 'Enter' || ev.key === ' ') {
 					ev.preventDefault();
-					this.toggleDevice(c.mac, row);
+					this.toggleDevice(p, c.mac, row);
 				}
 			}, this));
 		}
 		return row;
 	},
 
+	// Selecting a MAC in one list takes it out of the other (a device is
+	// either steered or excluded), and refreshes that list.
+	releaseFromOther: function(p, mac) {
+		var other = this.otherPicker(p);
+		if (!other || !other.sel[mac])
+			return;
+		delete other.sel[mac];
+		this.updateDevSummary(other);
+		this.renderDevices(other);
+	},
+
 	// Toggle in place (no re-sort), so the list does not jump under the
 	// pointer while working through it; the next search/open re-sorts.
-	toggleDevice: function(mac, row) {
-		if (this.devSel[mac])
-			delete this.devSel[mac];
+	toggleDevice: function(p, mac, row) {
+		if (p.sel[mac])
+			delete p.sel[mac];
 		else
-			this.devSel[mac] = true;
-		var on = !!this.devSel[mac];
+			p.sel[mac] = true;
+		var on = !!p.sel[mac];
+		if (on)
+			this.releaseFromOther(p, mac);
 		row.classList.toggle('nv-dev-on', on);
 		row.setAttribute('aria-selected', on ? 'true' : 'false');
 		dom.content(row.firstChild, [ on ? '☑' : '☐' ]);
-		this.updateDevSummary();
+		this.updateDevSummary(p);
 		this.onRoutingToggle();
 	},
 
-	addTypedDevice: function(mac) {
-		this.devSel[mac] = true;
-		this.devSearch.value = '';
-		this.updateDevSummary();
+	addTypedDevice: function(p, mac) {
+		p.sel[mac] = true;
+		this.releaseFromOther(p, mac);
+		p.search.value = '';
+		this.updateDevSummary(p);
 		this.onRoutingToggle();
-		this.renderDevices();
+		this.renderDevices(p);
 	},
 
 	steeredNetworks: function() {
@@ -1433,6 +1552,8 @@ return view.extend({
 		if (this.steerRow) this.steerRow.classList.toggle('hidden', !!auto);
 		if (this.devRow) this.devRow.classList.toggle('hidden', !!auto);
 		if (this.domRow) this.domRow.classList.toggle('hidden', !!auto);
+		if (this.bypDevRow) this.bypDevRow.classList.toggle('hidden', !on);
+		if (this.bypDomRow) this.bypDomRow.classList.toggle('hidden', !on);
 		if (this.ksRow) this.ksRow.classList.toggle('hidden', !on);
 		if (this.v6Row) this.v6Row.classList.toggle('hidden', !on);
 		if (this.dnsRow) this.dnsRow.classList.toggle('hidden', !on);
@@ -2393,8 +2514,21 @@ return view.extend({
 			var domains = autoOn ? [] : this.steeredDomains();
 			if (domains.length)
 				uci.set('nordvpn', inst, 'steer_domain', domains);
-			else if (this.domArea)
+			else if (this.domEds.steer)
 				uci.unset('nordvpn', inst, 'steer_domain');
+			// Exceptions. With "Route all LAN traffic" the backend supplies a
+			// routing table itself (the interface name) and drops it again once
+			// the list is empty, so none is written here for that case.
+			var bypDevs = this.pickedDevices('bypass');
+			if (bypDevs.length)
+				uci.set('nordvpn', inst, 'bypass_device', bypDevs);
+			else
+				uci.unset('nordvpn', inst, 'bypass_device');
+			var bypDoms = this.excludedDomains();
+			if (bypDoms.length)
+				uci.set('nordvpn', inst, 'bypass_domain', bypDoms);
+			else if (this.domEds.bypass)
+				uci.unset('nordvpn', inst, 'bypass_domain');
 			if (steered.length || devices.length || domains.length) {
 				// Steering needs a routing table; default to the interface name.
 				var rtb = this.refs.routing_table ? (this.refs.routing_table.value || '').trim()
@@ -2456,7 +2590,7 @@ return view.extend({
 		var p = this.notice(_('Saving configuration…'), 'info');
 
 		return uci.save()
-			.then(function() { return callUciApply(0, false); })
+			.then(function() { return callUciCommit('nordvpn'); })
 			.then(L.bind(function() {
 				this.dirty = false;
 				this.clearChangeIndicator();
@@ -2615,13 +2749,14 @@ return view.extend({
 		} catch (e) {}
 	},
 
-	// Our custom save calls uci.apply() directly (the framework's apply would
-	// reload the page and abort the reconnect), so clear the global "Unsaved
-	// Changes" indicator ourselves once our commit has gone through.
+	// Our custom save commits directly (the framework's apply would reload the
+	// page and abort the reconnect), so refresh the global "Unsaved Changes"
+	// indicator ourselves once our commit has gone through. Re-read rather
+	// than zeroed: changes staged on other pages are still pending.
 	clearChangeIndicator: function() {
 		try {
 			if (L.ui && L.ui.changes)
-				L.ui.changes.setIndicator(0);
+				Promise.resolve(L.ui.changes.init()).catch(function() {});
 		} catch (e) {}
 	}
 });

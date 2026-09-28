@@ -87,6 +87,13 @@ that adds the extra features marked **(fork)** below.
 - **Live status.** The page shows the real connected city, the public IP seen
   through the tunnel, uptime, traffic and throughput, and the recent events
   (connects, rotations, recoveries) for each tunnel.
+- **Protection check (fork).** NordVPN itself confirms that it sees the tunnel
+  as protected, with the exit city and ISP. With *Route all LAN traffic* and
+  no routing table, it also checks the path your devices take, and warns if
+  their traffic is leaving through your ISP although the tunnel is up. A DNS line says whether
+  lookups go to NordVPN or to your ISP's resolver.
+- **Status page card (fork).** Every tunnel's state, location, server, uptime
+  and traffic also appear on LuCI's main **Status → Overview** page.
 
 ### Choosing what goes through the VPN
 
@@ -103,10 +110,15 @@ that adds the extra features marked **(fork)** below.
 - **Steered domains (fork).** Send only traffic to chosen websites (and
   their subdomains) through the VPN, for example one streaming service,
   while everything else uses your normal connection.
+- **Exceptions (fork).** Exclude devices (a TV, a console, a work laptop) or
+  websites (a bank or a streaming service that blocks VPNs) from the VPN,
+  with *Route all LAN traffic* or with steering. Excluded traffic always uses
+  your normal connection, even while the kill switch blocks the rest.
 - **Kill switch and IPv6 leak block.** When the tunnel is down, steered
   traffic is blocked rather than leaking out through the WAN.
 - **NordVPN DNS.** Optionally use NordVPN's resolvers, or Threat Protection,
-  which blocks ads and malware at the DNS level.
+  which blocks ads and malware at the DNS level. The router's own lookups to
+  them go through the tunnel in steered mode too.
 - **Leaves your own setup alone.** If you already route traffic by hand, the
   app detects it and doesn't touch it. Everything it creates is tagged and
   removed cleanly.
@@ -250,6 +262,8 @@ config instance 'main'
 	list source_network 'media'      # or: steer only these networks
 	list source_device 'aa:bb:cc:dd:ee:ff'  # and/or individual devices, by MAC
 	list steer_domain 'example.com'  # and/or domains (+ subdomains); needs dnsmasq-full
+	list bypass_device 'aa:bb:cc:dd:ee:01'  # exceptions: always the normal connection
+	list bypass_domain 'bank.example.com'   #   (excluded domains need dnsmasq-full)
 	option killswitch '0'            # block steered traffic while VPN is down
 	option block_ipv6 '1'            # block direct IPv6 (leak prevention)
 	option vpn_dns 'off'             # off | standard | threat (NordVPN resolvers)
@@ -278,7 +292,8 @@ and secrets are never returned.
 ```bash
 ubus call nordvpn status            # runtime state, location, handshake age
 ubus call nordvpn instances         # status of every configured VPN instance
-ubus call nordvpn external_ip       # public IP as seen through the tunnel
+ubus call nordvpn overview          # lightweight per-instance summary (Status page card)
+ubus call nordvpn external_ip       # NordVPN's view: protected, public IP, city, ISP
 ubus call nordvpn history '{"instance":"main"}'  # recent events, newest first
 ubus call nordvpn disconnect        # take the tunnel down, pause rotation
 ubus call nordvpn clear_credentials # forget the stored WireGuard key
@@ -367,7 +382,10 @@ On every apply the backend first works out which routing mode applies:
 - **Automatic** (*Route all LAN traffic*). The backend sets
   `route_allowed_ips` on the peer, creates a masquerading zone and a
   LAN → VPN forwarding, and adds optional REJECT rules for the kill switch
-  and IPv6, plus the DNS override.
+  and IPv6, plus the DNS override. If the instance has a routing table, the
+  tunnel's default route lives in that table instead of the main one. The
+  backend then steers every network of the LAN zone into it, as described
+  under *Steered*, with the same result.
 - **Steered.** Policy rules send only the selected traffic into the
   instance's routing table:
   - **Networks:** `in <network> lookup <table>` at priority 20000.
@@ -387,9 +405,21 @@ On every apply the backend first works out which routing mode applies:
       its own changes; otherwise the set refills as clients look the names up
       again.
 
+  - **NordVPN DNS:** `to <resolver>/32 lookup <table>` at priority 19500, so
+    the router's own lookups to NordVPN's resolvers use the tunnel too.
+
   Prohibit rules (priority 21000) act as the kill switch and IPv6 block.
   They only fire when the tunnel's table can't serve the traffic. Every local
   IPv4 subnet is mirrored into the table so LAN and VLAN traffic stays local.
+- **Exceptions.** Excluded devices (an fw4 MARK rule per MAC) and excluded
+  domains (a second dnsmasq-filled set, `nv_<interface>_byp`) get the main
+  table's id, `0xfe000000`, as their mark. One `mark … lookup main` rule per
+  family at priority 18000 comes before every steering and prohibit rule,
+  so excluded traffic skips the tunnel and the kill switch and keeps its
+  IPv6. With *Route all LAN traffic*, exceptions need the LAN-zone steering
+  described under *Automatic*, because the REJECT kill switch would block
+  excluded devices too. If no table is set, the backend uses one named after
+  the interface, which isn't written to the config.
 
 Everything the app creates is tagged `nordvpn_managed`. Turning a toggle off
 removes exactly those objects. User zones, forwardings, routes, rules and
@@ -428,6 +458,26 @@ are cleared on reboot.
   against an allow-list first.
 - Every ubus input has a fixed schema and is validated for format and range.
 - The browser never receives the token or the WireGuard private key.
+- The tunnel endpoint must be a `*.nordvpn.com` server, so a tampered
+  server-list cache can't point the tunnel anywhere else.
+
+**What the router connects to.** Nothing listens on the network; the VPN
+firewall zone rejects all input and forwarding from the tunnel side.
+Outbound:
+
+- `api.nordvpn.com`: the one-time token exchange, the server list (every
+  `cache_refresh_interval`, 6 h by default) and, while the LuCI page is open,
+  the protection check. That check goes through the tunnel and, with *Route
+  all LAN traffic* and no routing table, once more along the path the LAN
+  takes.
+- The NordVPN WireGuard server you're connected to (UDP 51820).
+- Only if you turn them on: NordVPN's DNS resolvers (`vpn_dns`), and pings
+  to the `probe_target`s (default `1.1.1.1` and `8.8.8.8`) through the tunnel
+  every 30 s for the internet check.
+
+Packages from CI artifacts and Releases are **unsigned**, which is why
+installing them needs `--allow-untrusted`. Only install packages you built
+yourself or downloaded from this repository over HTTPS.
 
 ## Upgrading
 
@@ -467,6 +517,7 @@ LuCI view, the ucode tests, and a snapshot-SDK build of both packages.
 
 Originally created by **Andrey Aleksandrov** ([@Aladex](https://github.com/Aladex))
 as [nordvpn-luci](https://github.com/Aladex/nordvpn-luci). This fork adds
-load-aware selection, the P2P server filter and domain steering on top.
+load-aware selection, the P2P server filter, domain steering, exceptions, the
+protection check and the Status page card on top.
 
 [MIT](LICENSE). Do whatever you want with it, just keep the copyright notice.

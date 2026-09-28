@@ -9,6 +9,9 @@ import { pipe } from 'fs';
 const _common = require('nordvpn.common');
 const CREDS_URL = _common.CREDS_URL,
       open_cmd = _common.open_cmd,
+      full_match = _common.full_match,
+      clean_label = _common.clean_label,
+      validate_country_code = _common.validate_country_code,
       validate_token = _common.validate_token,
       validate_wg_key = _common.validate_wg_key;
 
@@ -27,6 +30,38 @@ function parse_credentials(body) {
 	if (!validate_wg_key(key))
 		return { error: 'no valid private key in credential response' };
 	return { private_key: key };
+}
+
+// Pure: NordVPN's verdict on the connection a request came from, parsed from
+// the IP-insights JSON into { ip, protected, country, country_code, city, isp }
+// (a field is null when absent or malformed). `protected` is whether NordVPN
+// sees the address as one of its own. NordVPN's own client does not read `ip`,
+// so it is optional; null when the body carries neither `ip` nor `protected`.
+// Exported so it can be unit-tested without any network access.
+function parse_insights(body) {
+	let data;
+	try {
+		data = json(body);
+	} catch (e) {
+		return null;
+	}
+	if (type(data) != 'object')
+		return null;
+	let ip = data.ip;
+	if (type(ip) != 'string' || length(ip) < 2 || length(ip) > 45 ||
+	    !full_match(ip, /^[0-9a-fA-F:.]+$/))
+		ip = null;
+	let prot = (type(data.protected) == 'bool') ? data.protected : null;
+	if (ip == null && prot == null)
+		return null;
+	return {
+		ip: ip,
+		protected: prot,
+		country: clean_label(data.country, null),
+		country_code: validate_country_code(data.country_code),
+		city: clean_label(data.city, null),
+		isp: clean_label(data.isp, null)
+	};
 }
 
 // Exchange a 64-hex token for the NordLynx WireGuard private key.
@@ -76,4 +111,4 @@ function get_private_key(token) {
 	return parse_credentials(body);
 }
 
-return { parse_credentials, get_private_key };
+return { parse_credentials, parse_insights, get_private_key };

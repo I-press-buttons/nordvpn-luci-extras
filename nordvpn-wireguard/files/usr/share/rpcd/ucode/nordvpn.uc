@@ -34,6 +34,7 @@ const next_rotation = _service.next_rotation,
       effective_state = _service.effective_state,
       egress_report = _service.egress_report;
 const read_events = require('nordvpn.history').read_events;
+const parse_insights = require('nordvpn.api').parse_insights;
 const list_clients = require('nordvpn.clients').clients;
 const detect_routing = require('nordvpn.routing').detect;
 const _cache = require('nordvpn.cache');
@@ -90,6 +91,32 @@ methods.instances = {
 		let out = [];
 		for (let name in list_instances(uci))
 			push(out, build_status(uci, name));
+		return { instances: out };
+	}
+};
+
+// Lightweight summary for the Status → Overview card, which polls every few
+// seconds: each instance's runtime status without the routing detection that
+// `instances` runs (ubus dumps, `ip link`, `dnsmasq --version`). Read-only; no
+// network access beyond local ubus and `wg show`.
+methods.overview = {
+	call: function() {
+		let uci = cursor();
+		let out = [];
+		for (let name in list_instances(uci)) {
+			let st = status(uci, name);
+			push(out, {
+				instance: st.instance,
+				state: effective_state(load_settings(uci, name), st.state, read_state(name), st.gateway),
+				enabled: st.enabled,
+				configured: st.configured,
+				location: st.location,
+				gateway: st.gateway,
+				latest_handshake_seconds: st.latest_handshake_seconds,
+				uptime: st.uptime,
+				transfer: st.transfer
+			});
+		}
 		return { instances: out };
 	}
 };
@@ -169,8 +196,23 @@ methods.refresh_status = {
 	}
 };
 
-// Public IP as seen through the instance's tunnel. Bound to the interface so
-// it reflects the VPN exit even with policy routing. Read-only network probe.
+// Ask NordVPN's own API how it sees a request from this router (no third-party
+// IP-echo service). `extra` is prepended curl arguments. Parsed or null.
+function insights(extra) {
+	let r = _common.run([ 'curl', '-s', '-m', '8', ...extra,
+		'-H', 'Accept: application/json', _common.IP_INSIGHTS_URL ]);
+	return (r.code == 0) ? parse_insights(r.stdout) : null;
+}
+
+// Public IP, location and NordVPN's "protected" verdict as seen through the
+// instance's tunnel. Bound to the interface so it reflects the VPN exit even
+// with policy routing. With "Route all LAN traffic" and no routing table the
+// LAN uses the main table, the same one an unbound request from the router
+// takes, so ask again without binding: `lan_path.protected == false` means
+// LAN traffic leaves outside the VPN although the tunnel itself is up. With
+// a table (set, or implied by exceptions) the LAN is steered into it, which
+// the router's own traffic cannot reproduce, as for steered clients.
+// Read-only network probe.
 methods.external_ip = {
 	args: { instance: '' },
 	call: function(request) {
@@ -178,14 +220,16 @@ methods.external_ip = {
 		let name = req_instance(uci, request);
 		if (!name)
 			return { error: 'no such instance' };
-		let iface = load_settings(uci, name).interface;
-		for (let url in [ 'https://api.ipify.org', 'https://ifconfig.me/ip' ]) {
-			let r = _common.run([ 'curl', '-s', '-m', '8', '--interface', iface, url ]);
-			let ip = trim(r.stdout || '');
-			if (r.code == 0 && length(ip) > 0 && length(ip) <= 45 && _common.full_match(ip, /^[0-9a-fA-F:.]+$/))
-				return { ip: ip, interface: iface };
+		let s = load_settings(uci, name);
+		let res = insights([ '--interface', s.interface ]);
+		if (!res)
+			return { error: 'could not determine the external IP' };
+		res.interface = s.interface;
+		if (s.enabled && s.routing_table == '' && detect_routing(uci, s, false).mode == 'auto') {
+			let lan = insights([]);
+			res.lan_path = lan ? { protected: lan.protected, ip: lan.ip, isp: lan.isp } : null;
 		}
-		return { error: 'could not determine the external IP' };
+		return res;
 	}
 };
 

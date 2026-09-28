@@ -150,6 +150,85 @@ ok('clear_credentials removes the key', global.MOCK_UCI.network.nordvpn.private_
 	eq('delete_instance keeps the foreign peer', global.MOCK_UCI.network.wanpeer, wanpeer);
 }
 
+// overview: the Status-page card's summary. Cheap (no routing detection) and,
+// like every read method, free of secrets.
+{
+	let saved_uci = global.MOCK_UCI, saved_ubus = global.MOCK_UBUS;
+	global.MOCK_UCI = { nordvpn: {
+			main: { '.type': 'instance', interface: 'nordvpn', cache_dir: cdir, enabled: '1' },
+			second: { '.type': 'instance', interface: 'nv_second', enabled: '0' } },
+		network: {
+			nordvpn: { '.type': 'interface', private_key: KEY, vpn_type: 'nordvpn',
+				nordvpn_country_code: 'ee', nordvpn_location: 'ee-tallinn' },
+			peer: { '.type': 'wireguard_nordvpn', interface: 'nordvpn',
+				nordvpn_gateway: 'ee70.nordvpn.com', public_key: KEY } } };
+	global.MOCK_UBUS = { 'network.interface.nordvpn~status': { up: true, l3_device: 'nordvpn', uptime: 42 } };
+	let open_before = global.MOCK_UBUS_OPEN || 0;
+	let ov = m.overview.call();
+	eq('overview: one entry per instance, main first', map(ov.instances, (i) => i.instance), [ 'main', 'second' ]);
+	let o = ov.instances[0];
+	eq('overview: runtime fields', [ o.configured, o.enabled, o.gateway, o.uptime, o.location ],
+		[ true, true, 'ee70.nordvpn.com', 42, { country: 'ee', city: 'ee-tallinn' } ]);
+	eq('overview: up without a handshake reads connecting', o.state, 'connecting');
+	eq('overview: unconfigured instance', [ ov.instances[1].state, ov.instances[1].configured ], [ 'not_configured', false ]);
+	ok('overview: no routing detection', o.routing == null && o.rotation == null);
+	ok('overview: no secret in the response', index(sprintf('%J', ov), KEY) < 0);
+	eq('overview: ubus connections closed', global.MOCK_UBUS_OPEN || 0, open_before);
+	global.MOCK_UCI = saved_uci;
+	global.MOCK_UBUS = saved_ubus;
+}
+
+// external_ip: NordVPN's verdict through the tunnel, plus the LAN path in
+// all-LAN mode. `run` is stubbed so nothing touches the network.
+{
+	let saved_uci = global.MOCK_UCI, real_run = _common.run;
+	let urls = [];
+	_common.run = function(argv) {
+		if (argv[0] != 'curl')
+			return real_run(argv);
+		push(urls, argv[length(argv) - 1]);
+		return (index(argv, '--interface') >= 0)
+			? { code: 0, stdout: '{"ip":"198.51.100.7","protected":true,"city":"Frankfurt",' +
+				'"country":"Germany","country_code":"DE","isp":"Exit Networks"}' }
+			: { code: 0, stdout: '{"ip":"203.0.113.9","protected":false,"isp":"Home ISP"}' };
+	};
+	global.MOCK_UCI = { nordvpn: { main: { '.type': 'instance', interface: 'nordvpn', enabled: '1',
+			auto_routing: '1', cache_dir: cdir } },
+		network: { nordvpn: { '.type': 'interface', private_key: KEY, vpn_type: 'nordvpn' } },
+		firewall: {} };
+	let r = m.external_ip.call({});
+	eq('external_ip: tunnel verdict', [ r.ip, r.protected, r.city, r.country_code, r.isp, r.interface ],
+		[ '198.51.100.7', true, 'Frankfurt', 'de', 'Exit Networks', 'nordvpn' ]);
+	eq('external_ip: all-LAN mode also checks the LAN path', r.lan_path,
+		{ protected: false, ip: '203.0.113.9', isp: 'Home ISP' });
+	eq('external_ip: only NordVPN is asked', uniq(urls), [ _common.IP_INSIGHTS_URL ]);
+
+	// With a table the LAN is steered into it; the router's own request would
+	// take the WAN and raise a false alarm, so no LAN-path probe.
+	urls = [];
+	global.MOCK_UCI.nordvpn.main.routing_table = '100';
+	r = m.external_ip.call({});
+	ok('external_ip: all-LAN with a table skips the LAN-path probe', r.lan_path == null && length(urls) == 1);
+	urls = [];
+	delete global.MOCK_UCI.nordvpn.main.routing_table;
+	global.MOCK_UCI.nordvpn.main.bypass_device = 'aa:bb:cc:dd:ee:01';
+	r = m.external_ip.call({});
+	ok('external_ip: ... also with the implicit table of exceptions', r.lan_path == null && length(urls) == 1);
+	delete global.MOCK_UCI.nordvpn.main.bypass_device;
+
+	urls = [];
+	global.MOCK_UCI.nordvpn.main.auto_routing = '0';
+	global.MOCK_UCI.nordvpn.main.source_network = 'lan';
+	global.MOCK_UCI.nordvpn.main.routing_table = '100';
+	r = m.external_ip.call({});
+	ok('external_ip: steered mode skips the LAN-path probe', r.lan_path == null && length(urls) == 1);
+
+	_common.run = function(argv) { return (argv[0] == 'curl') ? { code: 7, stdout: '' } : real_run(argv); };
+	eq('external_ip: unreachable', m.external_ip.call({}).error, 'could not determine the external IP');
+	_common.run = real_run;
+	global.MOCK_UCI = saved_uci;
+}
+
 // clients: read-only picker source; always an array (empty off-device).
 ok('clients method present', type(m.clients.call) == 'function');
 ok('clients returns an array', type(m.clients.call().clients) == 'array');

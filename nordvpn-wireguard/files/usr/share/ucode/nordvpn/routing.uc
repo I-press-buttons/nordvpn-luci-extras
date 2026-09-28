@@ -424,6 +424,27 @@ function domain_set_name(iface) {
 	return 'nv_' + iface + '_dom';
 }
 
+// Same for the domains an instance excludes from the tunnel.
+function bypass_set_name(iface) {
+	return 'nv_' + iface + '_byp';
+}
+
+// Mark of excluded traffic: the main table's id (254) in the same top byte as
+// the steering marks, so one rule sends it to the main table.
+const BYPASS_TABLE_ID = 254;
+
+// Logical networks of the (unmanaged) firewall zone named `zone`.
+function zone_networks(uci, zone) {
+	let nets = [];
+	uci.foreach('firewall', 'zone', function(sec) {
+		if (sec.name == zone && sec[MARK] != '1') {
+			nets = as_list(sec.network);
+			return false;
+		}
+	});
+	return nets;
+}
+
 // Whether the installed dnsmasq can fill nft sets (dnsmasq-full; the stock
 // dnsmasq is built without it). Same test as OpenWrt's dnsmasq init script:
 // 'nftset' among the compile-time options ('no-nftset' when absent). Cached
@@ -477,6 +498,15 @@ function drop_rt_table(name) {
 	}
 	if (changed)
 		atomic_write(RT_TABLES, join('\n', kept));
+}
+
+// Is routing table `name` any instance's (effective) table? `skip` names an
+// instance to leave out, usually the caller's own.
+function table_in_use(uci, name, skip) {
+	for (let n in _common.list_instances(uci))
+		if (n != skip && _common.load_settings(uci, n).routing_table == name)
+			return true;
+	return false;
 }
 
 // True when the WAN has a default IPv6 route (potential leak path).
@@ -602,11 +632,13 @@ function reconcile_rules(uci, sectype, role, iface, want_nets, mkopts, key, conf
 	return changed;
 }
 
-// Reconcile the one stamped dnsmasq 'ipset' section of an instance with the
+// Reconcile the one stamped dnsmasq 'ipset' section of an instance and role
+// ('domain_dns' for steered domains, 'bypass_dns' for excluded ones) with the
 // wanted domain list (empty = remove it). dnsmasq resolves each domain (and
 // its subdomains) into the fw4 set `setname`. Returns true on change.
-function reconcile_domain_dns(uci, iface, setname, domains) {
-	let have = find_managed_rules(uci, 'ipset', 'domain_dns', iface, 'nordvpn_set', 'dhcp');
+function reconcile_domain_dns(uci, iface, setname, domains, role) {
+	role = role || 'domain_dns';
+	let have = find_managed_rules(uci, 'ipset', role, iface, 'nordvpn_set', 'dhcp');
 	let changed = false;
 	for (let i = 0; i < length(have); i++) {
 		if (length(domains) == 0 || i > 0) {
@@ -620,7 +652,7 @@ function reconcile_domain_dns(uci, iface, setname, domains) {
 	if (!sec) {
 		sec = uci.add('dhcp', 'ipset');
 		uci.set('dhcp', sec, MARK, '1');
-		uci.set('dhcp', sec, ROLE, 'domain_dns');
+		uci.set('dhcp', sec, ROLE, role);
 		uci.set('dhcp', sec, 'nordvpn_iface', iface);
 		changed = true;
 	}
@@ -701,11 +733,15 @@ function detect(uci, s, runtime) {
 	let peer = find_peer(uci, iface);
 	let steering = length(s.source_networks || []) > 0 || length(s.source_devices || []) > 0 ||
 		length(s.source_domains || []) > 0;
+	// Exceptions only mean something while traffic is routed at all; with
+	// "Route all LAN traffic" they move it onto the steered machinery.
+	let exceptions = (s.auto_routing || steering) &&
+		(length(s.bypass_devices || []) > 0 || length(s.bypass_domains || []) > 0);
 	// With steering active, extra user routes INSIDE the instance's table are
 	// legitimate companions (e.g. a media→LAN route); only routes referencing
 	// the interface itself signal a hand-built scheme. Without steering, a
 	// table reference is the manual-mode signal it always was.
-	let user_routes = count_user_routes(uci, iface, steering ? '' : s.routing_table);
+	let user_routes = count_user_routes(uci, iface, (steering || exceptions) ? '' : s.routing_table);
 	// A bare routing_table is NOT manual on its own — only actual user routes or
 	// rules (referencing the interface, or living in the instance's table when
 	// not steering) are. A hand-built policy scheme always has such routes, so
@@ -722,9 +758,11 @@ function detect(uci, s, runtime) {
 		source_networks: s.source_networks || [],
 		source_devices: s.source_devices || [],
 		source_domains: s.source_domains || [],
-		// 'unsupported' when domains are configured but dnsmasq cannot fill
-		// nft sets (needs dnsmasq-full); null when not checked or not needed.
-		domain_steering: (runtime && length(s.source_domains || []) > 0)
+		exceptions: exceptions,
+		// 'unsupported' when steered or excluded domains are configured but
+		// dnsmasq cannot fill nft sets (needs dnsmasq-full); null when not
+		// checked or not needed.
+		domain_steering: (runtime && (length(s.source_domains || []) > 0 || length(s.bypass_domains || []) > 0))
 			? (nftset_supported() ? 'ok' : 'unsupported') : null,
 		route_allowed_ips: peer ? (uci.get('network', peer, 'route_allowed_ips') == '1') : false,
 		killswitch: find_managed(uci, 'rule', 'killswitch') != null ||
@@ -759,9 +797,31 @@ function enforce(uci, s, opts) {
 	let active = (s.enabled == null) ? true : !!s.enabled;
 	let auto = (det.mode == 'auto') && active;
 	let steer = (det.mode == 'steered') && active;
-	if (steer && (s.routing_table == null || s.routing_table == '')) {
+	let has_table = s.routing_table != null && s.routing_table != '';
+	if (steer && !has_table) {
 		push(notes, 'steering needs a routing table; set one for this instance');
 		steer = false;
+	}
+	// "Route all LAN traffic" runs as steering of the LAN zone's networks
+	// whenever the instance has a routing table. The tunnel's default route
+	// then lives in that table (ip4table), which the automatic path, built on
+	// the main table, never consults: LAN traffic would silently keep using
+	// the WAN. Exceptions need this path too, since its kill switch is
+	// prohibit rules, which the earlier exception rule gets past, whereas the
+	// automatic kill switch is a LAN→WAN REJECT that would block the excluded
+	// devices as well; load_settings() supplies a table for them.
+	let all_lan = false;
+	if (auto && (has_table || det.exceptions)) {
+		let lan_nets = det.lan_zone ? zone_networks(uci, det.lan_zone) : [];
+		if (!has_table)
+			push(notes, 'exceptions need a routing table; set one for this instance');
+		else if (!length(lan_nets))
+			push(notes, 'could not determine the LAN networks to route through table ' + s.routing_table);
+		else {
+			auto = false;
+			steer = true;
+			all_lan = lan_nets;
+		}
 	}
 	let managed = auto || steer;
 	let peer = find_peer(uci, iface);
@@ -794,18 +854,38 @@ function enforce(uci, s, opts) {
 	//     enabled) and IPv6 leak block (the tunnel carries no IPv6). Prohibit
 	//     sits between the lookup and the main table, so it only fires when
 	//     the tunnel's table cannot serve the traffic.
-	let steer_nets = steer ? s.source_networks : [];
+	let steer_nets = steer ? (all_lan || s.source_networks) : [];
 	let table = s.routing_table;
 	if (steer) {
 		if (!ensure_rt_table(table))
 			push(notes, 'could not register routing table ' + table + ' in ' + RT_TABLES);
 	} else {
 		drop_rt_table(s.routing_table);
+		// The implicit table of all-LAN exceptions is named after the
+		// interface; release it too once no other instance uses that name.
+		if (s.routing_table != iface && !table_in_use(uci, iface, s.name))
+			drop_rt_table(iface);
 	}
 	if (reconcile_rules(uci, 'rule', 'steer_lookup', iface, steer_nets, function(net) {
 		return { 'in': net, lookup: table, priority: '20000' };
 	}))
 		cn = true;
+	// Those rules are keyed by network, so a table change must re-point the
+	// existing ones, or they keep sending traffic to the old table. The old
+	// table's stamped rt_tables line goes once no instance uses it.
+	let old_tables = {};
+	if (steer)
+		uci.foreach('network', 'rule', function(sec) {
+			if (sec[MARK] == '1' && sec[ROLE] == 'steer_lookup' && sec.nordvpn_iface == iface &&
+			    sec.lookup != table) {
+				old_tables[sec.lookup] = true;
+				uci.set('network', sec['.name'], 'lookup', table);
+				cn = true;
+			}
+		});
+	for (let t in old_tables)
+		if (!table_in_use(uci, t))
+			drop_rt_table(t);
 	if (reconcile_rules(uci, 'rule', 'steer_ks', iface, (steer && s.killswitch) ? steer_nets : [], function(net) {
 		return { 'in': net, action: 'prohibit', priority: '21000' };
 	}))
@@ -820,9 +900,11 @@ function enforce(uci, s, opts) {
 	//      with the same prohibit rules as networks. Priority 19000 sits above
 	//      the network lookups, so a device choice beats a network choice. A
 	//      MAC already owned by another instance is left to that instance.
+	// All-LAN mode already sends every LAN network through the table; steered
+	// devices and domains only mean something in steered mode.
 	let steer_devs = [];
 	let mark = null;
-	if (steer && length(s.source_devices || []) > 0) {
+	if (steer && !all_lan && length(s.source_devices || []) > 0) {
 		let owners = device_owners(uci);
 		for (let mac in s.source_devices) {
 			if (owners[mac] && s.name && owners[mac] != s.name)
@@ -843,7 +925,7 @@ function enforce(uci, s, opts) {
 	//       Only LAN-zone traffic is marked: that zone is the one given a
 	//       forwarding into the VPN zone below.
 	let steer_doms = [];
-	if (steer && length(s.source_domains || []) > 0) {
+	if (steer && !all_lan && length(s.source_domains || []) > 0) {
 		let supported = (opts && opts.nftset != null) ? !!opts.nftset : nftset_supported();
 		if (!mark)
 			mark = device_mark(rt_table_id(table));
@@ -903,6 +985,77 @@ function enforce(uci, s, opts) {
 		cn = true;
 	if (reconcile_rules(uci, 'rule6', 'dev_v6', iface, s.block_ipv6 ? marks : [], function(m) {
 		return { mark: m, action: 'prohibit', priority: '21000' };
+	}, 'mark'))
+		cn = true;
+
+	// 1b'''. Exceptions: excluded devices (by MAC) and domains (a dnsmasq-filled
+	//        set) get the main table's id as their mark, and one rule per
+	//        family sends that mark to the main table at priority 18000,
+	//        ahead of every steering lookup (19000, 20000) and prohibit
+	//        (21000) rule: excluded traffic skips the tunnel and the kill
+	//        switch, and keeps its IPv6.
+	let byp_devs = [], byp_doms = [];
+	let bmark = device_mark(BYPASS_TABLE_ID);
+	if (steer && det.exceptions) {
+		if (rt_table_id(table) == BYPASS_TABLE_ID)
+			push(notes, 'exceptions need a routing table other than main');
+		else {
+			byp_devs = s.bypass_devices || [];
+			if (length(s.bypass_domains || []) > 0) {
+				let supported = (opts && opts.nftset != null) ? !!opts.nftset : nftset_supported();
+				if (!supported)
+					push(notes, 'excluded domains need dnsmasq with nftset support (dnsmasq-full)');
+				else if (!det.lan_zone)
+					push(notes, 'excluded domains: could not determine the LAN zone');
+				else
+					byp_doms = s.bypass_domains;
+			}
+		}
+	}
+	// fw4 applies MARK rules in config order and the last one wins, so the
+	// exceptions must follow every steering MARK rule, or a steered device
+	// visiting an excluded domain keeps the tunnel's mark. When a steering
+	// rule was added after them, recreate ours at the end.
+	let byp_secs = [], late = false;
+	uci.foreach('firewall', 'rule', function(sec) {
+		if (sec[MARK] != '1')
+			return;
+		let r = sec[ROLE];
+		if ((r == 'bypass_mark' || r == 'bypass_domain_mark') && sec.nordvpn_iface == iface)
+			push(byp_secs, sec['.name']);
+		else if (length(byp_secs) && (r == 'device_mark' || r == 'domain_mark'))
+			late = true;
+	});
+	if (late) {
+		for (let n in byp_secs)
+			uci.delete('firewall', n);
+		cf = true;
+	}
+	let bset = bypass_set_name(iface);
+	let byp_sets = length(byp_doms) ? [ bset ] : [];
+	if (reconcile_rules(uci, 'ipset', 'bypass_set', iface, byp_sets, function(n) {
+		return { name: n, family: 'ipv4', match: [ 'dest_ip' ] };
+	}, 'name', 'firewall'))
+		cf = true;
+	if (reconcile_rules(uci, 'rule', 'bypass_domain_mark', iface, byp_sets, function(n) {
+		return { name: 'NordVPN exceptions ' + iface, src: det.lan_zone, ipset: n, family: 'ipv4',
+			proto: 'all', target: 'MARK', set_xmark: bmark };
+	}, 'ipset', 'firewall'))
+		cf = true;
+	if (reconcile_domain_dns(uci, iface, bset, byp_doms, 'bypass_dns'))
+		cd = true;
+	if (reconcile_rules(uci, 'rule', 'bypass_mark', iface, byp_devs, function(mac) {
+		return { name: 'NordVPN exception ' + mac, src: '*', src_mac: mac, proto: 'all',
+			target: 'MARK', set_xmark: bmark };
+	}, 'src_mac', 'firewall'))
+		cf = true;
+	let bmarks = (length(byp_devs) || length(byp_doms)) ? [ bmark ] : [];
+	if (reconcile_rules(uci, 'rule', 'bypass_lookup', iface, bmarks, function(m) {
+		return { mark: m, lookup: 'main', priority: '18000' };
+	}, 'mark'))
+		cn = true;
+	if (reconcile_rules(uci, 'rule6', 'bypass_lookup6', iface, bmarks, function(m) {
+		return { mark: m, lookup: 'main', priority: '18000' };
 	}, 'mark'))
 		cn = true;
 
@@ -1067,9 +1220,26 @@ function enforce(uci, s, opts) {
 		cn = true;
 	}
 
+	// 5b. Steered mode keeps the tunnel's routes in the instance table, so the
+	//     router's own queries to those resolvers (dnsmasq forwards every
+	//     client's lookups to them) would follow the main table out of the WAN,
+	//     readable by the ISP. Send them into the instance table. netifd drops
+	//     the interface's DNS servers while the tunnel is down, so no prohibit
+	//     rule is needed. Keyed by resolver AND table, so a table change
+	//     replaces the rules instead of leaving a stale lookup.
+	let dns_keys = [];
+	if (steer && mode && VPN_DNS[mode])
+		for (let ip in split(VPN_DNS[mode], ' '))
+			push(dns_keys, ip + '/32 ' + table);
+	if (reconcile_rules(uci, 'rule', 'dns_lookup', iface, dns_keys, function(k) {
+		let p = split(k, ' ');
+		return { dest: p[0], lookup: p[1], priority: '19500', nordvpn_key: k };
+	}, 'nordvpn_key'))
+		cn = true;
+
 	return { changed_network: cn, changed_firewall: cf, changed_dhcp: cd,
-		domains_active: length(steer_doms) > 0, notes: notes };
+		domains_active: length(steer_doms) > 0 || length(byp_doms) > 0, notes: notes };
 }
 
 return { detect, enforce, find_wan_zone, find_lan_zone, count_user_routes, recommend_mtu,
-	rt_table_id, device_mark, device_owners, domain_set_name, nftset_supported };
+	rt_table_id, device_mark, device_owners, domain_set_name, bypass_set_name, nftset_supported };
