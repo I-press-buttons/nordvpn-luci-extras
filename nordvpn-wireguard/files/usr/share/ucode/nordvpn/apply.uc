@@ -157,7 +157,7 @@ function bring_up(iface) {
 // there is no handshake — including when the device does not exist, which is
 // a failed connection, not a pass.
 function handshake_age(iface) {
-	let res = run([ 'wg', 'show', iface, 'latest-handshakes' ]);
+	let res = run([ 'wg', 'show', iface, 'latest-handshakes' ], true);
 	if (res.code == 127)
 		return -1;
 	if (res.code != 0)

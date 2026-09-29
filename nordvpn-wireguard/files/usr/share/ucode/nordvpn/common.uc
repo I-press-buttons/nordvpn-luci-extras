@@ -649,17 +649,20 @@ function sh_quote(s) {
 // string (shell) form of popen(), so we build a shell command with every
 // argument single-quoted. All interpolated values are whitelist-validated
 // before reaching here, so no shell metacharacter can survive the quoting.
-function open_cmd(argv, mode) {
+// `quiet` discards the command's stderr instead of letting it reach the
+// service log.
+function open_cmd(argv, mode, quiet) {
 	let parts = [];
 	for (let a in argv)
 		push(parts, sh_quote(a));
-	return popen(join(' ', parts), mode || 'r');
+	return popen(join(' ', parts) + (quiet ? ' 2>/dev/null' : ''), mode || 'r');
 }
 
 // Run an external command (argv array) and capture stdout.
 // Returns { code, stdout }. `code` is -1 when the process could not start.
-function run(argv) {
-	let proc = open_cmd(argv, 'r');
+// `quiet` discards stderr (see open_cmd).
+function run(argv, quiet) {
+	let proc = open_cmd(argv, 'r', quiet);
 	if (!proc)
 		return { code: -1, stdout: '' };
 	let out = proc.read('all') || '';

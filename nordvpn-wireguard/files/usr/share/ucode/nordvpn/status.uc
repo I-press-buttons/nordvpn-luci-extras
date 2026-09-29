@@ -13,9 +13,11 @@ const load_settings = _common.load_settings,
       PROBE_TIMEOUT = _common.PROBE_TIMEOUT,
       run = _common.run;
 
-// Newest WireGuard handshake age in seconds for device `dev`, or null.
+// Newest WireGuard handshake age in seconds for device `dev`, or null. wg's
+// stderr is discarded: the device is briefly missing while netifd recreates
+// it, and "No such device" on every such tick is only log noise.
 function handshake_age(dev) {
-	let res = run([ 'wg', 'show', dev, 'latest-handshakes' ]);
+	let res = run([ 'wg', 'show', dev, 'latest-handshakes' ], true);
 	if (res.code != 0)
 		return null;
 	let best = 0;
@@ -50,7 +52,7 @@ function parse_transfer(out) {
 
 // Bytes received/sent over the tunnel since the interface came up, or null.
 function transfer(dev) {
-	let res = run([ 'wg', 'show', dev, 'transfer' ]);
+	let res = run([ 'wg', 'show', dev, 'transfer' ], true);
 	return (res.code == 0) ? parse_transfer(res.stdout) : null;
 }
 
