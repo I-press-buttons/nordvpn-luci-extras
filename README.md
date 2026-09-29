@@ -170,10 +170,12 @@ Supported: **OpenWrt snapshots** and **OpenWrt 25.12** (both use `apk`).
 
 ### Prebuilt packages from this fork
 
-Every change merged into `master` is published on the
-[Releases page](https://github.com/I-press-buttons/nordvpn-luci-extras/releases/latest)
-as a release of its own, tagged `v<version>-<build>` (for example `v1.7.0-14`).
-Download both architecture-independent `.apk` files from the newest one.
+A nightly build publishes the day's changes to `master` on the
+[Releases page](https://github.com/I-press-buttons/nordvpn-luci-extras/releases/latest),
+at most once a day and only when something was merged. It is tagged
+`v<version>-r<date>` (for example `v1.7.0-r20260930`), and the packages carry
+the same version, so `apk upgrade` picks up each new nightly. Download both
+architecture-independent `.apk` files from the newest release.
 Pull request builds are available as the `nordvpn-packages` artifact on the
 [Actions page](https://github.com/I-press-buttons/nordvpn-luci-extras/actions).
 Then, on the router:
@@ -640,11 +642,21 @@ sh nordvpn-wireguard/tests/run.sh
 ```
 
 CI (`.github/workflows/build.yml`) runs shell and JSON checks, ESLint on the
-LuCI view, the ucode tests, and a snapshot-SDK build of both packages. Every
-push to `master` then publishes a GitHub release, tagged
-`v<PKG_VERSION>-<run number>`, with release notes generated from the merged
-changes. Pushing an annotated `v*` tag still publishes a release whose notes
-come from the tag message.
+LuCI view, the ucode tests, and a snapshot-SDK build of both packages on every
+pull request and push to `master`. Those runs don't publish anything.
+
+Releases come from two places:
+
+- **Nightly** (06:17 UTC). If `master` changed since the latest release, CI
+  builds it with `PKG_RELEASE` set to the date and publishes
+  `v<PKG_VERSION>-r<YYYYMMDD>`, with notes generated from the changes merged
+  since the previous release. The date is set in CI only; the Makefiles keep
+  `PKG_RELEASE:=1`. To publish one right away, run the workflow from the
+  Actions page with *nightly* ticked (at most one per day).
+- **Versioned releases.** To ship a new version, bump `PKG_VERSION` in both
+  Makefiles (for example to `1.8.0`), merge it, and push an annotated `v*` tag
+  (`git tag -a v1.8.0 -m "..."`). The tag message becomes the release notes.
+  `1.8.0-r1` sorts above every `1.7.0` nightly, so routers upgrade to it.
 
 ## Credits and license
 
