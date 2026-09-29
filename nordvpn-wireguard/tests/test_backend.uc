@@ -1814,6 +1814,73 @@ write_cache(cache, cpath);
 	eq('dns lock: disabled instance releases it', [ dm().noresolv, dm().nordvpn_dns_lock ], [ null, null ]);
 }
 
+// Excluded devices keep the WAN's DNS: a DHCP option 6 per MAC and a DNAT of
+// their plain DNS to the WAN resolver, only while NordVPN DNS is on.
+{
+	let D = '4e:82:91:17:24:d5';
+	let mk = function() {
+		return {
+			nordvpn: { main: { '.type': 'instance', interface: 'nordvpn', enabled: '1', auto_routing: '1',
+				routing_table: 'nordvpn', vpn_dns: 'standard', bypass_device: [ D ] } },
+			network: {
+				lan: { '.type': 'interface', device: 'br-lan', proto: 'static', ipaddr: '192.168.1.1', netmask: '255.255.255.0' },
+				wan: { '.type': 'interface', device: 'wan', proto: 'dhcp' },
+				nordvpn: { '.type': 'interface', proto: 'wireguard', private_key: KEY, vpn_type: 'nordvpn' },
+				p1: { '.type': 'wireguard_nordvpn', interface: 'nordvpn', endpoint_host: 'x.nordvpn.com' }
+			},
+			firewall: {
+				zlan: { '.type': 'zone', name: 'lan', network: [ 'lan' ] },
+				zwan: { '.type': 'zone', name: 'wan', masq: '1', network: [ 'wan' ] }
+			},
+			dhcp: { dm: { '.type': 'dnsmasq' } }
+		};
+	};
+	let find = function(pkg, role) {
+		let out = [];
+		for (let k, v in global.MOCK_UCI[pkg])
+			if (v.nordvpn_role == role)
+				push(out, v);
+		return out;
+	};
+	let o = { nftset: true, wan_dns: [ '192.168.10.166', 'fd00::1' ] };
+
+	global.MOCK_UCI = mk();
+	let res = enforce_routing(cursor(), load_settings(cursor(), 'main'), o);
+	let rd = find('firewall', 'bypass_dns_redirect'), dh = find('dhcp', 'bypass_dhcp_dns');
+	ok('exc dns: one DNAT for the excluded device', length(rd) == 1 && rd[0].src_mac == D &&
+		rd[0].src == 'lan' && rd[0].dest == 'wan' && rd[0].target == 'DNAT' && rd[0].src_dport == '53' &&
+		rd[0].dest_ip == '192.168.10.166' && rd[0].family == 'ipv4' && rd[0].proto == 'tcp udp');
+	ok('exc dns: DHCP hands it the IPv4 WAN resolver under its own tag', length(dh) == 1 && dh[0].mac == D &&
+		dh[0].networkid == 'nvx4e82911724d5' && sprintf('%J', dh[0].dhcp_option) == sprintf('%J', [ '6,192.168.10.166' ]));
+	ok('exc dns: firewall and dnsmasq reloaded', res.changed_firewall && res.changed_dhcp);
+	ok('exc dns: idempotent', (function() {
+		let r = enforce_routing(cursor(), load_settings(cursor(), 'main'), o);
+		return !r.changed_firewall && !r.changed_dhcp;
+	})());
+
+	// The WAN resolver changes: both follow.
+	enforce_routing(cursor(), load_settings(cursor(), 'main'), { nftset: true, wan_dns: [ '192.168.10.1' ] });
+	rd = find('firewall', 'bypass_dns_redirect'); dh = find('dhcp', 'bypass_dhcp_dns');
+	eq('exc dns: follows a new WAN resolver', [ rd[0].dest_ip, dh[0].dhcp_option ], [ '192.168.10.1', [ '6,192.168.10.1' ] ]);
+
+	// Un-excluding the device removes both.
+	delete global.MOCK_UCI.nordvpn.main.bypass_device;
+	enforce_routing(cursor(), load_settings(cursor(), 'main'), o);
+	eq('exc dns: removed with the exclusion', [ length(find('firewall', 'bypass_dns_redirect')), length(find('dhcp', 'bypass_dhcp_dns')) ], [ 0, 0 ]);
+
+	// VPN DNS off: excluded devices need nothing special.
+	global.MOCK_UCI = mk();
+	global.MOCK_UCI.nordvpn.main.vpn_dns = 'off';
+	enforce_routing(cursor(), load_settings(cursor(), 'main'), o);
+	eq('exc dns: nothing without VPN DNS', [ length(find('firewall', 'bypass_dns_redirect')), length(find('dhcp', 'bypass_dhcp_dns')) ], [ 0, 0 ]);
+
+	// No IPv4 WAN resolver: nothing, with a note.
+	global.MOCK_UCI = mk();
+	res = enforce_routing(cursor(), load_settings(cursor(), 'main'), { nftset: true, wan_dns: [ 'fd00::1' ] });
+	ok('exc dns: skipped without an IPv4 WAN resolver', length(find('firewall', 'bypass_dns_redirect')) == 0 &&
+		index(join(' ', res.notes), 'excluded devices') >= 0);
+}
+
 unlink(cpath);
 printf('\n%s\n', fails ? ('FAILURES: ' + fails) : 'ALL PHASE-3 TESTS PASSED');
 exit(fails ? 1 : 0);

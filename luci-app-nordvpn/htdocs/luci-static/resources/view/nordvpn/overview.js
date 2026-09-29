@@ -1439,7 +1439,7 @@ return view.extend({
 
 		if (kind === 'bypass')
 			return this.row(_('Excluded devices'), [ p.details ],
-				_('These devices always use your normal internet connection, even while the kill switch blocks the rest, for example a TV, a console or a work laptop. Matched by MAC address.'));
+				_('These devices always use your normal internet connection, even while the kill switch blocks the rest, for example a TV, a console or a work laptop. Matched by MAC address. With NordVPN DNS on, they keep your provider\'s DNS over IPv4 (lookups they make over IPv6 still go to NordVPN).'));
 		return this.row(_('Steered devices'), [ p.details ],
 			_('Or route individual devices through this instance, matched by MAC address so a new DHCP lease keeps them on the tunnel. A device choice takes precedence over its network.'));
 	},

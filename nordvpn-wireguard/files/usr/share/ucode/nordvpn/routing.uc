@@ -1454,10 +1454,17 @@ function enforce(uci, s, opts) {
 	//     still resolve server hostnames to reconnect or rotate while the
 	//     tunnel is down. Excluded devices resolve through the VPN as well
 	//     (their traffic itself still goes direct).
+	let wans = null;
+	let wan_dns = function() {
+		if (wans == null) {
+			wans = (opts && opts.wan_dns != null) ? opts.wan_dns : wan_resolvers(uci, det.wan_zone);
+			wans = filter(wans, (ip) => index(split(VPN_DNS[mode], ' '), ip) < 0);
+		}
+		return wans;
+	};
 	let lock = null;
 	if ((auto || !!all_lan) && mode && VPN_DNS[mode]) {
-		let wans = (opts && opts.wan_dns != null) ? opts.wan_dns : wan_resolvers(uci, det.wan_zone);
-		wans = filter(wans, (ip) => index(split(VPN_DNS[mode], ' '), ip) < 0);
+		wan_dns();
 		if (!length(wans))
 			push(notes, 'could not find the WAN DNS servers; DNS not locked to the VPN');
 		else {
@@ -1484,6 +1491,51 @@ function enforce(uci, s, opts) {
 		return { dest: ip, action: 'prohibit', priority: '19501' };
 	}, 'dest'))
 		cn = true;
+
+	// 5d. Excluded devices keep the WAN's DNS while the others use NordVPN's.
+	//     dnsmasq cannot pick an upstream per client, so their lookups never
+	//     reach it: DHCP hands them the WAN's IPv4 resolvers (option 6, one
+	//     tag per MAC), and a DNAT sends any plain DNS they still send
+	//     (manual DNS, a lease not yet renewed) to the first of them. The
+	//     exception mark then routes it out of the WAN. IPv4 only: a device
+	//     asking the router over IPv6 still gets the NordVPN resolvers.
+	let byp_dns = [];
+	if (length(byp_devs) && mode && VPN_DNS[mode]) {
+		byp_dns = filter(wan_dns(), (ip) => _common.validate_ipv4(ip) != null);
+		if (!length(byp_dns))
+			push(notes, 'excluded devices: no IPv4 WAN DNS server found; they keep using the router\'s DNS');
+	}
+	let rdevs = length(byp_dns) ? byp_devs : [];
+	let dhcp_dns = length(byp_dns) ? [ '6,' + join(',', byp_dns) ] : [];
+	if (reconcile_rules(uci, 'redirect', 'bypass_dns_redirect', iface, rdevs, function(mac) {
+		let r = { name: 'NordVPN exception DNS ' + mac, src: det.lan_zone, src_mac: mac, proto: 'tcp udp',
+			src_dport: '53', dest_ip: byp_dns[0], dest_port: '53', family: 'ipv4', reflection: '0', target: 'DNAT' };
+		if (det.wan_zone)
+			r.dest = det.wan_zone;
+		return r;
+	}, 'src_mac', 'firewall'))
+		cf = true;
+	if (reconcile_rules(uci, 'mac', 'bypass_dhcp_dns', iface, rdevs, function(mac) {
+		return { mac: mac, networkid: 'nvx' + replace(mac, /:/g, ''), dhcp_option: dhcp_dns };
+	}, 'mac', 'dhcp'))
+		cd = true;
+	// The WAN's resolvers can change (DHCP on the WAN): follow them.
+	if (length(rdevs)) {
+		uci.foreach('firewall', 'redirect', function(sec) {
+			if (sec[MARK] == '1' && sec[ROLE] == 'bypass_dns_redirect' && sec.nordvpn_iface == iface &&
+			    sec.dest_ip != byp_dns[0]) {
+				uci.set('firewall', sec['.name'], 'dest_ip', byp_dns[0]);
+				cf = true;
+			}
+		});
+		uci.foreach('dhcp', 'mac', function(sec) {
+			if (sec[MARK] == '1' && sec[ROLE] == 'bypass_dhcp_dns' && sec.nordvpn_iface == iface &&
+			    sprintf('%J', as_list(sec.dhcp_option)) != sprintf('%J', dhcp_dns)) {
+				uci.set('dhcp', sec['.name'], 'dhcp_option', dhcp_dns);
+				cd = true;
+			}
+		});
+	}
 
 	return { changed_network: cn, changed_firewall: cf, changed_dhcp: cd,
 		domains_active: length(steer_doms) > 0 || length(byp_doms) > 0, dns_locked: lock != null, notes: notes };
