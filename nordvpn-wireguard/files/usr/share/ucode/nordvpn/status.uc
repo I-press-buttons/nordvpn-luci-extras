@@ -72,46 +72,6 @@ function egress_probe(dev, targets) {
 	return { ok: false, target: null };
 }
 
-// Pick { up, l3_device, uptime } out of a netifd interface status object, or
-// null when it is not one. Pure.
-function parse_netifd(st) {
-	if (type(st) != 'object' || st.up == null)
-		return null;
-	return {
-		up: st.up ? true : false,
-		l3_device: (type(st.l3_device) == 'string' && st.l3_device != '') ? st.l3_device : null,
-		uptime: (type(st.uptime) == 'int') ? st.uptime : null
-	};
-}
-
-// netifd's view of interface `iface`: { up, l3_device, uptime }, or null when
-// it cannot be read. Asks over the ubus module first and falls back to the
-// ubus CLI, which is what the apply worker relies on: the in-process call
-// can come back empty inside rpcd while the interface is plainly up. The
-// module connection is closed immediately: status() is called on every
-// daemon tick (watchdog), and a leaked connection per tick exhausts ubusd's
-// file descriptors within hours, after which nothing on the router can talk
-// to ubus at all.
-function netifd_status(iface) {
-	if (!validate_interface(iface))
-		return null;
-	let ub = connect();
-	if (ub) {
-		let st = parse_netifd(ub.call('network.interface.' + iface, 'status', {}));
-		ub.disconnect();
-		if (st)
-			return st;
-	}
-	let r = run([ 'ubus', 'call', 'network.interface.' + iface, 'status' ]);
-	if (r.code != 0)
-		return null;
-	try {
-		return parse_netifd(json(r.stdout));
-	} catch (e) {
-		return null;
-	}
-}
-
 function find_peer(uci, iface) {
 	let found = null;
 	uci.foreach('network', null, function(sec) {
@@ -173,10 +133,23 @@ function status(uci, instance) {
 	if (!has_key)
 		return result;
 
-	let ni = netifd_status(iface);
-	let ifup = ni ? ni.up : false;
-	let l3dev = (ni && ni.l3_device) ? ni.l3_device : iface;
-	let uptime = ni ? ni.uptime : null;
+	// Interface up? and its L3 device name, via netifd. The connection is closed
+	// immediately: status() is called on every daemon tick (watchdog), and a
+	// leaked connection per tick exhausts ubusd's file descriptors within hours,
+	// after which nothing on the router can talk to ubus at all.
+	let ifup = false, l3dev = iface, uptime = null;
+	let ub = connect();
+	if (ub) {
+		let st = ub.call('network.interface.' + iface, 'status', {});
+		if (st) {
+			ifup = st.up ? true : false;
+			if (st.l3_device)
+				l3dev = st.l3_device;
+			if (type(st.uptime) == 'int')
+				uptime = st.uptime;
+		}
+		ub.disconnect();
+	}
 	result.device = l3dev;
 	if (ifup) {
 		result.uptime = uptime;
@@ -186,15 +159,6 @@ function status(uci, instance) {
 	let hs = handshake_age(l3dev);
 	if (hs != null)
 		result.latest_handshake_seconds = hs;
-
-	// A fresh handshake on the device means the tunnel is live: netifd deletes
-	// a WireGuard device on ifdown, so it cannot outlive its interface. Trust
-	// it over a netifd answer that was unreadable or lagging, rather than
-	// reporting a working tunnel as disconnected.
-	if (!ifup && hs != null && hs <= 180) {
-		ifup = true;
-		result.transfer = transfer(l3dev);
-	}
 
 	if (!ifup)
 		result.state = 'disconnected';
@@ -208,4 +172,4 @@ function status(uci, instance) {
 	return result;
 }
 
-return { status, parse_transfer, parse_netifd, egress_probe };
+return { status, parse_transfer, egress_probe };
