@@ -68,7 +68,7 @@ var callExternalIp = rpc.declare({ object: 'nordvpn', method: 'external_ip', par
 var callClients = rpc.declare({ object: 'nordvpn', method: 'clients' });
 var callDisconnect = rpc.declare({ object: 'nordvpn', method: 'disconnect', params: [ 'instance' ] });
 var callClearCredentials = rpc.declare({ object: 'nordvpn', method: 'clear_credentials', params: [ 'instance' ] });
-var callCreateInstance = rpc.declare({ object: 'nordvpn', method: 'create_instance', params: [ 'instance' ] });
+var callCreateInstance = rpc.declare({ object: 'nordvpn', method: 'create_instance', params: [ 'instance', 'credentials_from' ] });
 var callDeleteInstance = rpc.declare({ object: 'nordvpn', method: 'delete_instance', params: [ 'instance' ] });
 var callHistory = rpc.declare({ object: 'nordvpn', method: 'history', params: [ 'instance', 'limit' ] });
 
@@ -315,25 +315,40 @@ return view.extend({
 	showAddInstanceModal: function() {
 		var input = E('input', { type: 'text', class: 'cbi-input-text', placeholder: _('e.g. media') });
 		var err = E('div', { class: 'cbi-value-description', style: 'color:var(--error-color,#c0392b)' });
+
+		// Offer to reuse an existing instance's credentials, defaulting to the
+		// selected instance when it has some, else the first one that does.
+		var sources = (this.instances || []).filter(function(st) { return st.configured; })
+			.map(function(st) { return st.instance; });
+		var from = null;
+		if (sources.length) {
+			var pick = (sources.indexOf(this.instance) >= 0) ? this.instance : sources[0];
+			from = E('select', { class: 'cbi-input-select' }, sources.map(function(n) {
+				return E('option', { value: n, selected: (n === pick) ? '' : null }, _('Reuse credentials from "%s"').format(n));
+			}).concat([ E('option', { value: '' }, _('Set new credentials later')) ]));
+		}
+
 		ui.showModal(_('Add VPN instance'), [
-			E('p', {}, _('A new instance runs its own tunnel on its own WireGuard interface with its own credentials and schedule. Issue a separate NordVPN access token for it — reusing one key elsewhere has been known to get it locked.')),
+			E('p', {}, _('A new instance runs its own tunnel on its own WireGuard interface with its own schedule.')),
 			E('div', { class: 'cbi-value' }, [ input ]),
+			from ? E('div', { class: 'cbi-value' }, [ from ]) : '',
 			err,
 			E('div', { class: 'right' }, [
 				E('button', { class: 'cbi-button', click: ui.hideModal }, _('Cancel')),
 				' ',
-				E('button', { class: 'cbi-button cbi-button-action', click: L.bind(this.addInstance, this, input, err) }, _('Add'))
+				E('button', { class: 'cbi-button cbi-button-action', click: L.bind(this.addInstance, this, input, from, err) }, _('Add'))
 			])
 		]);
 	},
 
-	addInstance: function(input, err) {
+	addInstance: function(input, from, err) {
 		var name = (input.value || '').trim();
 		if (!/^[A-Za-z0-9_]{1,12}$/.test(name)) {
 			dom.content(err, _('Use 1-12 letters, digits or underscores.'));
 			return;
 		}
-		return callCreateInstance(name).then(L.bind(function(res) {
+		var source = from ? from.value : '';
+		return callCreateInstance(name, source).then(L.bind(function(res) {
 			if (res && res.error) {
 				dom.content(err, [ res.error ]);
 				return;
@@ -344,7 +359,9 @@ return view.extend({
 				return this.refreshStatus();
 			}, this)).then(L.bind(function() {
 				this.selectInstance(name);
-				this.notice(_('Instance "%s" created. Set its credentials and pick a country, then save.').format(name), 'info', 6000);
+				this.notice((res && res.configured)
+					? _('Instance "%s" created with the credentials of "%s". Pick a country, then save.').format(name, source)
+					: _('Instance "%s" created. Set its credentials and pick a country, then save.').format(name), 'info', 6000);
 			}, this));
 		}, this)).catch(L.bind(function(e) {
 			dom.content(err, [ '' + e ]);
@@ -928,7 +945,7 @@ return view.extend({
 		// Building the form fires the same change paths as user input; the
 		// guard keeps programmatic construction from marking the form dirty.
 		this._building = true;
-		var sections = [ this.buildConnection(), this.buildRoutingSection(), this.buildRotation(), this.buildAdvanced() ];
+		var sections = [ this.buildCredentials(), this.buildConnection(), this.buildRoutingSection(), this.buildRotation(), this.buildAdvanced() ];
 		this._building = false;
 		return sections;
 	},
@@ -955,9 +972,8 @@ return view.extend({
 		return el;
 	},
 
-	buildConnection: function() {
-		var s = this.status || {};
-		var configured = !!s.configured;
+	buildCredentials: function() {
+		var configured = !!(this.status || {}).configured;
 
 		var credState = E('span', {}, configured ? _('Configured') : _('Not configured'));
 		var credBtn = E('button', {
@@ -969,6 +985,15 @@ return view.extend({
 			click: L.bind(this.showClearCredentialsModal, this)
 		}, _('Remove')) : '';
 
+		return E('fieldset', { class: 'cbi-section' }, [
+			E('legend', {}, _('Credentials')),
+			E('div', { class: 'cbi-section-node' }, [
+				this.row(_('Credentials'), [ E('div', { class: 'nv-inline' }, [ credState, credBtn, credClearBtn ]) ])
+			])
+		]);
+	},
+
+	buildConnection: function() {
 		// Server pin picker (custom panel, load-aware). _serverChosen is the
 		// source of truth: a hostname, or '' for automatic (rotation picks).
 		this._serversReq = 0;
@@ -1067,7 +1092,6 @@ return view.extend({
 		var section = E('fieldset', { class: 'cbi-section' }, [
 			E('legend', {}, _('Connection')),
 			E('div', { class: 'cbi-section-node' }, [
-				this.row(_('Credentials'), [ E('div', { class: 'nv-inline' }, [ credState, credBtn, credClearBtn ]) ]),
 				this.row(_('Hop mode'), [ seg, this.hopNote ]),
 				this.p2pRow,
 				this.row(_('Locations'), [

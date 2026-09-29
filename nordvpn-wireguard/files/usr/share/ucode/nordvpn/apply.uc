@@ -628,7 +628,7 @@ function clear_credentials(uci, instance) {
 // Create a new VPN instance section with its own interface. Committed
 // atomically here (not via the UI's staged-apply machinery, whose rollback
 // window makes programmatic section creation fragile).
-function create_instance(uci, name) {
+function create_instance(uci, name, credentials_from) {
 	let valid = _common.validate_instance(name);
 	if (!valid || valid != name)
 		return { error: 'invalid instance name' };
@@ -647,11 +647,35 @@ function create_instance(uci, name) {
 	if (taken || uci.get('network', iface) != null)
 		return { error: 'interface ' + iface + ' already exists' };
 
+	// Reuse another instance's credentials: the access token is never stored,
+	// only the WireGuard private key it was exchanged for — and NordVPN issues
+	// one key per account, so copying it is what a second token would yield.
+	// Checked before anything is written so a bad source creates nothing.
+	let key = null;
+	if (credentials_from != null && credentials_from != '') {
+		if (uci.get('nordvpn', credentials_from) == null)
+			return { error: 'no such instance to copy credentials from' };
+		let src = validate_interface(load_settings(uci, credentials_from).interface);
+		key = src ? validate_wg_key(uci.get('network', src, 'private_key')) : null;
+		if (!key)
+			return { error: 'instance ' + credentials_from + ' has no credentials to copy' };
+	}
+
 	uci.set('nordvpn', name, 'instance');
 	uci.set('nordvpn', name, 'interface', iface);
 	uci.set('nordvpn', name, 'enabled', '1');
 	uci.commit('nordvpn');
-	return { ok: true, instance: name, interface: iface };
+
+	if (key) {
+		uci.set('network', iface, 'interface');
+		uci.set('network', iface, 'proto', 'wireguard');
+		uci.set('network', iface, 'vpn_type', 'nordvpn');
+		uci.set('network', iface, 'private_key', key);
+		uci.set('network', iface, 'addresses', [ FIXED_ADDRESS ]);
+		uci.commit('network');
+		record_event(name, 'credentials_set');
+	}
+	return { ok: true, instance: name, interface: iface, configured: key != null };
 }
 
 // Tear down a VPN instance: stamped routing/firewall objects, the netifd

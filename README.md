@@ -129,7 +129,8 @@ that adds the extra features marked **(fork)** below.
 
 - **Multiple instances.** Run tunnels side by side, for example the main
   LAN through Germany and a media network through Serbia. Each has its own
-  credentials, locations, schedule and routing.
+  credentials, locations, schedule and routing. A new instance can reuse the
+  credentials of an existing one, so you only paste a token once.
 
   ![VPN instances](docs/screenshots/instances.png)
 
@@ -310,7 +311,9 @@ ubus call nordvpn refresh_locations # start an async server-list refresh
 
 `status`, `apply`, `rotate_now` and `set_credentials` accept an `instance`
 argument (default `main`). `create_instance` and `delete_instance` manage
-instances, and `nordvpn-rotate <name>` rotates one instance from the CLI.
+instances; pass `create_instance` a `credentials_from` instance name to copy
+its stored key instead of setting new credentials. `nordvpn-rotate <name>`
+rotates one instance from the CLI.
 
 `status` reports these states:
 

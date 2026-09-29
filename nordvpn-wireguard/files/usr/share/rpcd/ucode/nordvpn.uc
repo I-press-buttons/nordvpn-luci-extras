@@ -318,10 +318,16 @@ methods.clear_credentials = {
 };
 
 methods.create_instance = {
-	args: { instance: '' },
+	args: { instance: '', credentials_from: '' },
 	call: function(request) {
 		let a = request.args || {};
-		return create_instance(cursor(), a.instance);
+		let from = null;
+		if (a.credentials_from != null && a.credentials_from != '') {
+			from = validate_instance(a.credentials_from);
+			if (!from)
+				return { error: 'invalid instance name' };
+		}
+		return create_instance(cursor(), a.instance, from);
 	}
 };
 

@@ -241,6 +241,33 @@ eq('instances lists both', length(m.instances.call().instances), 2);
 ok('delete_instance ok', m.delete_instance.call({ args: { instance: 'extra' } }).ok == true);
 eq('instances back to one', length(m.instances.call().instances), 1);
 
+// create_instance can reuse another instance's credentials (its stored key)
+{
+	let saved_uci = global.MOCK_UCI;
+	global.MOCK_UCI = { nordvpn: { main: { '.type': 'instance', interface: 'nordvpn', cache_dir: cdir } },
+		network: { nordvpn: { '.type': 'interface', proto: 'wireguard', private_key: KEY, vpn_type: 'nordvpn' } } };
+	let r = m.create_instance.call({ args: { instance: 'media', credentials_from: 'main' } });
+	ok('create with credentials_from ok', r.ok == true && r.configured == true);
+	eq('the key is copied', global.MOCK_UCI.network.nv_media.private_key, KEY);
+	eq('the copy is a managed wireguard interface',
+		[ global.MOCK_UCI.network.nv_media.proto, global.MOCK_UCI.network.nv_media.vpn_type ],
+		[ 'wireguard', 'nordvpn' ]);
+	eq('the new instance reads as configured', m.status.call({ args: { instance: 'media' } }).configured, true);
+
+	r = m.create_instance.call({ args: { instance: 'plain' } });
+	ok('create without credentials_from stays unconfigured', r.ok == true && r.configured == false);
+	ok('no interface written without a source', global.MOCK_UCI.network.nv_plain == null);
+
+	r = m.create_instance.call({ args: { instance: 'ghost', credentials_from: 'nope' } });
+	ok('an unknown source is refused', r.error != null);
+	ok('a refused create writes nothing', global.MOCK_UCI.nordvpn.ghost == null);
+	r = m.create_instance.call({ args: { instance: 'ghost', credentials_from: 'plain' } });
+	ok('a source without credentials is refused', r.error != null && global.MOCK_UCI.nordvpn.ghost == null);
+	ok('a malformed source name is refused',
+		m.create_instance.call({ args: { instance: 'ghost', credentials_from: 'no way' } }).error != null);
+	global.MOCK_UCI = saved_uci;
+}
+
 // deleting 'main' resets it to defaults instead of removing the section
 global.MOCK_UCI = { nordvpn: { main: { '.type': 'settings', interface: 'nordvpn',
 	country_code: 'de', rotation_enabled: '1', config_version: '1', cache_dir: cdir } },
