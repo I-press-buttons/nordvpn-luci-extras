@@ -1561,6 +1561,13 @@ write_cache(cache, cpath);
 	st = status(cursor());
 	eq('status: no uptime while down', [ st.uptime, st.transfer ], [ null, null ]);
 	global.MOCK_UBUS = {};
+
+	eq('netifd: up object parsed', _status.parse_netifd({ up: true, l3_device: 'nordvpn', uptime: 7 }),
+		{ up: true, l3_device: 'nordvpn', uptime: 7 });
+	eq('netifd: down object parsed', _status.parse_netifd({ up: false }),
+		{ up: false, l3_device: null, uptime: null });
+	eq('netifd: empty reply -> null (falls back)', _status.parse_netifd({}), null);
+	eq('netifd: no reply -> null (falls back)', _status.parse_netifd(null), null);
 }
 
 // 13. event history
