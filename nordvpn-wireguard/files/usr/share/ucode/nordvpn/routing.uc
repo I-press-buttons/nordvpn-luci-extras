@@ -130,6 +130,59 @@ function find_managed(uci, sectype, role, iface) {
 	return found;
 }
 
+// The automatic kill switch / IPv6 block of instance `iface`. Rules from
+// before they were owned per instance carry no nordvpn_iface; those are
+// returned too (legacy: true) so the owner can adopt them.
+function find_owned(uci, role, iface) {
+	let own = find_managed(uci, 'rule', role, iface);
+	if (own)
+		return { name: own, legacy: false };
+	let legacy = null;
+	uci.foreach('firewall', 'rule', function(sec) {
+		if (sec[MARK] == '1' && sec[ROLE] == role && !sec.nordvpn_iface) {
+			legacy = sec['.name'];
+			return false;
+		}
+	});
+	return legacy ? { name: legacy, legacy: true } : null;
+}
+
+// Whether instance `iface` has its automatic `role` rule: its own, or an
+// unowned legacy one while it is the instance routing all LAN traffic.
+function owned_here(uci, role, iface, auto) {
+	let f = find_owned(uci, role, iface);
+	return f != null && (!f.legacy || !!auto);
+}
+
+// The instance that routes all LAN traffic, as seen by instance `name`: the
+// first enabled instance (main first) with "Route all LAN traffic" on that
+// comes before `name`. Only one instance can own the LAN's default path —
+// two would race for the same default route or policy-rule priority and one
+// tunnel would silently carry everything. null when `name` may have it.
+function all_lan_owner(uci, name) {
+	for (let n in _common.list_instances(uci)) {
+		if (n == name)
+			return null;
+		let o = _common.load_settings(uci, n);
+		if (o.enabled && o.auto_routing)
+			return n;
+	}
+	return null;
+}
+
+// True when an enabled instance other than `skip` has "Route all LAN
+// traffic" on.
+function any_all_lan(uci, skip) {
+	for (let n in _common.list_instances(uci)) {
+		if (n == skip)
+			continue;
+		let o = _common.load_settings(uci, n);
+		if (o.enabled && o.auto_routing)
+			return true;
+	}
+	return false;
+}
+
 // ── Local subnets (steering bypass) ──────────────────────────────────
 // A steered table's default swallows traffic to OTHER local subnets too, so
 // LAN↔VLAN and LAN↔tunnel-services connectivity would silently die. Steering
@@ -733,9 +786,13 @@ function detect(uci, s, runtime) {
 	let peer = find_peer(uci, iface);
 	let steering = length(s.source_networks || []) > 0 || length(s.source_devices || []) > 0 ||
 		length(s.source_domains || []) > 0;
+	// "Route all LAN traffic" already owned by an earlier instance: this one
+	// falls back to its steering (or none) and reports who holds it.
+	let owner = s.auto_routing ? all_lan_owner(uci, s.name) : null;
+	let auto = s.auto_routing && !owner;
 	// Exceptions only mean something while traffic is routed at all; with
 	// "Route all LAN traffic" they move it onto the steered machinery.
-	let exceptions = (s.auto_routing || steering) &&
+	let exceptions = (auto || steering) &&
 		(length(s.bypass_devices || []) > 0 || length(s.bypass_domains || []) > 0);
 	// With steering active, extra user routes INSIDE the instance's table are
 	// legitimate companions (e.g. a media→LAN route); only routes referencing
@@ -751,7 +808,8 @@ function detect(uci, s, runtime) {
 
 	let wanmtu = runtime ? wan_l3_mtu(uci) : null;
 	return {
-		mode: manual ? 'manual' : (s.auto_routing ? 'auto' : (steering ? 'steered' : 'none')),
+		mode: manual ? 'manual' : (auto ? 'auto' : (steering ? 'steered' : 'none')),
+		all_lan_owner: owner,
 		zone: zone ? zone.name : null,
 		zone_managed: zone ? zone.managed : false,
 		user_routes: user_routes,
@@ -765,9 +823,9 @@ function detect(uci, s, runtime) {
 		domain_steering: (runtime && (length(s.source_domains || []) > 0 || length(s.bypass_domains || []) > 0))
 			? (nftset_supported() ? 'ok' : 'unsupported') : null,
 		route_allowed_ips: peer ? (uci.get('network', peer, 'route_allowed_ips') == '1') : false,
-		killswitch: find_managed(uci, 'rule', 'killswitch') != null ||
+		killswitch: owned_here(uci, 'killswitch', iface, auto) ||
 			length(find_managed_rules(uci, 'rule', 'steer_ks', iface)) > 0,
-		ipv6_block: find_managed(uci, 'rule', 'ipv6block') != null ||
+		ipv6_block: owned_here(uci, 'ipv6block', iface, auto) ||
 			length(find_managed_rules(uci, 'rule6', 'steer_v6', iface)) > 0,
 		wan_zone: find_wan_zone(uci),
 		lan_zone: find_lan_zone(uci),
@@ -797,6 +855,8 @@ function enforce(uci, s, opts) {
 	let active = (s.enabled == null) ? true : !!s.enabled;
 	let auto = (det.mode == 'auto') && active;
 	let steer = (det.mode == 'steered') && active;
+	if (det.all_lan_owner && active)
+		push(notes, 'route all LAN traffic is already enabled on instance ' + det.all_lan_owner + '; not applied here');
 	let has_table = s.routing_table != null && s.routing_table != '';
 	if (steer && !has_table) {
 		push(notes, 'steering needs a routing table; set one for this instance');
@@ -1159,8 +1219,25 @@ function enforce(uci, s, opts) {
 
 	// 3. Kill switch: our own REJECT rule LAN->WAN. fw4 evaluates traffic rules
 	//    before zone forwardings, so the user's forwardings stay untouched.
+	// Each instance owns its rule (nordvpn_iface), so applying or deleting
+	// another instance never removes it. An unowned rule from an older version
+	// is adopted by the instance that wants it, and dropped once no instance
+	// routes all LAN traffic any more.
 	let want_ks = auto && s.killswitch;
-	let ks = find_managed(uci, 'rule', 'killswitch');
+	let ksf = find_owned(uci, 'killswitch', iface);
+	let ks = ksf ? ksf.name : null;
+	if (ksf && ksf.legacy) {
+		if (want_ks) {
+			uci.set('firewall', ks, 'nordvpn_iface', iface);
+			cf = true;
+		} else {
+			if (!any_all_lan(uci, s.name)) {
+				uci.delete('firewall', ks);
+				cf = true;
+			}
+			ks = null;
+		}
+	}
 	if (want_ks && !ks) {
 		if (det.lan_zone && det.wan_zone) {
 			let r = uci.add('firewall', 'rule');
@@ -1171,6 +1248,7 @@ function enforce(uci, s, opts) {
 			uci.set('firewall', r, 'target', 'REJECT');
 			uci.set('firewall', r, MARK, '1');
 			uci.set('firewall', r, ROLE, 'killswitch');
+			uci.set('firewall', r, 'nordvpn_iface', iface);
 			cf = true;
 		} else {
 			push(notes, 'could not determine the LAN/WAN zones; kill switch not installed');
@@ -1182,7 +1260,20 @@ function enforce(uci, s, opts) {
 
 	// 4. IPv6 leak block: same shape, family ipv6 only.
 	let want_v6 = auto && s.block_ipv6;
-	let v6 = find_managed(uci, 'rule', 'ipv6block');
+	let v6f = find_owned(uci, 'ipv6block', iface);
+	let v6 = v6f ? v6f.name : null;
+	if (v6f && v6f.legacy) {
+		if (want_v6) {
+			uci.set('firewall', v6, 'nordvpn_iface', iface);
+			cf = true;
+		} else {
+			if (!any_all_lan(uci, s.name)) {
+				uci.delete('firewall', v6);
+				cf = true;
+			}
+			v6 = null;
+		}
+	}
 	if (want_v6 && !v6) {
 		if (det.lan_zone && det.wan_zone) {
 			let r = uci.add('firewall', 'rule');
@@ -1194,6 +1285,7 @@ function enforce(uci, s, opts) {
 			uci.set('firewall', r, 'target', 'REJECT');
 			uci.set('firewall', r, MARK, '1');
 			uci.set('firewall', r, ROLE, 'ipv6block');
+			uci.set('firewall', r, 'nordvpn_iface', iface);
 			cf = true;
 		} else {
 			push(notes, 'could not determine the LAN/WAN zones; IPv6 block not installed');
@@ -1242,4 +1334,4 @@ function enforce(uci, s, opts) {
 }
 
 return { detect, enforce, find_wan_zone, find_lan_zone, count_user_routes, recommend_mtu,
-	rt_table_id, device_mark, device_owners, domain_set_name, bypass_set_name, nftset_supported };
+	rt_table_id, device_mark, device_owners, all_lan_owner, domain_set_name, bypass_set_name, nftset_supported };

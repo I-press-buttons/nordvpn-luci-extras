@@ -395,7 +395,12 @@ On every apply the backend first works out which routing mode applies:
   and IPv6, plus the DNS override. If the instance has a routing table, the
   tunnel's default route lives in that table instead of the main one. The
   backend then steers every network of the LAN zone into it, as described
-  under *Steered*, with the same result.
+  under *Steered*, with the same result. Only one enabled instance can route
+  all LAN traffic: the checkbox is locked on the others, and if the config
+  sets it on several anyway, the first one (main first) wins and the rest
+  log a note and fall back to their steering. The kill switch and IPv6 rules
+  belong to the instance that created them, so applying or deleting another
+  instance never removes them.
 - **Steered.** Policy rules send only the selected traffic into the
   instance's routing table:
   - **Networks:** `in <network> lookup <table>` at priority 20000.

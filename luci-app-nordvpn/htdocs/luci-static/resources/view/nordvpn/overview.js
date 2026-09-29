@@ -1241,8 +1241,23 @@ return view.extend({
 				return E('label', { class: 'nv-check' }, [ cb, n ]);
 			}, this)));
 
+			// Only one instance can route all LAN traffic (the backend enforces
+			// it too): elsewhere the box is locked, and a leftover conflict is
+			// flagged so it can be cleared.
+			var holder = this.allLanOwner(true);
+			var owner = this.allLanOwner(false);
+			var routeNote = null;
+			if (holder && !this.autoRouting.checked) {
+				this.autoRouting.disabled = true;
+				routeNote = E('div', { class: 'cbi-value-description' },
+					_('Already enabled on instance "%s". Only one instance can route all LAN traffic; route chosen networks, devices or domains through this one instead.').format(holder));
+			} else if (owner) {
+				routeNote = E('div', { class: 'cbi-value-description nv-inline-note' },
+					_('⚠ Not active: instance "%s" already routes all LAN traffic. Turn it off here or there.').format(owner));
+			}
 			body.appendChild(this.row(_('Traffic routing'), [
-				E('label', { class: 'nv-check' }, [ this.autoRouting, _('Route all LAN traffic through the VPN') ])
+				E('label', { class: 'nv-check' }, [ this.autoRouting, _('Route all LAN traffic through the VPN') ]),
+				routeNote || ''
 			], _('Creates a firewall zone and a default route via the tunnel; disabling removes exactly what was created.')));
 			this.steerRow = this.row(_('Steered networks'), [ this.steerWrap ],
 				_('Or route only these networks through this instance — policy rules send their traffic into its routing table.'));
@@ -1622,6 +1637,24 @@ return view.extend({
 			if (this.steerBoxes[k].checked)
 				out.push(k);
 		return out;
+	},
+
+	// Another enabled instance with "Route all LAN traffic" on, or null.
+	// `any` false: only one ahead of the selected instance, i.e. the one the
+	// backend lets win (the first, main first). `any` true: any other one.
+	allLanOwner: function(any) {
+		var list = this.instances || [];
+		for (var i = 0; i < list.length; i++) {
+			var n = list[i].instance;
+			if (n === this.instance) {
+				if (any)
+					continue;
+				return null;
+			}
+			if (list[i].enabled !== false && uci.get('nordvpn', n, 'auto_routing') === '1')
+				return n;
+		}
+		return null;
 	},
 
 	onRoutingToggle: function(init) {

@@ -1613,6 +1613,82 @@ write_cache(cache, cpath);
 	eq('apply event: partial failure is a failure', _apply_m.apply_event({ state: 'partial_failure', gateway: 'g', error: 'e' }).type, 'connect_failed');
 }
 
+// Multiple instances: the automatic kill switch / IPv6 block belong to the
+// instance that made them, and only one instance may route all LAN traffic.
+{
+	let mkmulti = function(main_auto, media_auto) {
+		return {
+			nordvpn: {
+				main: { '.type': 'instance', interface: 'nordvpn', enabled: '1', auto_routing: main_auto ? '1' : '0', killswitch: '1' },
+				media: { '.type': 'instance', interface: 'nv_media', enabled: '1', auto_routing: media_auto ? '1' : '0', killswitch: '1' }
+			},
+			network: {
+				nordvpn: { '.type': 'interface', proto: 'wireguard', private_key: KEY, vpn_type: 'nordvpn' },
+				p1: { '.type': 'wireguard_nordvpn', interface: 'nordvpn', endpoint_host: 'x.nordvpn.com' },
+				nv_media: { '.type': 'interface', proto: 'wireguard', private_key: KEY, vpn_type: 'nordvpn' },
+				p2: { '.type': 'wireguard_nv_media', interface: 'nv_media', endpoint_host: 'y.nordvpn.com' }
+			},
+			firewall: {
+				zlan: { '.type': 'zone', name: 'lan', network: [ 'lan' ] },
+				zwan: { '.type': 'zone', name: 'wan', masq: '1', network: [ 'wan' ] }
+			}
+		};
+	};
+	let rules = function(role) {
+		let out = [];
+		for (let k, v in global.MOCK_UCI.firewall)
+			if (v.nordvpn_role == role)
+				push(out, v.nordvpn_iface || '-');
+		return out;
+	};
+	let S = function(n) { return load_settings(cursor(), n); };
+
+	// Main routes all LAN with a kill switch; media only tunnels.
+	global.MOCK_UCI = mkmulti(true, false);
+	enforce_routing(cursor(), S('main'));
+	eq('multi: main owns its kill switch', rules('killswitch'), [ 'nordvpn' ]);
+	eq('multi: main owns its IPv6 block', rules('ipv6block'), [ 'nordvpn' ]);
+	enforce_routing(cursor(), S('media'));
+	eq('multi: applying media keeps main\'s kill switch', rules('killswitch'), [ 'nordvpn' ]);
+	eq('multi: applying media keeps main\'s IPv6 block', rules('ipv6block'), [ 'nordvpn' ]);
+	let gone = S('media');
+	gone.auto_routing = false; gone.killswitch = false; gone.block_ipv6 = false;
+	enforce_routing(cursor(), gone);
+	eq('multi: tearing media down keeps main\'s kill switch', rules('killswitch'), [ 'nordvpn' ]);
+	ok('multi: main still reports its kill switch', detect_routing(cursor(), S('main'), false).killswitch);
+	ok('multi: media reports none', !detect_routing(cursor(), S('media'), false).killswitch);
+
+	// Only one instance may route all LAN traffic; main (first) keeps it.
+	global.MOCK_UCI = mkmulti(true, true);
+	let dm = detect_routing(cursor(), S('main'), false);
+	let dx = detect_routing(cursor(), S('media'), false);
+	eq('single owner: main is auto', [ dm.mode, dm.all_lan_owner ], [ 'auto', null ]);
+	eq('single owner: media falls back and names the owner', [ dx.mode, dx.all_lan_owner ], [ 'none', 'main' ]);
+	enforce_routing(cursor(), S('main'));
+	let rx = enforce_routing(cursor(), S('media'));
+	ok('single owner: media gets a note', index(join(' ', rx.notes), 'already enabled on instance main') >= 0);
+	eq('single owner: media installs no kill switch of its own', rules('killswitch'), [ 'nordvpn' ]);
+	ok('single owner: media gets no default route', global.MOCK_UCI.network.p2.route_allowed_ips == null);
+	ok('single owner: main has its default route', global.MOCK_UCI.network.p1.route_allowed_ips == '1');
+	// A disabled owner does not block: media takes over.
+	global.MOCK_UCI.nordvpn.main.enabled = '0';
+	eq('single owner: a disabled main frees it', detect_routing(cursor(), S('media'), false).mode, 'auto');
+
+	// Legacy (unowned) rules from an older version.
+	global.MOCK_UCI = mkmulti(true, false);
+	global.MOCK_UCI.firewall.oldks = { '.type': 'rule', name: 'NordVPN kill switch', src: 'lan', dest: 'wan',
+		proto: 'all', target: 'REJECT', nordvpn_managed: '1', nordvpn_role: 'killswitch' };
+	ok('legacy: shown for the all-LAN instance before adoption', detect_routing(cursor(), S('main'), false).killswitch);
+	enforce_routing(cursor(), S('media'));
+	eq('legacy: another instance leaves it alone while main routes all LAN', rules('killswitch'), [ '-' ]);
+	enforce_routing(cursor(), S('main'));
+	eq('legacy: main adopts it (no duplicate)', rules('killswitch'), [ 'nordvpn' ]);
+	global.MOCK_UCI = mkmulti(false, false);
+	global.MOCK_UCI.firewall.oldks = { '.type': 'rule', nordvpn_managed: '1', nordvpn_role: 'killswitch', src: 'lan', dest: 'wan', target: 'REJECT' };
+	enforce_routing(cursor(), S('media'));
+	eq('legacy: dropped once no instance routes all LAN', rules('killswitch'), []);
+}
+
 unlink(cpath);
 printf('\n%s\n', fails ? ('FAILURES: ' + fails) : 'ALL PHASE-3 TESTS PASSED');
 exit(fails ? 1 : 0);
