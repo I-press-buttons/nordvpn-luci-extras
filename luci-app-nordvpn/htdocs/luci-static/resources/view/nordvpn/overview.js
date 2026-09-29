@@ -215,6 +215,7 @@ return view.extend({
 		this.instancesNode = E('div');
 		this.statusNode = E('div');
 		this.historyNode = this.buildHistory();
+		this.credNode = E('div');
 		this.formNode = E('div');
 		this.xferSamples = {};
 		this.xferRates = {};
@@ -226,6 +227,7 @@ return view.extend({
 		var container = E('div', {}, [
 			E('style', {}, STYLE),
 			E('h2', {}, _('NordVPN')),
+			this.credNode,
 			this.instancesNode,
 			this.statusNode,
 			this.historyNode,
@@ -945,7 +947,10 @@ return view.extend({
 		// Building the form fires the same change paths as user input; the
 		// guard keeps programmatic construction from marking the form dirty.
 		this._building = true;
-		var sections = [ this.buildCredentials(), this.buildConnection(), this.buildRoutingSection(), this.buildRotation(), this.buildAdvanced() ];
+		// Credentials sit at the top of the page, apart from the form, but follow
+		// the selected instance, so they are rebuilt with it.
+		dom.content(this.credNode, this.buildCredentials());
+		var sections = [ this.buildConnection(), this.buildRoutingSection(), this.buildRotation(), this.buildAdvanced() ];
 		this._building = false;
 		return sections;
 	},
@@ -985,8 +990,11 @@ return view.extend({
 			click: L.bind(this.showClearCredentialsModal, this)
 		}, _('Remove')) : '';
 
+		var legend = _('Credentials');
+		if ((this.instances || []).length > 1)
+			legend += ' — ' + this.instance;
 		return E('fieldset', { class: 'cbi-section' }, [
-			E('legend', {}, _('Credentials')),
+			E('legend', {}, legend),
 			E('div', { class: 'cbi-section-node' }, [
 				this.row(_('Credentials'), [ E('div', { class: 'nv-inline' }, [ credState, credBtn, credClearBtn ]) ])
 			])
