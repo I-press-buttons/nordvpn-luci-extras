@@ -977,6 +977,10 @@ function enforce(uci, s, opts) {
 			push(notes, 'device steering needs a routing table with an id of 1-255; ' + table + ' has none');
 			steer_devs = [];
 		}
+		if (!det.lan_zone && length(steer_devs)) {
+			push(notes, 'device steering: could not determine the LAN zone');
+			steer_devs = [];
+		}
 	}
 	// 1b''. Domain steering: dnsmasq resolves the listed domains into a fw4
 	//       nft set, and one MARK rule gives packets to those addresses the
@@ -1005,7 +1009,7 @@ function enforce(uci, s, opts) {
 	}, 'name', 'firewall'))
 		cf = true;
 	if (reconcile_rules(uci, 'rule', 'domain_mark', iface, dom_sets, function(n) {
-		return { name: 'NordVPN domains ' + iface, src: det.lan_zone, ipset: n, family: 'ipv4',
+		return { name: 'NordVPN domains ' + iface, src: det.lan_zone, dest: '*', ipset: n, family: 'ipv4',
 			proto: 'all', target: 'MARK', set_xmark: mark };
 	}, 'ipset', 'firewall'))
 		cf = true;
@@ -1014,22 +1018,18 @@ function enforce(uci, s, opts) {
 
 	let marks = (mark && (length(steer_devs) || length(steer_doms))) ? [ mark ] : [];
 	if (reconcile_rules(uci, 'rule', 'device_mark', iface, steer_devs, function(mac) {
-		return { name: 'NordVPN device ' + mac, src: '*', src_mac: mac, proto: 'all',
+		return { name: 'NordVPN device ' + mac, src: det.lan_zone, dest: '*', src_mac: mac, proto: 'all',
 			target: 'MARK', set_xmark: mark };
 	}, 'src_mac', 'firewall'))
 		cf = true;
-	// A table change moves the mark: rewrite MARK rules carrying a stale one
-	// (and a domain rule whose LAN zone was renamed).
+	// A table change moves the mark: rewrite MARK rules carrying a stale one.
+	// (A renamed LAN zone is handled with the zone fix-up further down.)
 	if (length(marks))
 		uci.foreach('firewall', 'rule', function(sec) {
 			if (sec[MARK] != '1' || sec.nordvpn_iface != iface)
 				return;
 			if ((sec[ROLE] == 'device_mark' || sec[ROLE] == 'domain_mark') && sec.set_xmark != mark) {
 				uci.set('firewall', sec['.name'], 'set_xmark', mark);
-				cf = true;
-			}
-			if (sec[ROLE] == 'domain_mark' && det.lan_zone && sec.src != det.lan_zone) {
-				uci.set('firewall', sec['.name'], 'src', det.lan_zone);
 				cf = true;
 			}
 		});
@@ -1061,6 +1061,10 @@ function enforce(uci, s, opts) {
 			push(notes, 'exceptions need a routing table other than main');
 		else {
 			byp_devs = s.bypass_devices || [];
+			if (length(byp_devs) && !det.lan_zone) {
+				push(notes, 'excluded devices: could not determine the LAN zone');
+				byp_devs = [];
+			}
 			if (length(s.bypass_domains || []) > 0) {
 				let supported = (opts && opts.nftset != null) ? !!opts.nftset : nftset_supported();
 				if (!supported)
@@ -1098,14 +1102,14 @@ function enforce(uci, s, opts) {
 	}, 'name', 'firewall'))
 		cf = true;
 	if (reconcile_rules(uci, 'rule', 'bypass_domain_mark', iface, byp_sets, function(n) {
-		return { name: 'NordVPN exceptions ' + iface, src: det.lan_zone, ipset: n, family: 'ipv4',
+		return { name: 'NordVPN exceptions ' + iface, src: det.lan_zone, dest: '*', ipset: n, family: 'ipv4',
 			proto: 'all', target: 'MARK', set_xmark: bmark };
 	}, 'ipset', 'firewall'))
 		cf = true;
 	if (reconcile_domain_dns(uci, iface, bset, byp_doms, 'bypass_dns'))
 		cd = true;
 	if (reconcile_rules(uci, 'rule', 'bypass_mark', iface, byp_devs, function(mac) {
-		return { name: 'NordVPN exception ' + mac, src: '*', src_mac: mac, proto: 'all',
+		return { name: 'NordVPN exception ' + mac, src: det.lan_zone, dest: '*', src_mac: mac, proto: 'all',
 			target: 'MARK', set_xmark: bmark };
 	}, 'src_mac', 'firewall'))
 		cf = true;
@@ -1118,6 +1122,26 @@ function enforce(uci, s, opts) {
 		return { mark: m, lookup: 'main', priority: '18000' };
 	}, 'mark'))
 		cn = true;
+
+	// fw4 places a MARK rule by its zones: only 'src <zone>' with 'dest *' lands
+	// in mangle_prerouting, ahead of the routing decision these marks feed. A
+	// rule without 'dest' is put in mangle_input and only sees traffic to the
+	// router itself, which is how older versions wrote them (src '*', no dest):
+	// nothing forwarded was ever marked. Marks are applied to LAN-zone traffic,
+	// the zone the tunnel forwards from. Correct any rule still in the old shape.
+	if (det.lan_zone)
+		uci.foreach('firewall', 'rule', function(sec) {
+			if (sec[MARK] != '1' || sec.nordvpn_iface != iface || sec.target != 'MARK')
+				return;
+			if (sec.src != det.lan_zone) {
+				uci.set('firewall', sec['.name'], 'src', det.lan_zone);
+				cf = true;
+			}
+			if (sec.dest != '*') {
+				uci.set('firewall', sec['.name'], 'dest', '*');
+				cf = true;
+			}
+		});
 
 	// 1c. Bypass routes for local subnets, so the steered default does not
 	//     swallow LAN↔VLAN or LAN↔local-tunnel traffic. The nordvpn instances'

@@ -957,7 +957,7 @@ write_cache(cache, cpath);
 	let marks = count('firewall', 'device_mark');
 	eq('one MARK rule per device', length(marks), 2);
 	let m1 = filter(marks, (r) => r.src_mac == D1)[0];
-	ok('MARK rule shape', m1 && m1.target == 'MARK' && m1.src == '*' && m1.proto == 'all' &&
+	ok('MARK rule shape', m1 && m1.target == 'MARK' && m1.src == 'lan' && m1.dest == '*' && m1.proto == 'all' &&
 		m1.set_xmark == '0x64000000/0xff000000' && m1.nordvpn_iface == 'nordvpn_rs');
 	let lk = count('network', 'dev_lookup');
 	ok('one mark lookup rule into the table',
@@ -1144,7 +1144,7 @@ write_cache(cache, cpath);
 	eq('exceptions: kill switch as prohibit rules instead', length(count('network', 'steer_ks')), 2);
 	let bm = count('firewall', 'bypass_mark');
 	ok('exceptions: MARK rule for the excluded device', length(bm) == 1 && bm[0].src_mac == D1 &&
-		bm[0].src == '*' && bm[0].target == 'MARK' && bm[0].set_xmark == BMARK);
+		bm[0].src == 'lan' && bm[0].dest == '*' && bm[0].target == 'MARK' && bm[0].set_xmark == BMARK);
 	let bl = count('network', 'bypass_lookup'), bl6 = count('network', 'bypass_lookup6');
 	ok('exceptions: mark -> main table at 18000, both families',
 		length(bl) == 1 && bl[0].mark == BMARK && bl[0].lookup == 'main' && bl[0].priority == '18000' &&
@@ -1159,7 +1159,7 @@ write_cache(cache, cpath);
 	res = enforce_routing(uci, ex({ bypass_domains: [ 'bank.example.com' ] }), yes);
 	let bs = count('firewall', 'bypass_set'), bdm = count('firewall', 'bypass_domain_mark');
 	ok('exceptions: fw4 set for excluded domains', length(bs) == 1 && bs[0].name == 'nv_nordvpn_byp');
-	ok('exceptions: domain MARK rule from the LAN zone', length(bdm) == 1 && bdm[0].src == 'lan' &&
+	ok('exceptions: domain MARK rule from the LAN zone', length(bdm) == 1 && bdm[0].src == 'lan' && bdm[0].dest == '*' &&
 		bdm[0].ipset == 'nv_nordvpn_byp' && bdm[0].set_xmark == BMARK);
 	let bd = count('dhcp', 'bypass_dns');
 	ok('exceptions: dnsmasq fills the set', length(bd) == 1 && bd[0].domain[0] == 'bank.example.com' &&
@@ -1380,7 +1380,7 @@ write_cache(cache, cpath);
 		sprintf('%J', sets[0].match) == sprintf('%J', [ 'dest_ip' ]));
 	let mr = count('firewall', 'domain_mark');
 	ok('one MARK rule on the set', length(mr) == 1 && mr[0].ipset == 'nv_nordvpn_rs_dom' &&
-		mr[0].target == 'MARK' && mr[0].src == 'lan' && mr[0].set_xmark == '0x64000000/0xff000000');
+		mr[0].target == 'MARK' && mr[0].src == 'lan' && mr[0].dest == '*' && mr[0].set_xmark == '0x64000000/0xff000000');
 	let dd = count('dhcp', 'domain_dns');
 	ok('one dnsmasq nftset section', length(dd) == 1 && dd[0]['.type'] == 'ipset' &&
 		sprintf('%J', dd[0].name) == sprintf('%J', [ 'nv_nordvpn_rs_dom' ]) &&
@@ -1687,6 +1687,50 @@ write_cache(cache, cpath);
 	global.MOCK_UCI.firewall.oldks = { '.type': 'rule', nordvpn_managed: '1', nordvpn_role: 'killswitch', src: 'lan', dest: 'wan', target: 'REJECT' };
 	enforce_routing(cursor(), S('media'));
 	eq('legacy: dropped once no instance routes all LAN', rules('killswitch'), []);
+}
+
+// MARK rules must land in fw4's mangle_prerouting: fw4 only puts a MARK rule
+// there for 'src <zone>' with 'dest *'. A rule without 'dest' goes to
+// mangle_input and never marks forwarded traffic (older versions wrote
+// src '*' with no dest), so an excluded device still took the tunnel.
+{
+	// fw4's placement (firewall4 fw4.uc, parse_rule, target mark/dscp).
+	let fw4_chain = function(r) {
+		let any = (z) => z == '*', zone = (z) => z != null && z != '*';
+		if ((any(r.src) && any(r.dest)) || (zone(r.src) && zone(r.dest))) return 'mangle_forward';
+		if (any(r.src) && zone(r.dest)) return 'mangle_postrouting';
+		if (zone(r.src) && any(r.dest)) return 'mangle_prerouting';
+		if (r.src && !r.dest) return 'mangle_input';
+		return 'mangle_output';
+	};
+	let D = 'aa:bb:cc:dd:ee:01';
+	global.MOCK_UCI = {
+		nordvpn: { main: { '.type': 'instance', interface: 'nordvpn', enabled: '1', auto_routing: '1',
+			bypass_device: [ D ] } },
+		network: {
+			lan: { '.type': 'interface', device: 'br-lan', proto: 'static', ipaddr: '192.168.1.1', netmask: '255.255.255.0' },
+			nordvpn: { '.type': 'interface', proto: 'wireguard', private_key: KEY, vpn_type: 'nordvpn' },
+			p1: { '.type': 'wireguard_nordvpn', interface: 'nordvpn', endpoint_host: 'x.nordvpn.com' }
+		},
+		firewall: {
+			zlan: { '.type': 'zone', name: 'lan', network: [ 'lan' ] },
+			zwan: { '.type': 'zone', name: 'wan', masq: '1', network: [ 'wan' ] },
+			// A rule as older versions wrote it.
+			old: { '.type': 'rule', name: 'NordVPN exception ' + D, src: '*', src_mac: D, proto: 'all',
+				target: 'MARK', set_xmark: '0xfe000000/0xff000000', nordvpn_managed: '1',
+				nordvpn_role: 'bypass_mark', nordvpn_iface: 'nordvpn' }
+		}
+	};
+	eq('fw4: the old shape lands in mangle_input', fw4_chain(global.MOCK_UCI.firewall.old), 'mangle_input');
+	let res = enforce_routing(cursor(), load_settings(cursor(), 'main'), { nftset: true });
+	ok('fw4: fixing the old rule changes the firewall', res.changed_firewall);
+	let marks = [];
+	for (let k, v in global.MOCK_UCI.firewall)
+		if (v.target == 'MARK')
+			push(marks, v);
+	eq('fw4: one exception rule, corrected in place', length(marks), 1);
+	eq('fw4: the exception now lands in mangle_prerouting', fw4_chain(marks[0]), 'mangle_prerouting');
+	ok('fw4: second run changes nothing', !enforce_routing(cursor(), load_settings(cursor(), 'main'), { nftset: true }).changed_firewall);
 }
 
 unlink(cpath);

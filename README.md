@@ -407,7 +407,10 @@ On every apply the backend first works out which routing mode applies:
   - **Devices:** an fw4 MARK rule per MAC, and one `mark … lookup <table>`
     rule at priority 19000. The mark is the table id in the top byte
     (`0xff000000`), which keeps clear of mwan3 and pbr, so the table id must
-    be 1–255. The default table gets one automatically.
+    be 1–255. The default table gets one automatically. Every MARK rule is
+    written as `src <LAN zone>` with `dest '*'`, the only shape fw4 places in
+    `mangle_prerouting`, ahead of the routing decision, so devices are
+    matched on the LAN zone's networks.
   - **Domains:**
     - dnsmasq resolves the listed domains into an fw4 nft set
       (`nv_<interface>_dom`), using a tagged `config ipset` in
