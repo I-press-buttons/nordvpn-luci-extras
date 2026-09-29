@@ -40,6 +40,9 @@ const status = _status.status,
       egress_probe = _status.egress_probe;
 const record_event = require('nordvpn.history').record_event;
 
+// One-time move of per-interface keys into the credential bank (idempotent).
+require('nordvpn.credentials').migrate(cursor());
+
 uloop.init();
 
 let last_cache = 0;

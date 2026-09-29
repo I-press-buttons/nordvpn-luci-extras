@@ -118,7 +118,9 @@ that adds the extra features marked **(fork)** below.
   traffic is blocked rather than leaking out through the WAN.
 - **NordVPN DNS.** Optionally use NordVPN's resolvers, or Threat Protection,
   which blocks ads and malware at the DNS level. The router's own lookups to
-  them go through the tunnel in steered mode too.
+  them go through the tunnel in steered mode too. With *Route all LAN
+  traffic*, no lookup falls back to your provider's resolver, and excluded
+  devices keep your provider's DNS. See [Preventing leaks](#preventing-leaks).
 - **Leaves your own setup alone.** If you already route traffic by hand, the
   app detects it and doesn't touch it. Everything it creates is tagged and
   removed cleanly.
@@ -129,7 +131,9 @@ that adds the extra features marked **(fork)** below.
 
 - **Multiple instances.** Run tunnels side by side, for example the main
   LAN through Germany and a media network through Serbia. Each has its own
-  credentials, locations, schedule and routing.
+  locations, schedule and routing. All tunnels share the *Default*
+  credentials, so you paste a token once; add more named credentials to the
+  bank if some tunnels should use another account.
 
   ![VPN instances](docs/screenshots/instances.png)
 
@@ -215,8 +219,9 @@ apk del dnsmasq && apk add ./dnsmasq-full-*.apk
 ## Quick start
 
 1. Open LuCI → **VPN → NordVPN**.
-2. Click **Set credentials** and paste your 64-character access token. To get
-   one, go to
+2. Under **Credentials**, click **Set token** on *Default* and paste your
+   64-character access token. Every tunnel uses *Default* unless you add
+   more credentials and pick them per instance. To get a token, go to
    <https://my.nordaccount.com/dashboard/nordvpn/manual-configuration/> →
    **Generate new token** (a non-expiring token is fine).
 3. Choose a **Hop mode** and add one or more **Locations**.
@@ -227,6 +232,111 @@ apk del dnsmasq && apk add ./dnsmasq-full-*.apk
 
 The page shows *configured* and *connected* as separate states: it only
 reports *Connected* once a real WireGuard handshake has happened.
+
+## Preventing leaks
+
+A leak is anything that reveals what you do online to your provider (or to
+whoever runs the network upstream of the router) while you think it is going
+through the VPN. There are four kinds: **traffic** leaving through the WAN
+instead of the tunnel, **DNS** lookups sent to your provider's resolver,
+**IPv6** traffic (NordLynx tunnels carry IPv4 only), and anything that slips
+out **while the tunnel is down**. This section covers what the router does
+about each, what it cannot do, and how to check.
+
+The strongest setup is: *Route all LAN traffic* on one instance, **Kill
+switch** and **Block direct IPv6** on, a **NordVPN DNS** option chosen, and
+a **routing table** set for the instance (Advanced settings; it is set
+automatically once you add an exception).
+
+### What the router does
+
+| Leak | Protection | How |
+| --- | --- | --- |
+| Traffic while the tunnel is down | **Kill switch** | With a routing table: `prohibit` rules (priority 21000) behind the tunnel's lookup, so LAN traffic is dropped when the tunnel's table is empty. Without one: a firewall REJECT rule from the LAN zone to the WAN zone. Each instance owns its rule; changing another instance never removes it. |
+| IPv6 | **Block direct IPv6** | The same two mechanisms, for IPv6. Keep it on: the tunnel has no IPv6, so without it IPv6-capable sites are reached directly over your provider. |
+| DNS to your provider | **NordVPN DNS** + DNS lock | dnsmasq, the router's resolver, is locked to NordVPN's resolvers (`noresolv` plus its own `server` entries). Without the lock, dnsmasq also knows the WAN's resolvers and keeps probing all of them, so some lookups go there. Only the instance with *Route all LAN traffic* sets the lock. |
+| The router's lookups to NordVPN's resolvers | Policy rules | They are sent into the tunnel's table (priority 19500) and, with the lock on, blocked when the tunnel is down (19501) rather than going out of the WAN. |
+| DNS while the tunnel is down | DNS lock | Lookups fail instead of falling back to your provider. The one exception is `nordvpn.com` names, which go to the WAN's resolver, so the router can still find a server to reconnect to. This only shows that you use NordVPN, which your provider can see from the traffic anyway. |
+| Excluded devices using NordVPN's DNS | DHCP option + DNAT | Excluded devices are meant to look like normal traffic, including their DNS. DHCP hands them the WAN's IPv4 resolvers (option 6, one tag per device). A firewall DNAT sends any plain DNS they still send, such as manually set DNS or a lease that has not been renewed yet, to the WAN's resolver. |
+
+Everything is stamped (`nordvpn_managed`, `nordvpn_role`, `nordvpn_iface`)
+and reverted when you turn the option off, disable or delete the instance.
+Your own dnsmasq `server` entries and `noresolv` setting are kept.
+
+### What it cannot do
+
+- **IPv6 DNS from excluded devices.** The router also advertises itself as
+  an IPv6 DNS server. An excluded device that asks over IPv6 reaches dnsmasq
+  and gets NordVPN's resolvers. To avoid that, stop advertising the router as
+  an IPv6 DNS server. Devices then use its IPv4 address, which gives VPN
+  devices NordVPN DNS and excluded devices their DHCP-assigned resolver:
+  ```sh
+  uci set dhcp.lan.dns_service='0'   # LuCI: Interfaces → lan → DHCP Server → IPv6 Settings → Local IPv6 DNS server
+  uci commit dhcp && /etc/init.d/odhcpd restart
+  ```
+- **DNS inside apps and browsers.** Chrome's *Secure DNS*, Firefox's DNS over
+  HTTPS and Android's *Private DNS* use their own resolver. On VPN devices
+  that traffic still goes through the tunnel, just to a third-party resolver.
+  **iCloud Private Relay** sends Safari traffic through Apple's relays instead
+  of the VPN; turn it off on devices that should use NordVPN.
+- **Steered instances.** The DNS lock is only set by the instance that routes
+  all LAN traffic. An instance that steers only some networks, devices or
+  domains cannot lock the router's resolver for everyone, so its devices'
+  lookups can still reach the WAN's resolver.
+- **The main-table variant while the tunnel is down.** Without a routing
+  table, the tunnel's default route and the WAN's live in the same table, so
+  the router's own queries to NordVPN's resolvers cannot be told apart and
+  may go out of the WAN until the tunnel is back. Set a routing table to
+  close this.
+- **The router's own traffic.** Package updates, time sync, the NordVPN API
+  and the server-list download leave through the WAN when the instance uses
+  a routing table. That is by design; only your devices' traffic is routed.
+- **A changed WAN resolver.** The lock, the `nordvpn.com` exception and the
+  excluded devices' DNS use the WAN's resolvers as they were at the last save
+  or reconnect. If your provider changes them, save once.
+
+### Checking for leaks
+
+On a device that should use the VPN:
+
+1. **Public IP.** <https://nordvpn.com/what-is-my-ip> should show a NordVPN
+   address in the chosen country. The status band's protection check says the
+   same from NordVPN's side.
+2. **DNS.** Run the *Extended test* at <https://www.dnsleaktest.com> (or
+   <https://browserleaks.com/dns>) two or three times. Every server should
+   belong to NordVPN or its hosting providers; your provider's name must not
+   appear. Turn off Secure DNS and Private Relay first, or they hide the
+   result.
+3. **IPv6.** <https://test-ipv6.com> should report no IPv6 connectivity with
+   *Block direct IPv6* on.
+
+On an excluded device, the same tests should show your normal IP and your
+provider's (or upstream router's) resolver.
+
+On the router:
+
+```sh
+# DNS leaving through the WAN: only nordvpn.com names should appear
+tcpdump -ni "$(ubus call network.interface.wan status | jsonfilter -e '@.l3_device')" port 53
+
+# The DNS lock
+uci show dhcp.@dnsmasq[0] | grep -E "noresolv|server|nordvpn"
+
+# Kill switch, IPv6 block and DNS rules
+ip rule; ip -6 rule
+uci show firewall | grep nordvpn_role
+
+# Excluded devices: marks, DNS redirect and DHCP option (counters show hits)
+nft list chain inet fw4 mangle_prerouting
+nft list chain inet fw4 dstnat_lan
+uci show dhcp | grep -A3 "nordvpn_role='bypass_dhcp_dns'"
+```
+
+To test the kill switch, take the tunnel down with `ifdown nordvpn` (use
+your instance's interface name). A VPN device should lose internet access
+and DNS, an excluded device should keep both, and `nslookup api.nordvpn.com`
+on the router should still resolve. Bring it back with `ifup nordvpn`. The
+watchdog may reconnect it by itself if it is enabled.
 
 ## Reference
 
@@ -298,11 +408,13 @@ ubus call nordvpn overview          # lightweight per-instance summary (Status p
 ubus call nordvpn external_ip       # NordVPN's view: protected, public IP, city, ISP
 ubus call nordvpn history '{"instance":"main"}'  # recent events, newest first
 ubus call nordvpn disconnect        # take the tunnel down, pause rotation
-ubus call nordvpn clear_credentials # forget the stored WireGuard key
+ubus call nordvpn credentials       # credential bank: names, status, which instances use each
+ubus call nordvpn remove_credentials '{"credential":"work"}'  # delete an unused entry ('default' only loses its key)
 ubus call nordvpn locations         # cached country/city tree (+ per-city counts)
 ubus call nordvpn servers '{"locations":["de","nl-amsterdam"],"hop_mode":"single","server_group":"p2p"}'
 ubus call nordvpn refresh_status    # cache-refresh job progress
-ubus call nordvpn set_credentials '{"token":"<64-hex-token>"}'
+ubus call nordvpn set_credentials '{"token":"<64-hex-token>"}'                        # replace the Default key
+ubus call nordvpn set_credentials '{"token":"<64-hex-token>","name":"Family plan"}'   # add a named entry
 ubus call nordvpn apply             # rebuild the peer and bring the tunnel up
 ubus call nordvpn rotate_now        # one-shot rotation
 ubus call nordvpn refresh_locations # start an async server-list refresh
@@ -310,7 +422,10 @@ ubus call nordvpn refresh_locations # start an async server-list refresh
 
 `status`, `apply`, `rotate_now` and `set_credentials` accept an `instance`
 argument (default `main`). `create_instance` and `delete_instance` manage
-instances, and `nordvpn-rotate <name>` rotates one instance from the CLI.
+instances; a new instance uses the Default credentials unless
+`create_instance` gets a `credential` entry id. An instance's `credential`
+option in `/etc/config/nordvpn` picks its bank entry. `nordvpn-rotate <name>`
+rotates one instance from the CLI.
 
 `status` reports these states:
 
@@ -387,14 +502,24 @@ On every apply the backend first works out which routing mode applies:
   and IPv6, plus the DNS override. If the instance has a routing table, the
   tunnel's default route lives in that table instead of the main one. The
   backend then steers every network of the LAN zone into it, as described
-  under *Steered*, with the same result.
+  under *Steered*, with the same result. Only one enabled instance can route
+  all LAN traffic: the checkbox is locked on the others, and if the config
+  sets it on several anyway, the first one (main first) wins and the rest
+  log a note and fall back to their steering. The kill switch and IPv6 rules
+  belong to the instance that created them, so applying or deleting another
+  instance never removes them. With a NordVPN DNS option on, that instance
+  also locks dnsmasq to NordVPN's resolvers; see
+  [Preventing leaks](#preventing-leaks).
 - **Steered.** Policy rules send only the selected traffic into the
   instance's routing table:
   - **Networks:** `in <network> lookup <table>` at priority 20000.
   - **Devices:** an fw4 MARK rule per MAC, and one `mark … lookup <table>`
     rule at priority 19000. The mark is the table id in the top byte
     (`0xff000000`), which keeps clear of mwan3 and pbr, so the table id must
-    be 1–255. The default table gets one automatically.
+    be 1–255. The default table gets one automatically. Every MARK rule is
+    written as `src <LAN zone>` with `dest '*'`, the only shape fw4 places in
+    `mangle_prerouting`, ahead of the routing decision, so devices are
+    matched on the LAN zone's networks.
   - **Domains:**
     - dnsmasq resolves the listed domains into an fw4 nft set
       (`nv_<interface>_dom`), using a tagged `config ipset` in
@@ -454,7 +579,9 @@ are cleared on reboot.
 
 - The access token reaches curl only through an anonymous pipe. It never
   appears in argv, environment variables, temp files or logs, and it's never
-  saved.
+  saved. Only the derived WireGuard key is kept, in the root-only
+  `/etc/config/nordvpn_credentials` (and on each tunnel's interface, where
+  netifd needs it).
 - External commands are built from argument lists, and every interpolated
   value (interfaces, hostnames, domains, schedules, paths) is validated
   against an allow-list first.

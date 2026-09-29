@@ -957,7 +957,7 @@ write_cache(cache, cpath);
 	let marks = count('firewall', 'device_mark');
 	eq('one MARK rule per device', length(marks), 2);
 	let m1 = filter(marks, (r) => r.src_mac == D1)[0];
-	ok('MARK rule shape', m1 && m1.target == 'MARK' && m1.src == '*' && m1.proto == 'all' &&
+	ok('MARK rule shape', m1 && m1.target == 'MARK' && m1.src == 'lan' && m1.dest == '*' && m1.proto == 'all' &&
 		m1.set_xmark == '0x64000000/0xff000000' && m1.nordvpn_iface == 'nordvpn_rs');
 	let lk = count('network', 'dev_lookup');
 	ok('one mark lookup rule into the table',
@@ -1144,7 +1144,7 @@ write_cache(cache, cpath);
 	eq('exceptions: kill switch as prohibit rules instead', length(count('network', 'steer_ks')), 2);
 	let bm = count('firewall', 'bypass_mark');
 	ok('exceptions: MARK rule for the excluded device', length(bm) == 1 && bm[0].src_mac == D1 &&
-		bm[0].src == '*' && bm[0].target == 'MARK' && bm[0].set_xmark == BMARK);
+		bm[0].src == 'lan' && bm[0].dest == '*' && bm[0].target == 'MARK' && bm[0].set_xmark == BMARK);
 	let bl = count('network', 'bypass_lookup'), bl6 = count('network', 'bypass_lookup6');
 	ok('exceptions: mark -> main table at 18000, both families',
 		length(bl) == 1 && bl[0].mark == BMARK && bl[0].lookup == 'main' && bl[0].priority == '18000' &&
@@ -1159,7 +1159,7 @@ write_cache(cache, cpath);
 	res = enforce_routing(uci, ex({ bypass_domains: [ 'bank.example.com' ] }), yes);
 	let bs = count('firewall', 'bypass_set'), bdm = count('firewall', 'bypass_domain_mark');
 	ok('exceptions: fw4 set for excluded domains', length(bs) == 1 && bs[0].name == 'nv_nordvpn_byp');
-	ok('exceptions: domain MARK rule from the LAN zone', length(bdm) == 1 && bdm[0].src == 'lan' &&
+	ok('exceptions: domain MARK rule from the LAN zone', length(bdm) == 1 && bdm[0].src == 'lan' && bdm[0].dest == '*' &&
 		bdm[0].ipset == 'nv_nordvpn_byp' && bdm[0].set_xmark == BMARK);
 	let bd = count('dhcp', 'bypass_dns');
 	ok('exceptions: dnsmasq fills the set', length(bd) == 1 && bd[0].domain[0] == 'bank.example.com' &&
@@ -1380,7 +1380,7 @@ write_cache(cache, cpath);
 		sprintf('%J', sets[0].match) == sprintf('%J', [ 'dest_ip' ]));
 	let mr = count('firewall', 'domain_mark');
 	ok('one MARK rule on the set', length(mr) == 1 && mr[0].ipset == 'nv_nordvpn_rs_dom' &&
-		mr[0].target == 'MARK' && mr[0].src == 'lan' && mr[0].set_xmark == '0x64000000/0xff000000');
+		mr[0].target == 'MARK' && mr[0].src == 'lan' && mr[0].dest == '*' && mr[0].set_xmark == '0x64000000/0xff000000');
 	let dd = count('dhcp', 'domain_dns');
 	ok('one dnsmasq nftset section', length(dd) == 1 && dd[0]['.type'] == 'ipset' &&
 		sprintf('%J', dd[0].name) == sprintf('%J', [ 'nv_nordvpn_rs_dom' ]) &&
@@ -1611,6 +1611,274 @@ write_cache(cache, cpath);
 	eq('apply event: success', _apply_m.apply_event({ state: 'success', gateway: 'g' }), { type: 'connect', fields: { server: 'g' } });
 	eq('apply event: failure', _apply_m.apply_event({ state: 'failure', error: 'boom' }).fields.error, 'boom');
 	eq('apply event: partial failure is a failure', _apply_m.apply_event({ state: 'partial_failure', gateway: 'g', error: 'e' }).type, 'connect_failed');
+}
+
+// Multiple instances: the automatic kill switch / IPv6 block belong to the
+// instance that made them, and only one instance may route all LAN traffic.
+{
+	let mkmulti = function(main_auto, media_auto) {
+		return {
+			nordvpn: {
+				main: { '.type': 'instance', interface: 'nordvpn', enabled: '1', auto_routing: main_auto ? '1' : '0', killswitch: '1' },
+				media: { '.type': 'instance', interface: 'nv_media', enabled: '1', auto_routing: media_auto ? '1' : '0', killswitch: '1' }
+			},
+			network: {
+				nordvpn: { '.type': 'interface', proto: 'wireguard', private_key: KEY, vpn_type: 'nordvpn' },
+				p1: { '.type': 'wireguard_nordvpn', interface: 'nordvpn', endpoint_host: 'x.nordvpn.com' },
+				nv_media: { '.type': 'interface', proto: 'wireguard', private_key: KEY, vpn_type: 'nordvpn' },
+				p2: { '.type': 'wireguard_nv_media', interface: 'nv_media', endpoint_host: 'y.nordvpn.com' }
+			},
+			firewall: {
+				zlan: { '.type': 'zone', name: 'lan', network: [ 'lan' ] },
+				zwan: { '.type': 'zone', name: 'wan', masq: '1', network: [ 'wan' ] }
+			}
+		};
+	};
+	let rules = function(role) {
+		let out = [];
+		for (let k, v in global.MOCK_UCI.firewall)
+			if (v.nordvpn_role == role)
+				push(out, v.nordvpn_iface || '-');
+		return out;
+	};
+	let S = function(n) { return load_settings(cursor(), n); };
+
+	// Main routes all LAN with a kill switch; media only tunnels.
+	global.MOCK_UCI = mkmulti(true, false);
+	enforce_routing(cursor(), S('main'));
+	eq('multi: main owns its kill switch', rules('killswitch'), [ 'nordvpn' ]);
+	eq('multi: main owns its IPv6 block', rules('ipv6block'), [ 'nordvpn' ]);
+	enforce_routing(cursor(), S('media'));
+	eq('multi: applying media keeps main\'s kill switch', rules('killswitch'), [ 'nordvpn' ]);
+	eq('multi: applying media keeps main\'s IPv6 block', rules('ipv6block'), [ 'nordvpn' ]);
+	let gone = S('media');
+	gone.auto_routing = false; gone.killswitch = false; gone.block_ipv6 = false;
+	enforce_routing(cursor(), gone);
+	eq('multi: tearing media down keeps main\'s kill switch', rules('killswitch'), [ 'nordvpn' ]);
+	ok('multi: main still reports its kill switch', detect_routing(cursor(), S('main'), false).killswitch);
+	ok('multi: media reports none', !detect_routing(cursor(), S('media'), false).killswitch);
+
+	// Only one instance may route all LAN traffic; main (first) keeps it.
+	global.MOCK_UCI = mkmulti(true, true);
+	let dm = detect_routing(cursor(), S('main'), false);
+	let dx = detect_routing(cursor(), S('media'), false);
+	eq('single owner: main is auto', [ dm.mode, dm.all_lan_owner ], [ 'auto', null ]);
+	eq('single owner: media falls back and names the owner', [ dx.mode, dx.all_lan_owner ], [ 'none', 'main' ]);
+	enforce_routing(cursor(), S('main'));
+	let rx = enforce_routing(cursor(), S('media'));
+	ok('single owner: media gets a note', index(join(' ', rx.notes), 'already enabled on instance main') >= 0);
+	eq('single owner: media installs no kill switch of its own', rules('killswitch'), [ 'nordvpn' ]);
+	ok('single owner: media gets no default route', global.MOCK_UCI.network.p2.route_allowed_ips == null);
+	ok('single owner: main has its default route', global.MOCK_UCI.network.p1.route_allowed_ips == '1');
+	// A disabled owner does not block: media takes over.
+	global.MOCK_UCI.nordvpn.main.enabled = '0';
+	eq('single owner: a disabled main frees it', detect_routing(cursor(), S('media'), false).mode, 'auto');
+
+	// Legacy (unowned) rules from an older version.
+	global.MOCK_UCI = mkmulti(true, false);
+	global.MOCK_UCI.firewall.oldks = { '.type': 'rule', name: 'NordVPN kill switch', src: 'lan', dest: 'wan',
+		proto: 'all', target: 'REJECT', nordvpn_managed: '1', nordvpn_role: 'killswitch' };
+	ok('legacy: shown for the all-LAN instance before adoption', detect_routing(cursor(), S('main'), false).killswitch);
+	enforce_routing(cursor(), S('media'));
+	eq('legacy: another instance leaves it alone while main routes all LAN', rules('killswitch'), [ '-' ]);
+	enforce_routing(cursor(), S('main'));
+	eq('legacy: main adopts it (no duplicate)', rules('killswitch'), [ 'nordvpn' ]);
+	global.MOCK_UCI = mkmulti(false, false);
+	global.MOCK_UCI.firewall.oldks = { '.type': 'rule', nordvpn_managed: '1', nordvpn_role: 'killswitch', src: 'lan', dest: 'wan', target: 'REJECT' };
+	enforce_routing(cursor(), S('media'));
+	eq('legacy: dropped once no instance routes all LAN', rules('killswitch'), []);
+}
+
+// MARK rules must land in fw4's mangle_prerouting: fw4 only puts a MARK rule
+// there for 'src <zone>' with 'dest *'. A rule without 'dest' goes to
+// mangle_input and never marks forwarded traffic (older versions wrote
+// src '*' with no dest), so an excluded device still took the tunnel.
+{
+	// fw4's placement (firewall4 fw4.uc, parse_rule, target mark/dscp).
+	let fw4_chain = function(r) {
+		let any = (z) => z == '*', zone = (z) => z != null && z != '*';
+		if ((any(r.src) && any(r.dest)) || (zone(r.src) && zone(r.dest))) return 'mangle_forward';
+		if (any(r.src) && zone(r.dest)) return 'mangle_postrouting';
+		if (zone(r.src) && any(r.dest)) return 'mangle_prerouting';
+		if (r.src && !r.dest) return 'mangle_input';
+		return 'mangle_output';
+	};
+	let D = 'aa:bb:cc:dd:ee:01';
+	global.MOCK_UCI = {
+		nordvpn: { main: { '.type': 'instance', interface: 'nordvpn', enabled: '1', auto_routing: '1',
+			bypass_device: [ D ] } },
+		network: {
+			lan: { '.type': 'interface', device: 'br-lan', proto: 'static', ipaddr: '192.168.1.1', netmask: '255.255.255.0' },
+			nordvpn: { '.type': 'interface', proto: 'wireguard', private_key: KEY, vpn_type: 'nordvpn' },
+			p1: { '.type': 'wireguard_nordvpn', interface: 'nordvpn', endpoint_host: 'x.nordvpn.com' }
+		},
+		firewall: {
+			zlan: { '.type': 'zone', name: 'lan', network: [ 'lan' ] },
+			zwan: { '.type': 'zone', name: 'wan', masq: '1', network: [ 'wan' ] },
+			// A rule as older versions wrote it.
+			old: { '.type': 'rule', name: 'NordVPN exception ' + D, src: '*', src_mac: D, proto: 'all',
+				target: 'MARK', set_xmark: '0xfe000000/0xff000000', nordvpn_managed: '1',
+				nordvpn_role: 'bypass_mark', nordvpn_iface: 'nordvpn' }
+		}
+	};
+	eq('fw4: the old shape lands in mangle_input', fw4_chain(global.MOCK_UCI.firewall.old), 'mangle_input');
+	let res = enforce_routing(cursor(), load_settings(cursor(), 'main'), { nftset: true });
+	ok('fw4: fixing the old rule changes the firewall', res.changed_firewall);
+	let marks = [];
+	for (let k, v in global.MOCK_UCI.firewall)
+		if (v.target == 'MARK')
+			push(marks, v);
+	eq('fw4: one exception rule, corrected in place', length(marks), 1);
+	eq('fw4: the exception now lands in mangle_prerouting', fw4_chain(marks[0]), 'mangle_prerouting');
+	ok('fw4: second run changes nothing', !enforce_routing(cursor(), load_settings(cursor(), 'main'), { nftset: true }).changed_firewall);
+}
+
+// DNS lock: with "Route all LAN" and NordVPN DNS, dnsmasq forwards only to the
+// NordVPN resolvers (nordvpn.com names excepted, via the WAN's resolver), and
+// everything is restored when routing or VPN DNS is turned off.
+{
+	let mk = function(extra) {
+		let main = { '.type': 'instance', interface: 'nordvpn', enabled: '1', auto_routing: '1',
+			routing_table: 'nordvpn', vpn_dns: 'standard' };
+		for (let k in extra)
+			main[k] = extra[k];
+		return {
+			nordvpn: { main: main },
+			network: {
+				lan: { '.type': 'interface', device: 'br-lan', proto: 'static', ipaddr: '192.168.1.1', netmask: '255.255.255.0' },
+				wan: { '.type': 'interface', device: 'wan', proto: 'dhcp' },
+				nordvpn: { '.type': 'interface', proto: 'wireguard', private_key: KEY, vpn_type: 'nordvpn' },
+				p1: { '.type': 'wireguard_nordvpn', interface: 'nordvpn', endpoint_host: 'x.nordvpn.com' }
+			},
+			firewall: {
+				zlan: { '.type': 'zone', name: 'lan', network: [ 'lan' ] },
+				zwan: { '.type': 'zone', name: 'wan', masq: '1', network: [ 'wan' ] }
+			},
+			dhcp: { dm: { '.type': 'dnsmasq', server: [ '/home.lan/192.168.1.5' ] } }
+		};
+	};
+	let o = { nftset: true, wan_dns: [ '192.168.10.166' ] };
+	let dm = function() { return global.MOCK_UCI.dhcp.dm; };
+	let ks = function() {
+		let out = [];
+		for (let k, v in global.MOCK_UCI.network)
+			if (v.nordvpn_role == 'dns_ks')
+				push(out, v.dest);
+		return sort(out);
+	};
+
+	global.MOCK_UCI = mk({});
+	let res = enforce_routing(cursor(), load_settings(cursor(), 'main'), o);
+	ok('dns lock: reported and dnsmasq restarted', res.dns_locked && res.changed_dhcp);
+	eq('dns lock: resolv file ignored', dm().noresolv, '1');
+	eq('dns lock: only NordVPN resolvers, nordvpn.com via WAN, own entries kept', dm().server,
+		[ '/home.lan/192.168.1.5', '103.86.96.100', '103.86.99.100', '/nordvpn.com/192.168.10.166' ]);
+	eq('dns lock: blocked while the tunnel is down', ks(), [ '103.86.96.100/32', '103.86.99.100/32' ]);
+	ok('dns lock: idempotent', !enforce_routing(cursor(), load_settings(cursor(), 'main'), o).changed_dhcp);
+
+	// Switching to Threat Protection swaps the resolvers.
+	global.MOCK_UCI.nordvpn.main.vpn_dns = 'threat';
+	enforce_routing(cursor(), load_settings(cursor(), 'main'), o);
+	eq('dns lock: threat protection resolvers', dm().server,
+		[ '/home.lan/192.168.1.5', '103.86.96.96', '103.86.99.99', '/nordvpn.com/192.168.10.166' ]);
+
+	// Turning VPN DNS off restores dnsmasq exactly.
+	global.MOCK_UCI.nordvpn.main.vpn_dns = 'off';
+	enforce_routing(cursor(), load_settings(cursor(), 'main'), o);
+	eq('dns lock: released, previous state restored',
+		[ dm().noresolv, dm().server, dm().nordvpn_dns_lock, dm().nordvpn_dns_servers ],
+		[ null, [ '/home.lan/192.168.1.5' ], null, null ]);
+	eq('dns lock: no DNS block rules left', ks(), []);
+
+	// A user's own noresolv=1 survives the lock and its release.
+	global.MOCK_UCI = mk({});
+	global.MOCK_UCI.dhcp.dm.noresolv = '1';
+	global.MOCK_UCI.dhcp.dm.server = [ '9.9.9.9' ];
+	res = enforce_routing(cursor(), load_settings(cursor(), 'main'), o);
+	ok('dns lock: warns about the user\'s own upstream', index(join(' ', res.notes), '9.9.9.9') >= 0);
+	global.MOCK_UCI.nordvpn.main.auto_routing = '0';
+	enforce_routing(cursor(), load_settings(cursor(), 'main'), o);
+	eq('dns lock: user noresolv and server kept after release', [ dm().noresolv, dm().server ], [ '1', [ '9.9.9.9' ] ]);
+
+	// No WAN resolvers known: no lock (reconnecting would need them).
+	global.MOCK_UCI = mk({});
+	res = enforce_routing(cursor(), load_settings(cursor(), 'main'), { nftset: true, wan_dns: [] });
+	ok('dns lock: skipped without WAN resolvers, with a note', !res.dns_locked && dm().noresolv == null &&
+		index(join(' ', res.notes), 'WAN DNS') >= 0);
+
+	// Disabling the instance releases it.
+	global.MOCK_UCI = mk({});
+	enforce_routing(cursor(), load_settings(cursor(), 'main'), o);
+	global.MOCK_UCI.nordvpn.main.enabled = '0';
+	enforce_routing(cursor(), load_settings(cursor(), 'main'), o);
+	eq('dns lock: disabled instance releases it', [ dm().noresolv, dm().nordvpn_dns_lock ], [ null, null ]);
+}
+
+// Excluded devices keep the WAN's DNS: a DHCP option 6 per MAC and a DNAT of
+// their plain DNS to the WAN resolver, only while NordVPN DNS is on.
+{
+	let D = '4e:82:91:17:24:d5';
+	let mk = function() {
+		return {
+			nordvpn: { main: { '.type': 'instance', interface: 'nordvpn', enabled: '1', auto_routing: '1',
+				routing_table: 'nordvpn', vpn_dns: 'standard', bypass_device: [ D ] } },
+			network: {
+				lan: { '.type': 'interface', device: 'br-lan', proto: 'static', ipaddr: '192.168.1.1', netmask: '255.255.255.0' },
+				wan: { '.type': 'interface', device: 'wan', proto: 'dhcp' },
+				nordvpn: { '.type': 'interface', proto: 'wireguard', private_key: KEY, vpn_type: 'nordvpn' },
+				p1: { '.type': 'wireguard_nordvpn', interface: 'nordvpn', endpoint_host: 'x.nordvpn.com' }
+			},
+			firewall: {
+				zlan: { '.type': 'zone', name: 'lan', network: [ 'lan' ] },
+				zwan: { '.type': 'zone', name: 'wan', masq: '1', network: [ 'wan' ] }
+			},
+			dhcp: { dm: { '.type': 'dnsmasq' } }
+		};
+	};
+	let find = function(pkg, role) {
+		let out = [];
+		for (let k, v in global.MOCK_UCI[pkg])
+			if (v.nordvpn_role == role)
+				push(out, v);
+		return out;
+	};
+	let o = { nftset: true, wan_dns: [ '192.168.10.166', 'fd00::1' ] };
+
+	global.MOCK_UCI = mk();
+	let res = enforce_routing(cursor(), load_settings(cursor(), 'main'), o);
+	let rd = find('firewall', 'bypass_dns_redirect'), dh = find('dhcp', 'bypass_dhcp_dns');
+	ok('exc dns: one DNAT for the excluded device', length(rd) == 1 && rd[0].src_mac == D &&
+		rd[0].src == 'lan' && rd[0].dest == 'wan' && rd[0].target == 'DNAT' && rd[0].src_dport == '53' &&
+		rd[0].dest_ip == '192.168.10.166' && rd[0].family == 'ipv4' && rd[0].proto == 'tcp udp');
+	ok('exc dns: DHCP hands it the IPv4 WAN resolver under its own tag', length(dh) == 1 && dh[0].mac == D &&
+		dh[0].networkid == 'nvx4e82911724d5' && sprintf('%J', dh[0].dhcp_option) == sprintf('%J', [ '6,192.168.10.166' ]));
+	ok('exc dns: firewall and dnsmasq reloaded', res.changed_firewall && res.changed_dhcp);
+	ok('exc dns: idempotent', (function() {
+		let r = enforce_routing(cursor(), load_settings(cursor(), 'main'), o);
+		return !r.changed_firewall && !r.changed_dhcp;
+	})());
+
+	// The WAN resolver changes: both follow.
+	enforce_routing(cursor(), load_settings(cursor(), 'main'), { nftset: true, wan_dns: [ '192.168.10.1' ] });
+	rd = find('firewall', 'bypass_dns_redirect'); dh = find('dhcp', 'bypass_dhcp_dns');
+	eq('exc dns: follows a new WAN resolver', [ rd[0].dest_ip, dh[0].dhcp_option ], [ '192.168.10.1', [ '6,192.168.10.1' ] ]);
+
+	// Un-excluding the device removes both.
+	delete global.MOCK_UCI.nordvpn.main.bypass_device;
+	enforce_routing(cursor(), load_settings(cursor(), 'main'), o);
+	eq('exc dns: removed with the exclusion', [ length(find('firewall', 'bypass_dns_redirect')), length(find('dhcp', 'bypass_dhcp_dns')) ], [ 0, 0 ]);
+
+	// VPN DNS off: excluded devices need nothing special.
+	global.MOCK_UCI = mk();
+	global.MOCK_UCI.nordvpn.main.vpn_dns = 'off';
+	enforce_routing(cursor(), load_settings(cursor(), 'main'), o);
+	eq('exc dns: nothing without VPN DNS', [ length(find('firewall', 'bypass_dns_redirect')), length(find('dhcp', 'bypass_dhcp_dns')) ], [ 0, 0 ]);
+
+	// No IPv4 WAN resolver: nothing, with a note.
+	global.MOCK_UCI = mk();
+	res = enforce_routing(cursor(), load_settings(cursor(), 'main'), { nftset: true, wan_dns: [ 'fd00::1' ] });
+	ok('exc dns: skipped without an IPv4 WAN resolver', length(find('firewall', 'bypass_dns_redirect')) == 0 &&
+		index(join(' ', res.notes), 'excluded devices') >= 0);
 }
 
 unlink(cpath);

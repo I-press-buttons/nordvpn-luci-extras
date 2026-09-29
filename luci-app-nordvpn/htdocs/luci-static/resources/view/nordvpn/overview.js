@@ -30,7 +30,9 @@ var callInstances = rpc.declare({ object: 'nordvpn', method: 'instances' });
 var callLocations = rpc.declare({ object: 'nordvpn', method: 'locations' });
 var callServers = rpc.declare({ object: 'nordvpn', method: 'servers', params: [ 'locations', 'hop_mode', 'server_group' ] });
 var callRefreshStatus = rpc.declare({ object: 'nordvpn', method: 'refresh_status' });
-var callSetCredentials = rpc.declare({ object: 'nordvpn', method: 'set_credentials', params: [ 'token', 'instance' ] });
+var callSetCredentials = rpc.declare({ object: 'nordvpn', method: 'set_credentials', params: [ 'token', 'instance', 'credential', 'name' ] });
+var callCredentials = rpc.declare({ object: 'nordvpn', method: 'credentials' });
+var callRemoveCredentials = rpc.declare({ object: 'nordvpn', method: 'remove_credentials', params: [ 'credential' ] });
 // LuCI's uci.apply() arms a rollback (10s by default) and confirms it from a
 // timer the returned promise does not wait for. We go on to call `apply`,
 // which verifies a WireGuard handshake per candidate server at verify_timeout
@@ -67,8 +69,7 @@ var callRotateNow = rpc.declare({ object: 'nordvpn', method: 'rotate_now', param
 var callExternalIp = rpc.declare({ object: 'nordvpn', method: 'external_ip', params: [ 'instance' ] });
 var callClients = rpc.declare({ object: 'nordvpn', method: 'clients' });
 var callDisconnect = rpc.declare({ object: 'nordvpn', method: 'disconnect', params: [ 'instance' ] });
-var callClearCredentials = rpc.declare({ object: 'nordvpn', method: 'clear_credentials', params: [ 'instance' ] });
-var callCreateInstance = rpc.declare({ object: 'nordvpn', method: 'create_instance', params: [ 'instance' ] });
+var callCreateInstance = rpc.declare({ object: 'nordvpn', method: 'create_instance', params: [ 'instance', 'credential' ] });
 var callDeleteInstance = rpc.declare({ object: 'nordvpn', method: 'delete_instance', params: [ 'instance' ] });
 var callHistory = rpc.declare({ object: 'nordvpn', method: 'history', params: [ 'instance', 'limit' ] });
 
@@ -138,6 +139,7 @@ var STYLE = '' +
 	'.nv-pool-remove{color:#c0392b;font-weight:600}' +
 	'.nv-pool-remove:hover{background:rgba(192,57,43,.12)}' +
 	'.nv-pool-sep{border-top:1px solid var(--border-color-medium,#ddd);margin:.25em 0}' +
+	'.nv-pool-label{padding:.2em .5em;font-size:.85em;font-weight:600;color:var(--text-color-medium,#666)}' +
 	'.nv-chip-add{font-weight:700;padding:0 .15em}' +
 	// Server picker: same panel, plus a load dot (green/amber/red), a group
 	// header per country and quick "Automatic / Lowest load" rows at the top.
@@ -200,7 +202,8 @@ return view.extend({
 			uci.load('nordvpn'),
 			callInstances().catch(function() { return { instances: [] }; }),
 			callLocations().catch(function() { return { available: false }; }),
-			callRefreshStatus().catch(function() { return { state: 'idle' }; })
+			callRefreshStatus().catch(function() { return { state: 'idle' }; }),
+			callCredentials().catch(function() { return { credentials: [] }; })
 		]);
 	},
 
@@ -209,12 +212,14 @@ return view.extend({
 		this.instance = this.instances.length ? this.instances[0].instance : 'main';
 		this.status = this.instances[0] || {};
 		this.locations = data[2] || { available: false };
+		this.credentials = (data[4] && data[4].credentials) || [];
 		this.dirty = false;
 		this.refs = {};
 
 		this.instancesNode = E('div');
 		this.statusNode = E('div');
 		this.historyNode = this.buildHistory();
+		this.credNode = E('div');
 		this.formNode = E('div');
 		this.xferSamples = {};
 		this.xferRates = {};
@@ -226,6 +231,7 @@ return view.extend({
 		var container = E('div', {}, [
 			E('style', {}, STYLE),
 			E('h2', {}, _('NordVPN')),
+			this.credNode,
 			this.instancesNode,
 			this.statusNode,
 			this.historyNode,
@@ -315,25 +321,31 @@ return view.extend({
 	showAddInstanceModal: function() {
 		var input = E('input', { type: 'text', class: 'cbi-input-text', placeholder: _('e.g. media') });
 		var err = E('div', { class: 'cbi-value-description', style: 'color:var(--error-color,#c0392b)' });
+		// New instances use the Default credentials; offer the others only when
+		// the bank has more than one entry.
+		var creds = this.credentials || [];
+		var credSel = (creds.length > 1) ? this.credentialSelect('default') : null;
+
 		ui.showModal(_('Add VPN instance'), [
-			E('p', {}, _('A new instance runs its own tunnel on its own WireGuard interface with its own credentials and schedule. Issue a separate NordVPN access token for it — reusing one key elsewhere has been known to get it locked.')),
+			E('p', {}, _('A new instance runs its own tunnel on its own WireGuard interface with its own schedule.')),
 			E('div', { class: 'cbi-value' }, [ input ]),
+			credSel ? E('div', { class: 'cbi-value' }, [ E('label', { class: 'nv-check' }, [ _('Credentials'), credSel ]) ]) : '',
 			err,
 			E('div', { class: 'right' }, [
 				E('button', { class: 'cbi-button', click: ui.hideModal }, _('Cancel')),
 				' ',
-				E('button', { class: 'cbi-button cbi-button-action', click: L.bind(this.addInstance, this, input, err) }, _('Add'))
+				E('button', { class: 'cbi-button cbi-button-action', click: L.bind(this.addInstance, this, input, credSel, err) }, _('Add'))
 			])
 		]);
 	},
 
-	addInstance: function(input, err) {
+	addInstance: function(input, credSel, err) {
 		var name = (input.value || '').trim();
 		if (!/^[A-Za-z0-9_]{1,12}$/.test(name)) {
 			dom.content(err, _('Use 1-12 letters, digits or underscores.'));
 			return;
 		}
-		return callCreateInstance(name).then(L.bind(function(res) {
+		return callCreateInstance(name, credSel ? credSel.value : '').then(L.bind(function(res) {
 			if (res && res.error) {
 				dom.content(err, [ res.error ]);
 				return;
@@ -341,10 +353,14 @@ return view.extend({
 			ui.hideModal();
 			uci.unload('nordvpn');
 			return uci.load('nordvpn').then(L.bind(function() {
+				return this.refreshCredentials();
+			}, this)).then(L.bind(function() {
 				return this.refreshStatus();
 			}, this)).then(L.bind(function() {
 				this.selectInstance(name);
-				this.notice(_('Instance "%s" created. Set its credentials and pick a country, then save.').format(name), 'info', 6000);
+				this.notice((res && res.configured)
+					? _('Instance "%s" created with the "%s" credentials. Pick a country, then save.').format(name, this.credentialName(res.credential))
+					: _('Instance "%s" created. Add credentials and pick a country, then save.').format(name), 'info', 6000);
 			}, this));
 		}, this)).catch(L.bind(function(e) {
 			dom.content(err, [ '' + e ]);
@@ -357,7 +373,7 @@ return view.extend({
 		var main = (name === 'main');
 		ui.showModal(main ? _('Reset "main" to defaults?') : _('Delete instance "%s"?').format(name), [
 			E('p', {}, main
-				? _('The tunnel is taken down, the stored key, interface and firewall objects are removed, and every setting of this instance returns to its default. Other instances are not affected.')
+				? _('The tunnel is taken down, its interface and firewall objects are removed, and every setting of this instance returns to its default. The credentials stay in the bank, and other instances are not affected.')
 				: _('The tunnel is taken down and its interface, firewall objects and settings are removed. LAN traffic routed through it will fall back to your other routes.')),
 			E('div', { class: 'right' }, [
 				E('button', { class: 'cbi-button', click: ui.hideModal }, _('Cancel')),
@@ -928,6 +944,9 @@ return view.extend({
 		// Building the form fires the same change paths as user input; the
 		// guard keeps programmatic construction from marking the form dirty.
 		this._building = true;
+		// Credentials sit at the top of the page, apart from the form, but follow
+		// the selected instance, so they are rebuilt with it.
+		dom.content(this.credNode, this.buildCredentials());
 		var sections = [ this.buildConnection(), this.buildRoutingSection(), this.buildRotation(), this.buildAdvanced() ];
 		this._building = false;
 		return sections;
@@ -955,20 +974,69 @@ return view.extend({
 		return el;
 	},
 
+	// The credential bank: named NordVPN credentials shared by the instances.
+	// Every instance uses Default unless its Connection settings pick another.
+	buildCredentials: function() {
+		var creds = this.credentials || [];
+		var rows = creds.map(L.bind(function(c) {
+			var isDefault = (c.id === 'default');
+			return E('tr', { class: 'tr' }, [
+				E('td', { class: 'td' }, c.name),
+				E('td', { class: 'td' }, c.configured ? _('Configured') : _('Not configured')),
+				E('td', { class: 'td' }, (c.instances && c.instances.length) ? c.instances.join(', ') : _('not used')),
+				E('td', { class: 'td nv-inline' }, [
+					E('button', { class: 'cbi-button', click: L.bind(this.showCredentialModal, this, c) },
+						c.configured ? _('Replace token') : _('Set token')),
+					(isDefault && !c.configured) ? '' : E('button', {
+						class: 'cbi-button cbi-button-remove',
+						click: L.bind(this.showClearCredentialsModal, this, c)
+					}, isDefault ? _('Remove key') : _('Remove'))
+				])
+			]);
+		}, this));
+
+		return E('fieldset', { class: 'cbi-section' }, [
+			E('legend', {}, _('Credentials')),
+			E('div', { class: 'cbi-section-node' }, [
+				E('table', { class: 'table' }, [
+					E('tr', { class: 'tr table-titles' }, [
+						E('th', { class: 'th' }, _('Name')),
+						E('th', { class: 'th' }, _('Status')),
+						E('th', { class: 'th' }, _('Used by')),
+						E('th', { class: 'th' }, '')
+					])
+				].concat(rows)),
+				E('div', { class: 'cbi-value-description' },
+					_('All instances use the Default credentials unless an instance picks another set under Connection.')),
+				E('div', {}, [
+					E('button', { class: 'cbi-button cbi-button-add', click: L.bind(this.showCredentialModal, this, null) },
+						'+ ' + _('Add credentials'))
+				])
+			])
+		]);
+	},
+
+	// A <select> over the credential bank, `value` preselected.
+	credentialSelect: function(value) {
+		return E('select', { class: 'cbi-input-select' }, (this.credentials || []).map(function(c) {
+			return E('option', { value: c.id, selected: (c.id === value) ? '' : null },
+				c.configured ? c.name : _('%s (not configured)').format(c.name));
+		}));
+	},
+
+	credentialName: function(id) {
+		var found = (this.credentials || []).filter(function(c) { return c.id === id; })[0];
+		return found ? found.name : id;
+	},
+
+	refreshCredentials: function() {
+		return callCredentials().then(L.bind(function(res) {
+			this.credentials = (res && res.credentials) || [];
+			dom.content(this.credNode, this.buildCredentials());
+		}, this)).catch(function() {});
+	},
+
 	buildConnection: function() {
-		var s = this.status || {};
-		var configured = !!s.configured;
-
-		var credState = E('span', {}, configured ? _('Configured') : _('Not configured'));
-		var credBtn = E('button', {
-			class: 'cbi-button',
-			click: L.bind(this.showCredentialModal, this)
-		}, configured ? _('Replace credentials') : _('Set credentials'));
-		var credClearBtn = configured ? E('button', {
-			class: 'cbi-button cbi-button-remove',
-			click: L.bind(this.showClearCredentialsModal, this)
-		}, _('Remove')) : '';
-
 		// Server pin picker (custom panel, load-aware). _serverChosen is the
 		// source of truth: a hostname, or '' for automatic (rotation picks).
 		this._serversReq = 0;
@@ -1064,10 +1132,23 @@ return view.extend({
 		this.poolNote = E('div', { class: 'cbi-value-description' });
 		this.rebuildPoolWidget();
 
+		// Which credentials this instance uses; offered once there is a choice.
+		this.credSel = null;
+		var credRow = '';
+		if ((this.credentials || []).length > 1) {
+			var cur = uci.get('nordvpn', this.instance, 'credential') || 'default';
+			if (!(this.credentials || []).some(function(c) { return c.id === cur; }))
+				cur = 'default';
+			this.credSel = this.credentialSelect(cur);
+			this.credSel.addEventListener('change', L.bind(this.markDirty, this));
+			credRow = this.row(_('Credentials'), [ this.credSel ],
+				_('The credentials this instance connects with. Takes effect on save.'));
+		}
+
 		var section = E('fieldset', { class: 'cbi-section' }, [
 			E('legend', {}, _('Connection')),
 			E('div', { class: 'cbi-section-node' }, [
-				this.row(_('Credentials'), [ E('div', { class: 'nv-inline' }, [ credState, credBtn, credClearBtn ]) ]),
+				credRow,
 				this.row(_('Hop mode'), [ seg, this.hopNote ]),
 				this.p2pRow,
 				this.row(_('Locations'), [
@@ -1160,8 +1241,23 @@ return view.extend({
 				return E('label', { class: 'nv-check' }, [ cb, n ]);
 			}, this)));
 
+			// Only one instance can route all LAN traffic (the backend enforces
+			// it too): elsewhere the box is locked, and a leftover conflict is
+			// flagged so it can be cleared.
+			var holder = this.allLanOwner(true);
+			var owner = this.allLanOwner(false);
+			var routeNote = null;
+			if (holder && !this.autoRouting.checked) {
+				this.autoRouting.disabled = true;
+				routeNote = E('div', { class: 'cbi-value-description' },
+					_('Already enabled on instance "%s". Only one instance can route all LAN traffic; route chosen networks, devices or domains through this one instead.').format(holder));
+			} else if (owner) {
+				routeNote = E('div', { class: 'cbi-value-description nv-inline-note' },
+					_('⚠ Not active: instance "%s" already routes all LAN traffic. Turn it off here or there.').format(owner));
+			}
 			body.appendChild(this.row(_('Traffic routing'), [
-				E('label', { class: 'nv-check' }, [ this.autoRouting, _('Route all LAN traffic through the VPN') ])
+				E('label', { class: 'nv-check' }, [ this.autoRouting, _('Route all LAN traffic through the VPN') ]),
+				routeNote || ''
 			], _('Creates a firewall zone and a default route via the tunnel; disabling removes exactly what was created.')));
 			this.steerRow = this.row(_('Steered networks'), [ this.steerWrap ],
 				_('Or route only these networks through this instance — policy rules send their traffic into its routing table.'));
@@ -1184,7 +1280,7 @@ return view.extend({
 				this.v6Warn
 			]);
 			this.dnsRow = this.row(_('DNS'), [ this.dnsSel ],
-				_('Which resolver to use while connected. Threat Protection blocks ads and malware at the DNS level; both NordVPN options only work through the tunnel.'));
+				_('Which resolver to use while connected. Threat Protection blocks ads and malware at the DNS level; both NordVPN options only work through the tunnel. With "Route all LAN traffic", the router then forwards every lookup only to NordVPN (so none leak to your provider\'s resolver), and lookups fail while the tunnel is down.'));
 			body.appendChild(this.ksRow);
 			body.appendChild(this.v6Row);
 			body.appendChild(this.dnsRow);
@@ -1343,7 +1439,7 @@ return view.extend({
 
 		if (kind === 'bypass')
 			return this.row(_('Excluded devices'), [ p.details ],
-				_('These devices always use your normal internet connection, even while the kill switch blocks the rest, for example a TV, a console or a work laptop. Matched by MAC address.'));
+				_('These devices always use your normal internet connection, even while the kill switch blocks the rest, for example a TV, a console or a work laptop. Matched by MAC address. With NordVPN DNS on, they keep your provider\'s DNS over IPv4 (lookups they make over IPv6 still go to NordVPN).'));
 		return this.row(_('Steered devices'), [ p.details ],
 			_('Or route individual devices through this instance, matched by MAC address so a new DHCP lease keeps them on the tunnel. A device choice takes precedence over its network.'));
 	},
@@ -1541,6 +1637,24 @@ return view.extend({
 			if (this.steerBoxes[k].checked)
 				out.push(k);
 		return out;
+	},
+
+	// Another enabled instance with "Route all LAN traffic" on, or null.
+	// `any` false: only one ahead of the selected instance, i.e. the one the
+	// backend lets win (the first, main first). `any` true: any other one.
+	allLanOwner: function(any) {
+		var list = this.instances || [];
+		for (var i = 0; i < list.length; i++) {
+			var n = list[i].instance;
+			if (n === this.instance) {
+				if (any)
+					continue;
+				return null;
+			}
+			if (list[i].enabled !== false && uci.get('nordvpn', n, 'auto_routing') === '1')
+				return n;
+		}
+		return null;
 	},
 
 	onRoutingToggle: function(init) {
@@ -1947,7 +2061,7 @@ return view.extend({
 				click: L.bind(function(ev) { ev.stopPropagation(); this.poolClosePanel(); }, this) }, '✕')
 		]));
 		var filt = E('input', { type: 'text', class: 'cbi-input-text nv-pool-filter',
-			placeholder: _('Filter') + '…', value: this._poolFilter });
+			placeholder: _('Search countries or cities') + '…', value: this._poolFilter });
 		filt.addEventListener('input', L.bind(function() {
 			this._poolFilter = filt.value;
 			this.poolRenderCountryList();
@@ -1957,7 +2071,13 @@ return view.extend({
 		this._poolListEl = E('div', {});
 		panel.appendChild(this._poolListEl);
 		this.poolRenderCountryList();
-		setTimeout(function() { try { filt.focus(); } catch (e) {} }, 0);
+		// The panel re-renders after every pick; keep typing where it left off.
+		setTimeout(function() {
+			try {
+				filt.focus();
+				filt.setSelectionRange(filt.value.length, filt.value.length);
+			} catch (e) {}
+		}, 0);
 	},
 
 	// Country rows, filtered. Mark: whole = check, partial = half, none = blank.
@@ -1984,6 +2104,36 @@ return view.extend({
 					E('span', { class: 'chev' }, '›')
 				]));
 		}, this));
+
+		// While filtering, cities match too, across every country, so a city can
+		// be found without knowing its country. Clicking one adds just that city
+		// (or drops it again); the panel stays open for more picks.
+		var cityRows = [];
+		if (f) {
+			var key = this.hopCountKey();
+			this.filteredCountries().forEach(L.bind(function(c) {
+				var st = this.poolCountryHas(c.code);
+				var flag = this.countryFlag(c.code);
+				(c.cities || []).forEach(L.bind(function(city) {
+					if ((city.name || '').toLowerCase().indexOf(f) < 0)
+						return;
+					var on = st.whole || !!st.cities[city.code];
+					cityRows.push(E('div', { class: 'nv-pool-row',
+						click: L.bind(function(ev) { ev.stopPropagation(); this.poolToggleCity(c.code, city.code); }, this) }, [
+							E('span', { class: 'box' }, on ? '☑' : '☐'),
+							E('span', { class: 'grow' }, (flag ? flag + ' ' : '') +
+								'%s, %s (%d)'.format(city.name, c.name, city[key] || 0))
+						]));
+				}, this));
+			}, this));
+		}
+		if (cityRows.length) {
+			if (any)
+				el.appendChild(E('div', { class: 'nv-pool-sep' }));
+			el.appendChild(E('div', { class: 'nv-pool-label' }, _('Cities')));
+			cityRows.forEach(function(r) { el.appendChild(r); });
+			any = true;
+		}
 		if (!any)
 			el.appendChild(E('div', { class: 'nv-pool-row is-in' }, _('No matches')));
 	},
@@ -2473,6 +2623,8 @@ return view.extend({
 		if (this.refs.cache_dir)
 			setv('cache_dir', (this.refs.cache_dir.value || '').trim(), 'main');
 
+		if (this.credSel)
+			setv('credential', this.credSel.value === 'default' ? '' : this.credSel.value);
 		setv('hop_mode', this.hopMode());
 		setv('server_group', this.serverGroup());
 		if (this.selSel)
@@ -2623,58 +2775,73 @@ return view.extend({
 
 	/* ---- credentials -------------------------------------------------- */
 
-	showCredentialModal: function() {
+	// Add a named set (`entry` null) or replace the token of `entry`.
+	showCredentialModal: function(entry) {
 		// LuCI's password Textfield renders the input with an inline reveal
 		// button in one control-group row.
 		var field = new ui.Textfield('', {
 			password: true,
 			placeholder: _('64-character hexadecimal token')
 		});
+		var nameInput = entry ? null : E('input', { type: 'text', class: 'cbi-input-text', maxlength: 32,
+			placeholder: _('Name, e.g. Family plan') });
 		var err = E('div', { class: 'cbi-value-description', style: 'color:var(--error-color,#c0392b)' });
 
-		ui.showModal(_('NordVPN credentials'), [
+		ui.showModal(entry ? _('Credentials "%s"').format(entry.name) : _('Add credentials'), [
 			E('p', {}, _('Paste your 64-character NordVPN access token. It is used once to derive the WireGuard private key and is never stored or shown again.')),
+			(entry && entry.instances && entry.instances.length)
+				? E('p', {}, _('Used by: %s. Their tunnels switch to the new key.').format(entry.instances.join(', '))) : '',
+			nameInput ? E('div', { class: 'cbi-value' }, [ nameInput ]) : '',
 			E('div', { class: 'cbi-value nv-token-field' }, [ field.render() ]),
 			err,
 			E('div', { class: 'right' }, [
 				E('button', { class: 'cbi-button', click: ui.hideModal }, _('Cancel')),
 				' ',
-				E('button', { class: 'cbi-button cbi-button-action', click: L.bind(this.submitCredentials, this, field, err) }, _('Save credentials'))
+				E('button', { class: 'cbi-button cbi-button-action', click: L.bind(this.submitCredentials, this, entry, nameInput, field, err) }, _('Save credentials'))
 			])
 		]);
 	},
 
-	showClearCredentialsModal: function() {
-		ui.showModal(_('Remove credentials?'), [
-			E('p', {}, _('The tunnel is taken down and the stored WireGuard key is deleted from this instance. Your selection (country, schedule) is kept — enter a new token to reconnect.')),
+	showClearCredentialsModal: function(entry) {
+		var isDefault = (entry.id === 'default');
+		var used = (entry.instances || []).join(', ');
+		ui.showModal(isDefault ? _('Remove the Default key?') : _('Remove credentials "%s"?').format(entry.name), [
+			E('p', {}, isDefault
+				? _('The stored WireGuard key is deleted and every instance using Default goes down (%s). Their settings are kept; set a new token to reconnect.').format(used || _('none'))
+				: (used
+					? _('These credentials are still used by %s. Switch those instances to other credentials first.').format(used)
+					: _('The stored WireGuard key and its name are deleted.'))),
 			E('div', { class: 'right' }, [
 				E('button', { class: 'cbi-button', click: ui.hideModal }, _('Cancel')),
 				' ',
-				E('button', { class: 'cbi-button cbi-button-negative', click: L.bind(this.clearCredentials, this) }, _('Remove'))
+				(!isDefault && used) ? '' : E('button', { class: 'cbi-button cbi-button-negative', click: L.bind(this.clearCredentials, this, entry) }, _('Remove'))
 			])
 		]);
 	},
 
-	clearCredentials: function() {
+	clearCredentials: function(entry) {
 		ui.hideModal();
 		var n = this.notice(_('Removing credentials…'), 'info');
-		return callClearCredentials(this.instance).then(L.bind(function(res) {
+		return callRemoveCredentials(entry.id).then(L.bind(function(res) {
 			this.dismiss(n);
 			if (res && res.error) {
 				this.notice(_('Failed: %s').format(res.error), 'error');
 				return;
 			}
 			this.notice(_('Credentials removed.'), 'info', 4000);
-			return this.refreshStatus().then(L.bind(function() {
-				dom.content(this.formNode, this.buildFormSections());
-			}, this));
+			return this.afterCredentialChange();
 		}, this)).catch(L.bind(function(e) {
 			this.dismiss(n);
 			this.notice(_('Failed: %s').format(e), 'error');
 		}, this));
 	},
 
-	submitCredentials: function(field, err, ev) {
+	submitCredentials: function(entry, nameInput, field, err, ev) {
+		var name = nameInput ? (nameInput.value || '').trim() : '';
+		if (nameInput && !name) {
+			dom.content(err, _('Enter a name for these credentials.'));
+			return;
+		}
 		var token = (field.getValue() || '').trim();
 		if (!token.match(/^[0-9a-fA-F]{64}$/)) {
 			dom.content(err, _('Enter a valid 64-character hexadecimal token.'));
@@ -2683,21 +2850,30 @@ return view.extend({
 		var btn = ev.target;
 		btn.disabled = true;
 		dom.content(err, _('Verifying…'));
-		return callSetCredentials(token, this.instance).then(L.bind(function(res) {
+		return callSetCredentials(token, '', entry ? entry.id : '', name).then(L.bind(function(res) {
 			if (res && res.error) {
 				btn.disabled = false;
 				dom.content(err, [ res.error ]);
 				return;
 			}
 			ui.hideModal();
-			this.notice(_('Credentials saved.'), 'info');
-			return this.refreshStatus().then(L.bind(function() {
-				dom.content(this.formNode, this.buildFormSections());
-			}, this));
+			this.notice(_('Credentials "%s" saved.').format(res.name || name), 'info');
+			return this.afterCredentialChange();
 		}, this)).catch(function(e) {
 			btn.disabled = false;
 			dom.content(err, [ '' + e ]);
 		});
+	},
+
+	// A bank change can flip several instances' state; refresh everything
+	// that shows it. The form is rebuilt only when it has no unsaved edits.
+	afterCredentialChange: function() {
+		return this.refreshCredentials().then(L.bind(function() {
+			return this.refreshStatus();
+		}, this)).then(L.bind(function() {
+			if (!this.dirty)
+				dom.content(this.formNode, this.buildFormSections());
+		}, this));
 	},
 
 	/* ---- cache -------------------------------------------------------- */
