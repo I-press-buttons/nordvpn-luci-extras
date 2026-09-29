@@ -512,6 +512,8 @@ function load_settings(uci, instance) {
 		country_code: g('country_code', ''),
 		city_code: g('city_code', ''),
 		fixed_server: g('fixed_server', ''),
+		// Credential bank entry this instance uses (nordvpn.credentials).
+		credential: validate_instance(g('credential', 'default')) || 'default',
 		rotation_enabled: g('rotation_enabled', '0') == '1',
 		rotation_mode: validate_rotation_mode(g('rotation_mode', 'interval')) || 'interval',
 		rotation_interval: bi('rotation_interval', '360', MIN_ROTATION_INTERVAL, MAX_ROTATION_INTERVAL),

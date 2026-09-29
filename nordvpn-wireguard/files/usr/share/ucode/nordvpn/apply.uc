@@ -31,12 +31,11 @@ const selection_candidates = _select.selection_candidates,
       by_hostname = _select.by_hostname,
       pick = _select.pick,
       order_candidates = _select.order_candidates;
-const _api = require('nordvpn.api');
-const get_private_key = _api.get_private_key;
 const _routing = require('nordvpn.routing');
 const enforce_routing = _routing.enforce;
 const _history = require('nordvpn.history');
 const record_event = _history.record_event;
+const _creds = require('nordvpn.credentials');
 
 // Locate the managed peer section (type wireguard_<iface>, interface=<iface>).
 function find_peer(uci, iface) {
@@ -50,31 +49,17 @@ function find_peer(uci, iface) {
 	return found;
 }
 
-// Exchange the token for a private key and persist ONLY the key, on the
-// instance's own interface — every instance carries its own credentials (a
-// shared key reportedly risks being locked by NordVPN when reused). The token
-// is never written to UCI. Returns { ok: true } or { error }.
+// Store credentials for `instance` (its bank entry; see nordvpn.credentials)
+// and push them to every instance sharing that entry. Kept for scripts that
+// set credentials per instance. Returns { ok, credential, name } or { error }.
 function set_credentials(uci, token, instance) {
 	let iface = validate_interface(load_settings(uci, instance).interface);
 	if (!iface)
 		return { error: 'invalid interface name' };
 	if (!managed_interface(uci, iface))
 		return { error: 'interface ' + iface + ' is not managed by nordvpn' };
-
-	let res = get_private_key(token);
-	if (res.error)
-		return res;
-
-	if (!uci.get('network', iface))
-		uci.set('network', iface, 'interface');
-	uci.set('network', iface, 'proto', 'wireguard');
-	uci.set('network', iface, 'vpn_type', 'nordvpn');
-	uci.set('network', iface, 'private_key', res.private_key);
-	uci.set('network', iface, 'addresses', [ FIXED_ADDRESS ]);
-	uci.delete('network', iface, 'nordvpn_token');
-	uci.commit('network');
-	record_event(instance, 'credentials_set');
-	return { ok: true };
+	_creds.migrate(uci);
+	return _creds.set(uci, token, null, null, instance);
 }
 
 // Snapshot the current peer so a failed rotation can be rolled back.
@@ -317,6 +302,11 @@ function apply_inner(uci, instance) {
 		return { state: 'failure', error: 'invalid interface name' };
 	if (!managed_interface(uci, iface))
 		return { state: 'failure', error: 'interface ' + iface + ' is not managed by nordvpn' };
+	// The instance's credentials may have changed in the bank or been switched
+	// to another entry since the last apply: bring the interface key in line.
+	_creds.migrate(uci);
+	if (_creds.sync_instance(uci, instance))
+		uci.commit('network');
 	if (!validate_wg_key(uci.get('network', iface, 'private_key')))
 		return { state: 'failure', error: 'no credentials configured' };
 
@@ -602,33 +592,25 @@ function disconnect(uci, instance) {
 	return { ok: true, interface: iface };
 }
 
-// Forget the stored WireGuard key and peer so the instance goes back to
-// "not configured". The selection (country, schedule, …) is kept so entering
-// a new token restores the previous behaviour.
+// Remove the key of the bank entry `instance` uses. The entry is shared, so
+// every instance on it goes down (see nordvpn.credentials.clear_key()).
 function clear_credentials(uci, instance) {
-	let s = load_settings(uci, instance);
-	let iface = validate_interface(s.interface);
+	let iface = validate_interface(load_settings(uci, instance).interface);
 	if (!iface)
 		return { error: 'invalid interface name' };
 	if (!managed_interface(uci, iface))
 		return { error: 'interface ' + iface + ' is not managed by nordvpn' };
-	run([ 'ifdown', iface ]);
-	let peer = find_peer(uci, iface);
-	if (peer)
-		uci.delete('network', peer);
-	if (uci.get('network', iface) != null) {
-		uci.delete('network', iface, 'private_key');
-		uci.set('network', iface, 'auto', '0');
-	}
-	uci.commit('network');
-	record_event(instance, 'credentials_cleared');
-	return { ok: true, interface: iface };
+	_creds.migrate(uci);
+	let res = _creds.clear_key(uci, _creds.instance_credential(uci, instance));
+	if (res.ok)
+		res.interface = iface;
+	return res;
 }
 
 // Create a new VPN instance section with its own interface. Committed
 // atomically here (not via the UI's staged-apply machinery, whose rollback
 // window makes programmatic section creation fragile).
-function create_instance(uci, name, credentials_from) {
+function create_instance(uci, name, credential) {
 	let valid = _common.validate_instance(name);
 	if (!valid || valid != name)
 		return { error: 'invalid instance name' };
@@ -647,35 +629,25 @@ function create_instance(uci, name, credentials_from) {
 	if (taken || uci.get('network', iface) != null)
 		return { error: 'interface ' + iface + ' already exists' };
 
-	// Reuse another instance's credentials: the access token is never stored,
-	// only the WireGuard private key it was exchanged for — and NordVPN issues
-	// one key per account, so copying it is what a second token would yield.
-	// Checked before anything is written so a bad source creates nothing.
-	let key = null;
-	if (credentials_from != null && credentials_from != '') {
-		if (uci.get('nordvpn', credentials_from) == null)
-			return { error: 'no such instance to copy credentials from' };
-		let src = validate_interface(load_settings(uci, credentials_from).interface);
-		key = src ? validate_wg_key(uci.get('network', src, 'private_key')) : null;
-		if (!key)
-			return { error: 'instance ' + credentials_from + ' has no credentials to copy' };
-	}
+	// New instances share the 'default' credentials unless told otherwise.
+	_creds.migrate(uci);
+	let cred = (credential == null || credential == '') ? _creds.DEFAULT_ID : credential;
+	if (!_creds.exists(uci, cred))
+		return { error: 'no such credentials' };
 
 	uci.set('nordvpn', name, 'instance');
 	uci.set('nordvpn', name, 'interface', iface);
 	uci.set('nordvpn', name, 'enabled', '1');
+	if (cred != _creds.DEFAULT_ID)
+		uci.set('nordvpn', name, 'credential', cred);
 	uci.commit('nordvpn');
 
+	let key = _creds.sync_instance(uci, name) == 'set';
 	if (key) {
-		uci.set('network', iface, 'interface');
-		uci.set('network', iface, 'proto', 'wireguard');
-		uci.set('network', iface, 'vpn_type', 'nordvpn');
-		uci.set('network', iface, 'private_key', key);
-		uci.set('network', iface, 'addresses', [ FIXED_ADDRESS ]);
 		uci.commit('network');
 		record_event(name, 'credentials_set');
 	}
-	return { ok: true, instance: name, interface: iface, configured: key != null };
+	return { ok: true, instance: name, interface: iface, credential: cred, configured: key };
 }
 
 // Tear down a VPN instance: stamped routing/firewall objects, the netifd

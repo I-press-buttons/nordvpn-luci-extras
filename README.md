@@ -129,8 +129,9 @@ that adds the extra features marked **(fork)** below.
 
 - **Multiple instances.** Run tunnels side by side, for example the main
   LAN through Germany and a media network through Serbia. Each has its own
-  credentials, locations, schedule and routing. A new instance can reuse the
-  credentials of an existing one, so you only paste a token once.
+  locations, schedule and routing. All tunnels share the *Default*
+  credentials, so you paste a token once; add more named credentials to the
+  bank if some tunnels should use another account.
 
   ![VPN instances](docs/screenshots/instances.png)
 
@@ -216,8 +217,9 @@ apk del dnsmasq && apk add ./dnsmasq-full-*.apk
 ## Quick start
 
 1. Open LuCI → **VPN → NordVPN**.
-2. Click **Set credentials** and paste your 64-character access token. To get
-   one, go to
+2. Under **Credentials**, click **Set token** on *Default* and paste your
+   64-character access token. Every tunnel uses *Default* unless you add
+   more credentials and pick them per instance. To get a token, go to
    <https://my.nordaccount.com/dashboard/nordvpn/manual-configuration/> →
    **Generate new token** (a non-expiring token is fine).
 3. Choose a **Hop mode** and add one or more **Locations**.
@@ -299,11 +301,13 @@ ubus call nordvpn overview          # lightweight per-instance summary (Status p
 ubus call nordvpn external_ip       # NordVPN's view: protected, public IP, city, ISP
 ubus call nordvpn history '{"instance":"main"}'  # recent events, newest first
 ubus call nordvpn disconnect        # take the tunnel down, pause rotation
-ubus call nordvpn clear_credentials # forget the stored WireGuard key
+ubus call nordvpn credentials       # credential bank: names, status, which instances use each
+ubus call nordvpn remove_credentials '{"credential":"work"}'  # delete an unused entry ('default' only loses its key)
 ubus call nordvpn locations         # cached country/city tree (+ per-city counts)
 ubus call nordvpn servers '{"locations":["de","nl-amsterdam"],"hop_mode":"single","server_group":"p2p"}'
 ubus call nordvpn refresh_status    # cache-refresh job progress
-ubus call nordvpn set_credentials '{"token":"<64-hex-token>"}'
+ubus call nordvpn set_credentials '{"token":"<64-hex-token>"}'                        # replace the Default key
+ubus call nordvpn set_credentials '{"token":"<64-hex-token>","name":"Family plan"}'   # add a named entry
 ubus call nordvpn apply             # rebuild the peer and bring the tunnel up
 ubus call nordvpn rotate_now        # one-shot rotation
 ubus call nordvpn refresh_locations # start an async server-list refresh
@@ -311,8 +315,9 @@ ubus call nordvpn refresh_locations # start an async server-list refresh
 
 `status`, `apply`, `rotate_now` and `set_credentials` accept an `instance`
 argument (default `main`). `create_instance` and `delete_instance` manage
-instances; pass `create_instance` a `credentials_from` instance name to copy
-its stored key instead of setting new credentials. `nordvpn-rotate <name>`
+instances; a new instance uses the Default credentials unless
+`create_instance` gets a `credential` entry id. An instance's `credential`
+option in `/etc/config/nordvpn` picks its bank entry. `nordvpn-rotate <name>`
 rotates one instance from the CLI.
 
 `status` reports these states:
@@ -457,7 +462,9 @@ are cleared on reboot.
 
 - The access token reaches curl only through an anonymous pipe. It never
   appears in argv, environment variables, temp files or logs, and it's never
-  saved.
+  saved. Only the derived WireGuard key is kept, in the root-only
+  `/etc/config/nordvpn_credentials` (and on each tunnel's interface, where
+  netifd needs it).
 - External commands are built from argument lists, and every interpolated
   value (interfaces, hostnames, domains, schedules, paths) is validated
   against an allow-list first.
