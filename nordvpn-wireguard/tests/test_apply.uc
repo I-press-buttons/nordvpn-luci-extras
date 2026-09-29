@@ -231,6 +231,21 @@ const DEAD_PID = 1073741824;
 	unlink(APPLY_STATUS_FILE);
 }
 
+// netifd hints for a tunnel that never came up
+{
+	// The exact reply from a router whose netifd never loaded the handler.
+	let unloaded = { up: false, pending: false, available: false, proto: 'none',
+		errors: [ { subsystem: 'interface', code: 'NO_DEVICE' } ] };
+	ok('proto none names the missing handler',
+		index(_apply.netifd_hint(unloaded), 'network restart') >= 0);
+	ok('NO_DEVICE on a wireguard proto names the kernel module',
+		index(_apply.netifd_hint({ up: false, proto: 'wireguard',
+			errors: [ { code: 'NO_DEVICE' } ] }), 'kmod-wireguard') >= 0);
+	eq('an up interface needs no hint', _apply.netifd_hint({ up: true, proto: 'wireguard' }), null);
+	eq('a plain down interface needs no hint', _apply.netifd_hint({ up: false, proto: 'wireguard' }), null);
+	eq('no status needs no hint', _apply.netifd_hint(null), null);
+}
+
 unlink(APPLY_STATUS_FILE);
 unlink(APPLY_LOCK_FILE);
 printf('\n%s\n', fails ? ('FAILURES: ' + fails) : 'ALL APPLY TESTS PASSED');

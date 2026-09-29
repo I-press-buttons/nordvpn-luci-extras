@@ -27,6 +27,7 @@ const bring_up = _apply.bring_up,
       restore_peer = _apply.restore_peer,
       connect_one = _apply.connect_one,
       verify_handshake = _apply.verify_handshake,
+      tunnel_hint = _apply.tunnel_hint,
       restore_wan_default = _apply.restore_wan_default;
 const record_event = require('nordvpn.history').record_event;
 
@@ -189,12 +190,13 @@ function rotate_inner(uci, instance) {
 
 	// Every different candidate failed to handshake — keep a working tunnel by
 	// rolling back to the last working peer.
+	let hint = tunnel_hint(iface);
 	if (saved) {
 		restore_peer(uci, iface, saved);
 		uci.commit('network');
 		bring_up(iface);
 	}
-	return { error: 'no working server found', restored: saved != null };
+	return { error: hint || 'no working server found', restored: saved != null };
 }
 
 // History entry for a finished rotation, or null when there is nothing worth

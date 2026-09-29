@@ -168,11 +168,15 @@ function bring_up(iface) {
 }
 
 // Newest WireGuard handshake age (seconds) for the interface. Returns -1 when
-// wg cannot be run (off-device), null when it ran but there is no handshake.
+// the wg binary is absent (off-device: exit 127 from the shell), null when
+// there is no handshake — including when the device does not exist, which is
+// a failed connection, not a pass.
 function handshake_age(iface) {
 	let res = run([ 'wg', 'show', iface, 'latest-handshakes' ]);
-	if (res.code != 0)
+	if (res.code == 127)
 		return -1;
+	if (res.code != 0)
+		return null;
 	let best = 0;
 	for (let line in split(trim(res.stdout || ''), '\n')) {
 		let parts = split(line, '\t');
@@ -200,6 +204,35 @@ function verify_handshake(iface, seconds) {
 			return true;
 	}
 	return false;
+}
+
+// Why netifd could not create the tunnel device, as a user-facing hint, or
+// null. `st` is the interface's netifd status object. A WireGuard section
+// that netifd reports as proto 'none' means its wireguard protocol handler is
+// not loaded: netifd reads handlers only at startup, so installing
+// wireguard-tools without restarting it leaves every tunnel down while
+// `ifup` still succeeds. Pure.
+function netifd_hint(st) {
+	if (type(st) != 'object' || st.up)
+		return null;
+	if (st.proto == 'none')
+		return 'netifd has not loaded the WireGuard protocol handler; run /etc/init.d/network restart (or reboot) after installing the packages';
+	for (let e in (st.errors || []))
+		if (e && e.code == 'NO_DEVICE')
+			return 'netifd could not create the WireGuard device; check that kmod-wireguard matches the running kernel (lsmod | grep wireguard)';
+	return null;
+}
+
+// netifd_hint() for the live interface, or null when it cannot be read.
+function tunnel_hint(iface) {
+	let r = run([ 'ubus', 'call', 'network.interface.' + iface, 'status' ]);
+	if (r.code != 0)
+		return null;
+	try {
+		return netifd_hint(json(r.stdout));
+	} catch (e) {
+		return null;
+	}
 }
 
 // Commit and reload whatever an enforce_routing() pass changed. The firewall
@@ -324,7 +357,7 @@ function apply_inner(uci, instance) {
 			interface: iface, gateway: relay.hostname,
 			endpoint: relay.hostname + ':' + (relay.port || DEFAULT_PORT),
 			restarted: up,
-			error: ok ? null : 'the selected server did not respond'
+			error: ok ? null : (tunnel_hint(iface) || 'the selected server did not respond')
 		};
 	}
 
@@ -348,13 +381,14 @@ function apply_inner(uci, instance) {
 			};
 	}
 
+	let hint = tunnel_hint(iface);
 	if (saved) {
 		restore_peer(uci, iface, saved);
 		uci.commit('network');
 		bring_up(iface);
 	}
 	return { state: 'failure', restored: saved != null,
-		error: 'could not reach any server for the current selection; restored the previous connection' };
+		error: hint || 'could not reach any server for the current selection; restored the previous connection' };
 }
 
 // History entry for an apply outcome. Pure/testable.
@@ -680,5 +714,5 @@ function delete_instance(uci, name) {
 	return { ok: true, deleted: name, interface: iface };
 }
 
-return { set_credentials, clear_credentials, current_peer, restore_peer, write_relay, bring_up, verify_handshake, connect_one, apply_event, apply, disconnect, create_instance, delete_instance, restore_wan_default,
+return { set_credentials, clear_credentials, current_peer, restore_peer, write_relay, bring_up, verify_handshake, netifd_hint, tunnel_hint, connect_one, apply_event, apply, disconnect, create_instance, delete_instance, restore_wan_default,
 	write_apply_status, read_apply_status, apply_running, apply_status_report, run_apply, start_apply };
