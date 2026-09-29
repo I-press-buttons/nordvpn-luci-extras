@@ -12,6 +12,7 @@
 'use strict';
 
 import { readfile, unlink, stat } from 'fs';
+import { cursor } from 'uci';
 const _common = require('nordvpn.common');
 const _apply = require('nordvpn.apply');
 const APPLY_STATUS_FILE = _common.APPLY_STATUS_FILE,
@@ -229,6 +230,83 @@ const DEAD_PID = 1073741824;
 
 	_common.release_lock(token);
 	unlink(APPLY_STATUS_FILE);
+}
+
+// 7. apply_routing(): adding or excluding a device on a running tunnel only
+//    reconciles the rules; the peer and interface are left alone (no ifup,
+//    so nobody's connection drops). Anything the interface itself carries
+//    (table, MTU, autostart) or a tunnel that is not up needs a full apply.
+{
+	let count = function(conf, role) {
+		let n = [];
+		for (let k in global.MOCK_UCI[conf] || {})
+			if (global.MOCK_UCI[conf][k].nordvpn_role == role)
+				push(n, global.MOCK_UCI[conf][k]);
+		return n;
+	};
+	let seed = function() {
+		global.MOCK_UCI = { nordvpn: {
+			main: { '.type': 'instance', interface: 'nv_media', enabled: '1', auto_routing: '0',
+				routing_table: '100', source_network: [ 'lan' ] }
+		}, network: {
+			nv_media: { '.type': 'interface', proto: 'wireguard', vpn_type: 'nordvpn', private_key: KEY,
+				auto: '1', ip4table: '100', ip6table: '100', nordvpn_last_applied: 'then' },
+			peer0: { '.type': 'wireguard_nv_media', interface: 'nv_media', public_key: 'pk',
+				endpoint_host: 'de1.nordvpn.com', endpoint_port: '51820' },
+			lan: { '.type': 'interface', proto: 'static', ipaddr: '192.168.1.1/24' }
+		}, firewall: {
+			zlan: { '.type': 'zone', name: 'lan', network: [ 'lan' ] },
+			zwan: { '.type': 'zone', name: 'wan', masq: '1', network: [ 'wan' ] }
+		}, dhcp: {} };
+	};
+	unlink(APPLY_LOCK_FILE);
+
+	seed();
+	let res = _apply.apply_routing(cursor(), 'main');
+	ok('a routing-only apply succeeds', res.ok == true && res.routing_only == true);
+	global.MOCK_UCI.nordvpn.main.bypass_device = [ 'aa:bb:cc:dd:ee:01' ];
+	res = _apply.apply_routing(cursor(), 'main');
+	ok('an excluded device is applied in place', res.ok == true &&
+		length(count('firewall', 'bypass_mark')) == 1 &&
+		count('firewall', 'bypass_mark')[0].src_mac == 'aa:bb:cc:dd:ee:01');
+	eq('the peer is untouched', global.MOCK_UCI.network.peer0.endpoint_host, 'de1.nordvpn.com');
+	eq('the interface is not re-stamped', global.MOCK_UCI.network.nv_media.nordvpn_last_applied, 'then');
+	ok('the apply lock is released', stat(APPLY_LOCK_FILE) == null);
+
+	global.MOCK_UCI.nordvpn.main.bypass_device = [];
+	res = _apply.apply_routing(cursor(), 'main');
+	ok('removing the device drops its rule', res.ok == true && length(count('firewall', 'bypass_mark')) == 0);
+
+	let refused = function(label, mutate, reason) {
+		seed();
+		mutate();
+		let r = _apply.apply_routing(cursor(), 'main');
+		ok(label, r.needs_reconnect == true && r.reason == reason);
+		if (global.MOCK_UCI.network.peer0)
+			eq(label + ': peer untouched', global.MOCK_UCI.network.peer0.endpoint_host, 'de1.nordvpn.com');
+	};
+	refused('a disabled instance needs a full apply',
+		() => global.MOCK_UCI.nordvpn.main.enabled = '0', 'instance is disabled');
+	refused('a changed routing table needs a full apply',
+		() => global.MOCK_UCI.nordvpn.main.routing_table = '101', 'routing table changed');
+	refused('a changed MTU needs a full apply',
+		() => global.MOCK_UCI.nordvpn.main.mtu = '1400', 'MTU changed');
+	refused('a downed interface needs a full apply',
+		() => global.MOCK_UCI.network.nv_media.auto = '0', 'interface is disabled');
+	refused('no peer yet needs a full apply',
+		() => delete global.MOCK_UCI.network.peer0, 'no server applied yet');
+
+	seed();
+	let token = _common.acquire_lock(APPLY_LOCK_FILE, APPLY_MAX_RUNTIME);
+	res = _apply.apply_routing(cursor(), 'main');
+	ok('a running apply is not interleaved', res.needs_reconnect == true &&
+		res.reason == 'apply already running');
+	_common.release_lock(token);
+
+	seed();
+	global.MOCK_UCI.network.nv_media.vpn_type = null;
+	global.MOCK_UCI.network.nv_media.proto = 'static';
+	ok('a foreign interface is refused', _apply.apply_routing(cursor(), 'main').error != null);
 }
 
 unlink(APPLY_STATUS_FILE);

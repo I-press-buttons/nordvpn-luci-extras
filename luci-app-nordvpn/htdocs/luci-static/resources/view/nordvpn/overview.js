@@ -62,6 +62,9 @@ var callUciCommit = rpc.declare({
 // backend for the CLI only.
 var callApplyStart = rpc.declare({ object: 'nordvpn', method: 'apply_start', params: [ 'instance' ] });
 var callApplyStatus = rpc.declare({ object: 'nordvpn', method: 'apply_status' });
+// Routing-only apply: reconciles the steering/exception rules without touching
+// the tunnel. Quick (no handshake wait), so it is a plain call.
+var callApplyRouting = rpc.declare({ object: 'nordvpn', method: 'apply_routing', params: [ 'instance' ] });
 var callRefreshLocations = rpc.declare({ object: 'nordvpn', method: 'refresh_locations' });
 var callRotateNow = rpc.declare({ object: 'nordvpn', method: 'rotate_now', params: [ 'instance' ] });
 var callExternalIp = rpc.declare({ object: 'nordvpn', method: 'external_ip', params: [ 'instance' ] });
@@ -88,6 +91,20 @@ var APPLY_TIMEOUT_MS = 240000;
 // Cadence of the background status poll, kept in a constant because the apply
 // watcher has to take that poller off the queue and put it back.
 var STATUS_POLL_S = 5;
+// Instance options a running tunnel can take without a reconnect: what is
+// routed (devices, networks, domains, exceptions, kill switch, IPv6, DNS) is
+// plain firewall/rule config, and rotation, watchdog and the internet check
+// are read by the daemon on its next tick. A save that changes only these
+// adds or removes a device without dropping everyone else's connections. Any
+// other change (server, location, hop mode, table, MTU, …) reconnects.
+var NO_RECONNECT_OPTS = [
+	'source_device', 'bypass_device', 'source_network', 'steer_domain', 'bypass_domain',
+	'auto_routing', 'killswitch', 'block_ipv6', 'vpn_dns', 'use_vpn_dns',
+	'rotation_enabled', 'rotation_mode', 'rotation_interval', 'rotation_time',
+	'watchdog', 'egress_probe', 'probe_target', 'verify_timeout', 'max_retries'
+];
+// Values equivalent to an unset option, for comparing the form with the config.
+var OPTION_DEFAULTS = { hop_mode: 'single', selection: 'balanced' };
 // Events shown in the "Recent events" panel (the backend keeps up to 50).
 var HISTORY_LIMIT = 25;
 // A probe target: a dotted-quad IPv4 literal (the backend accepts nothing else).
@@ -2118,7 +2135,7 @@ return view.extend({
 			class: 'cbi-button cbi-button-save',
 			disabled: true,
 			click: L.bind(this.save, this)
-		}, _('Save and reconnect'));
+		}, _('Save and apply'));
 		this.discardBtn = E('button', {
 			class: 'cbi-button',
 			disabled: true,
@@ -2571,6 +2588,64 @@ return view.extend({
 		return el ? (el.value || '').split(/[\s,]+/).filter(Boolean) : [];
 	},
 
+	// The instance's options as committed (plus the shared cache directory),
+	// taken before collectIntoUci() so save() can tell what the form changed.
+	// Empty values and the backend defaults the form writes back as "unset"
+	// are left out, so the shipped `option routing_table ''` style entries do
+	// not read as changes on the first save.
+	optionSnapshot: function() {
+		var sec = uci.get('nordvpn', this.instance) || {}, snap = {};
+		var put = function(k, v) {
+			if (v == null || v === '' || (Array.isArray(v) && !v.length) || OPTION_DEFAULTS[k] === v)
+				return;
+			snap[k] = JSON.stringify(v);
+		};
+		Object.keys(sec).forEach(function(k) {
+			if (k.charAt(0) !== '.')
+				put(k, sec[k]);
+		});
+		put('main.cache_dir', uci.get('nordvpn', 'main', 'cache_dir'));
+		return snap;
+	},
+
+	// True when every option that differs between two snapshots is one the
+	// tunnel can take without reconnecting.
+	routingOnlyChange: function(before, after) {
+		var keys = Object.keys(before).concat(Object.keys(after));
+		return keys.every(function(k) {
+			return before[k] === after[k] || NO_RECONNECT_OPTS.indexOf(k) >= 0;
+		});
+	},
+
+	// Resolves with the same shape applyAsync() does. Tries the routing-only
+	// update first when the change allows it; the backend still refuses (and
+	// this falls back to a full apply) when the tunnel is not up with matching
+	// interface settings, e.g. the instance was disabled.
+	applySaved: function(routingOnly, p) {
+		if (!routingOnly) {
+			this.dismiss(p);
+			p = this.notice(_('Applying and reconnecting…'), 'info');
+			return this.applyAsync(this.instance).then(L.bind(function(res) {
+				this.dismiss(p);
+				return res;
+			}, this), L.bind(function(e) {
+				this.dismiss(p);
+				throw e;
+			}, this));
+		}
+		this.dismiss(p);
+		p = this.notice(_('Applying routing changes…'), 'info');
+		return callApplyRouting(this.instance).then(L.bind(function(res) {
+			if (res && res.needs_reconnect)
+				return this.applySaved(false, p);
+			this.dismiss(p);
+			return res || { error: _('no response') };
+		}, this), L.bind(function(e) {
+			this.dismiss(p);
+			throw e;
+		}, this));
+	},
+
 	save: function() {
 		// Require at least one location valid for the current hop mode; entries
 		// carried over from another mode (count null) do not count.
@@ -2584,7 +2659,9 @@ return view.extend({
 			this.notice(_('Internet check target "%s" is not an IPv4 address.').format(badTarget), 'error');
 			return Promise.resolve();
 		}
+		var before = this.optionSnapshot();
 		this.collectIntoUci();
+		var routingOnly = this.routingOnlyChange(before, this.optionSnapshot());
 		this.saveBtn.disabled = true;
 		this.discardBtn.disabled = true;
 		var p = this.notice(_('Saving configuration…'), 'info');
@@ -2594,14 +2671,15 @@ return view.extend({
 			.then(L.bind(function() {
 				this.dirty = false;
 				this.clearChangeIndicator();
-				this.dismiss(p);
-				p = this.notice(_('Applying and reconnecting…'), 'info');
-				return this.applyAsync(this.instance);
+				var q = p;
+				p = null;
+				return this.applySaved(routingOnly, q);
 			}, this))
 			.then(L.bind(function(res) {
-				this.dismiss(p);
 				if (res && res.error)
 					this.notice(_('Apply failed: %s').format(res.error), 'error');
+				else if (res && res.routing_only)
+					this.notice(_('Settings applied without reconnecting.'), 'info', 4000);
 				else if (res && res.state === 'success')
 					this.notice(_('Connected to %s').format(res.gateway || ''), 'info', 4000);
 				else if (res && res.state === 'partial_failure')

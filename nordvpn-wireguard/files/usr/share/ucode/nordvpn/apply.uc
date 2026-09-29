@@ -376,6 +376,66 @@ function apply(uci, instance) {
 	return res;
 }
 
+// Why the running tunnel cannot take the saved settings without a reconnect,
+// or null when it can. Routing, firewall and DNS objects are reconciled on
+// their own, but the interface itself carries the routing table, MTU and
+// autostart that write_relay() stamps; a mismatch there needs a full apply.
+function reconnect_reason(uci, iface, s) {
+	if (!s.enabled)
+		return 'instance is disabled';
+	if (!validate_wg_key(uci.get('network', iface, 'private_key')))
+		return 'no credentials configured';
+	if (!find_peer(uci, iface))
+		return 'no server applied yet';
+	if (uci.get('network', iface, 'auto') == '0')
+		return 'interface is disabled';
+	if ((uci.get('network', iface, 'ip4table') || '') != (s.routing_table || ''))
+		return 'routing table changed';
+	if ((uci.get('network', iface, 'mtu') || '') != (s.mtu ? '' + s.mtu : ''))
+		return 'MTU changed';
+	return null;
+}
+
+// Apply routing-only changes (steered/excluded devices, networks, domains,
+// kill switch, IPv6 block, DNS) without touching the tunnel: no peer rewrite
+// and no ifup, so connections through the VPN survive. The steering rules and
+// MARK rules are plain netifd/fw4 config, and a netifd reload leaves the
+// unchanged interface alone. Returns { ok, routing_only: true } or
+// { needs_reconnect: true, reason } when only a full apply() can do it.
+function apply_routing(uci, instance) {
+	let s = load_settings(uci, instance);
+	let iface = validate_interface(s.interface);
+	if (!iface)
+		return { error: 'invalid interface name' };
+	if (!managed_interface(uci, iface))
+		return { error: 'interface ' + iface + ' is not managed by nordvpn' };
+
+	let reason = reconnect_reason(uci, iface, s);
+	if (reason)
+		return { needs_reconnect: true, reason: reason };
+
+	// Never interleave with a full apply: it is about to reconcile the same
+	// objects (from the settings it read when it started) and restart the
+	// interface anyway.
+	let lock = _common.acquire_lock(APPLY_LOCK_FILE, APPLY_MAX_RUNTIME);
+	if (!lock)
+		return { needs_reconnect: true, reason: 'apply already running' };
+
+	let res;
+	try {
+		let routing = enforce_routing(uci, s);
+		if (commit_routing(uci, routing) && routing.changed_network)
+			restore_wan_default();
+		for (let note in routing.notes)
+			_common.log('routing: ' + note);
+		res = { ok: true, routing_only: true, interface: iface, notes: routing.notes };
+	} catch (e) {
+		res = { error: 'routing update failed: ' + e };
+	}
+	_common.release_lock(lock);
+	return res;
+}
+
 // ── Asynchronous apply (worker + status file) ────────────────────────
 // apply() is slow by nature: it reads the multi-megabyte server cache and then
 // waits verify_timeout seconds per candidate for a handshake — NordVPN
@@ -680,5 +740,5 @@ function delete_instance(uci, name) {
 	return { ok: true, deleted: name, interface: iface };
 }
 
-return { set_credentials, clear_credentials, current_peer, restore_peer, write_relay, bring_up, verify_handshake, connect_one, apply_event, apply, disconnect, create_instance, delete_instance, restore_wan_default,
+return { set_credentials, clear_credentials, current_peer, restore_peer, write_relay, bring_up, verify_handshake, connect_one, apply_event, apply, apply_routing, disconnect, create_instance, delete_instance, restore_wan_default,
 	write_apply_status, read_apply_status, apply_running, apply_status_report, run_apply, start_apply };

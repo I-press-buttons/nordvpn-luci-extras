@@ -277,6 +277,21 @@ methods.apply_start = {
 	}
 };
 
+// Routing-only apply for the UI: device, network and domain steering and
+// exceptions take effect without reconnecting the tunnel. Fast (no handshake
+// wait), so it runs inside the call; answers { needs_reconnect } when the
+// saved settings need a full apply_start instead.
+methods.apply_routing = {
+	args: { instance: '' },
+	call: function(request) {
+		let uci = cursor();
+		let name = req_instance(uci, request);
+		if (!name)
+			return { error: 'no such instance' };
+		return _apply.apply_routing(uci, name);
+	}
+};
+
 // Apply progress/outcome for the UI.
 methods.apply_status = {
 	call: function(request) {

@@ -21,7 +21,7 @@ policy-routing rules and firewall zones, and fixing things when a server dies.
 This project does all of that from one LuCI page:
 
 - **Easy setup.** Paste a NordVPN access token, choose countries, press
-  *Save and reconnect*. There are no config files to edit and no keys to copy
+  *Save and apply*. There are no config files to edit and no keys to copy
   around.
 - **Choose what goes through the VPN.** Send the whole LAN, only some
   networks, only some devices, or only some websites.
@@ -223,7 +223,13 @@ apk del dnsmasq && apk add ./dnsmasq-full-*.apk
 4. Leave **Server** on *Automatic*, or pin a specific server.
 5. Optionally turn on **Automatic rotation** and choose what to route under
    **Traffic routing**.
-6. Click **Save and reconnect**.
+6. Click **Save and apply**.
+
+Changing only what is routed (steered or excluded devices, networks and
+websites, the kill switch, IPv6 blocking, VPN DNS) or the rotation, watchdog
+and internet-check options updates the rules in place without reconnecting,
+so traffic already on the VPN is not interrupted. Server, location, hop mode,
+routing table, MTU and interface changes reconnect the tunnel.
 
 The page shows *configured* and *connected* as separate states: it only
 reports *Connected* once a real WireGuard handshake has happened.
@@ -304,11 +310,12 @@ ubus call nordvpn servers '{"locations":["de","nl-amsterdam"],"hop_mode":"single
 ubus call nordvpn refresh_status    # cache-refresh job progress
 ubus call nordvpn set_credentials '{"token":"<64-hex-token>"}'
 ubus call nordvpn apply             # rebuild the peer and bring the tunnel up
+ubus call nordvpn apply_routing     # re-apply routing/exceptions without reconnecting
 ubus call nordvpn rotate_now        # one-shot rotation
 ubus call nordvpn refresh_locations # start an async server-list refresh
 ```
 
-`status`, `apply`, `rotate_now` and `set_credentials` accept an `instance`
+`status`, `apply`, `apply_routing`, `rotate_now` and `set_credentials` accept an `instance`
 argument (default `main`). `create_instance` and `delete_instance` manage
 instances, and `nordvpn-rotate <name>` rotates one instance from the CLI.
 
