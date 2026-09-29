@@ -139,6 +139,7 @@ var STYLE = '' +
 	'.nv-pool-remove{color:#c0392b;font-weight:600}' +
 	'.nv-pool-remove:hover{background:rgba(192,57,43,.12)}' +
 	'.nv-pool-sep{border-top:1px solid var(--border-color-medium,#ddd);margin:.25em 0}' +
+	'.nv-pool-label{padding:.2em .5em;font-size:.85em;font-weight:600;color:var(--text-color-medium,#666)}' +
 	'.nv-chip-add{font-weight:700;padding:0 .15em}' +
 	// Server picker: same panel, plus a load dot (green/amber/red), a group
 	// header per country and quick "Automatic / Lowest load" rows at the top.
@@ -2027,7 +2028,7 @@ return view.extend({
 				click: L.bind(function(ev) { ev.stopPropagation(); this.poolClosePanel(); }, this) }, '✕')
 		]));
 		var filt = E('input', { type: 'text', class: 'cbi-input-text nv-pool-filter',
-			placeholder: _('Filter') + '…', value: this._poolFilter });
+			placeholder: _('Search countries or cities') + '…', value: this._poolFilter });
 		filt.addEventListener('input', L.bind(function() {
 			this._poolFilter = filt.value;
 			this.poolRenderCountryList();
@@ -2037,7 +2038,13 @@ return view.extend({
 		this._poolListEl = E('div', {});
 		panel.appendChild(this._poolListEl);
 		this.poolRenderCountryList();
-		setTimeout(function() { try { filt.focus(); } catch (e) {} }, 0);
+		// The panel re-renders after every pick; keep typing where it left off.
+		setTimeout(function() {
+			try {
+				filt.focus();
+				filt.setSelectionRange(filt.value.length, filt.value.length);
+			} catch (e) {}
+		}, 0);
 	},
 
 	// Country rows, filtered. Mark: whole = check, partial = half, none = blank.
@@ -2064,6 +2071,36 @@ return view.extend({
 					E('span', { class: 'chev' }, '›')
 				]));
 		}, this));
+
+		// While filtering, cities match too, across every country, so a city can
+		// be found without knowing its country. Clicking one adds just that city
+		// (or drops it again); the panel stays open for more picks.
+		var cityRows = [];
+		if (f) {
+			var key = this.hopCountKey();
+			this.filteredCountries().forEach(L.bind(function(c) {
+				var st = this.poolCountryHas(c.code);
+				var flag = this.countryFlag(c.code);
+				(c.cities || []).forEach(L.bind(function(city) {
+					if ((city.name || '').toLowerCase().indexOf(f) < 0)
+						return;
+					var on = st.whole || !!st.cities[city.code];
+					cityRows.push(E('div', { class: 'nv-pool-row',
+						click: L.bind(function(ev) { ev.stopPropagation(); this.poolToggleCity(c.code, city.code); }, this) }, [
+							E('span', { class: 'box' }, on ? '☑' : '☐'),
+							E('span', { class: 'grow' }, (flag ? flag + ' ' : '') +
+								'%s, %s (%d)'.format(city.name, c.name, city[key] || 0))
+						]));
+				}, this));
+			}, this));
+		}
+		if (cityRows.length) {
+			if (any)
+				el.appendChild(E('div', { class: 'nv-pool-sep' }));
+			el.appendChild(E('div', { class: 'nv-pool-label' }, _('Cities')));
+			cityRows.forEach(function(r) { el.appendChild(r); });
+			any = true;
+		}
 		if (!any)
 			el.appendChild(E('div', { class: 'nv-pool-row is-in' }, _('No matches')));
 	},
