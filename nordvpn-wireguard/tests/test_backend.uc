@@ -1733,6 +1733,87 @@ write_cache(cache, cpath);
 	ok('fw4: second run changes nothing', !enforce_routing(cursor(), load_settings(cursor(), 'main'), { nftset: true }).changed_firewall);
 }
 
+// DNS lock: with "Route all LAN" and NordVPN DNS, dnsmasq forwards only to the
+// NordVPN resolvers (nordvpn.com names excepted, via the WAN's resolver), and
+// everything is restored when routing or VPN DNS is turned off.
+{
+	let mk = function(extra) {
+		let main = { '.type': 'instance', interface: 'nordvpn', enabled: '1', auto_routing: '1',
+			routing_table: 'nordvpn', vpn_dns: 'standard' };
+		for (let k in extra)
+			main[k] = extra[k];
+		return {
+			nordvpn: { main: main },
+			network: {
+				lan: { '.type': 'interface', device: 'br-lan', proto: 'static', ipaddr: '192.168.1.1', netmask: '255.255.255.0' },
+				wan: { '.type': 'interface', device: 'wan', proto: 'dhcp' },
+				nordvpn: { '.type': 'interface', proto: 'wireguard', private_key: KEY, vpn_type: 'nordvpn' },
+				p1: { '.type': 'wireguard_nordvpn', interface: 'nordvpn', endpoint_host: 'x.nordvpn.com' }
+			},
+			firewall: {
+				zlan: { '.type': 'zone', name: 'lan', network: [ 'lan' ] },
+				zwan: { '.type': 'zone', name: 'wan', masq: '1', network: [ 'wan' ] }
+			},
+			dhcp: { dm: { '.type': 'dnsmasq', server: [ '/home.lan/192.168.1.5' ] } }
+		};
+	};
+	let o = { nftset: true, wan_dns: [ '192.168.10.166' ] };
+	let dm = function() { return global.MOCK_UCI.dhcp.dm; };
+	let ks = function() {
+		let out = [];
+		for (let k, v in global.MOCK_UCI.network)
+			if (v.nordvpn_role == 'dns_ks')
+				push(out, v.dest);
+		return sort(out);
+	};
+
+	global.MOCK_UCI = mk({});
+	let res = enforce_routing(cursor(), load_settings(cursor(), 'main'), o);
+	ok('dns lock: reported and dnsmasq restarted', res.dns_locked && res.changed_dhcp);
+	eq('dns lock: resolv file ignored', dm().noresolv, '1');
+	eq('dns lock: only NordVPN resolvers, nordvpn.com via WAN, own entries kept', dm().server,
+		[ '/home.lan/192.168.1.5', '103.86.96.100', '103.86.99.100', '/nordvpn.com/192.168.10.166' ]);
+	eq('dns lock: blocked while the tunnel is down', ks(), [ '103.86.96.100/32', '103.86.99.100/32' ]);
+	ok('dns lock: idempotent', !enforce_routing(cursor(), load_settings(cursor(), 'main'), o).changed_dhcp);
+
+	// Switching to Threat Protection swaps the resolvers.
+	global.MOCK_UCI.nordvpn.main.vpn_dns = 'threat';
+	enforce_routing(cursor(), load_settings(cursor(), 'main'), o);
+	eq('dns lock: threat protection resolvers', dm().server,
+		[ '/home.lan/192.168.1.5', '103.86.96.96', '103.86.99.99', '/nordvpn.com/192.168.10.166' ]);
+
+	// Turning VPN DNS off restores dnsmasq exactly.
+	global.MOCK_UCI.nordvpn.main.vpn_dns = 'off';
+	enforce_routing(cursor(), load_settings(cursor(), 'main'), o);
+	eq('dns lock: released, previous state restored',
+		[ dm().noresolv, dm().server, dm().nordvpn_dns_lock, dm().nordvpn_dns_servers ],
+		[ null, [ '/home.lan/192.168.1.5' ], null, null ]);
+	eq('dns lock: no DNS block rules left', ks(), []);
+
+	// A user's own noresolv=1 survives the lock and its release.
+	global.MOCK_UCI = mk({});
+	global.MOCK_UCI.dhcp.dm.noresolv = '1';
+	global.MOCK_UCI.dhcp.dm.server = [ '9.9.9.9' ];
+	res = enforce_routing(cursor(), load_settings(cursor(), 'main'), o);
+	ok('dns lock: warns about the user\'s own upstream', index(join(' ', res.notes), '9.9.9.9') >= 0);
+	global.MOCK_UCI.nordvpn.main.auto_routing = '0';
+	enforce_routing(cursor(), load_settings(cursor(), 'main'), o);
+	eq('dns lock: user noresolv and server kept after release', [ dm().noresolv, dm().server ], [ '1', [ '9.9.9.9' ] ]);
+
+	// No WAN resolvers known: no lock (reconnecting would need them).
+	global.MOCK_UCI = mk({});
+	res = enforce_routing(cursor(), load_settings(cursor(), 'main'), { nftset: true, wan_dns: [] });
+	ok('dns lock: skipped without WAN resolvers, with a note', !res.dns_locked && dm().noresolv == null &&
+		index(join(' ', res.notes), 'WAN DNS') >= 0);
+
+	// Disabling the instance releases it.
+	global.MOCK_UCI = mk({});
+	enforce_routing(cursor(), load_settings(cursor(), 'main'), o);
+	global.MOCK_UCI.nordvpn.main.enabled = '0';
+	enforce_routing(cursor(), load_settings(cursor(), 'main'), o);
+	eq('dns lock: disabled instance releases it', [ dm().noresolv, dm().nordvpn_dns_lock ], [ null, null ]);
+}
+
 unlink(cpath);
 printf('\n%s\n', fails ? ('FAILURES: ' + fails) : 'ALL PHASE-3 TESTS PASSED');
 exit(fails ? 1 : 0);

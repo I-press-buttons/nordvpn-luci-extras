@@ -720,6 +720,101 @@ function reconcile_domain_dns(uci, iface, setname, domains, role) {
 	return changed;
 }
 
+// Resolvers the WAN networks hand out (netifd's dns-server, plus any static
+// `dns` option), IPv4/IPv6 literals only. `wan_zone` null -> none. Empty
+// off-device.
+function wan_resolvers(uci, wan_zone) {
+	let out = [];
+	for (let net in (wan_zone ? zone_networks(uci, wan_zone) : [])) {
+		if (!_common.validate_interface(net))
+			continue;
+		let list = [];
+		let r = run([ 'ubus', 'call', 'network.interface.' + net, 'status' ], true);
+		if (r.code == 0) {
+			try {
+				let st = json(r.stdout);
+				if (st && type(st['dns-server']) == 'array')
+					list = st['dns-server'];
+			} catch (e) {}
+		}
+		for (let d in as_list(uci.get('network', net, 'dns')))
+			push(list, d);
+		for (let ip in list)
+			if (type(ip) == 'string' && (_common.validate_ipv4(ip) || match(ip, /^[0-9A-Fa-f:]+$/) && index(ip, ':') >= 0) &&
+			    index(out, ip) < 0)
+				push(out, ip);
+	}
+	return out;
+}
+
+// DNS lock on the (first) dnsmasq instance: with `want` a server list,
+// dnsmasq stops reading the resolv file netifd writes (it merges the WAN's
+// resolvers with the tunnel's, and dnsmasq keeps probing all of them, so
+// lookups would leak to the WAN's resolver) and forwards only to `want`.
+// With `want` null the lock is released and the previous state restored.
+// Only the servers we added are touched; the user's own stay. One instance
+// holds the lock (nordvpn_dns_lock). Returns { changed, notes }.
+function reconcile_dns_lock(uci, iface, want) {
+	let notes = [];
+	let sec = null;
+	uci.foreach('dhcp', 'dnsmasq', function(x) {
+		sec = x['.name'];
+		return false;
+	});
+	if (!sec) {
+		if (want)
+			push(notes, 'no dnsmasq instance found; DNS not locked to the VPN');
+		return { changed: false, notes: notes };
+	}
+	let holder = uci.get('dhcp', sec, 'nordvpn_dns_lock');
+	if (holder && holder != iface) {
+		if (want)
+			push(notes, 'DNS is already locked by ' + holder);
+		return { changed: false, notes: notes };
+	}
+	let ours = as_list(uci.get('dhcp', sec, 'nordvpn_dns_servers'));
+	let cur = as_list(uci.get('dhcp', sec, 'server'));
+	let theirs = filter(cur, (x) => index(ours, x) < 0);
+	let changed = false;
+	let set_list = function(opt, list) {
+		if (sprintf('%J', as_list(uci.get('dhcp', sec, opt))) == sprintf('%J', list))
+			return;
+		if (length(list))
+			uci.set('dhcp', sec, opt, list);
+		else
+			uci.delete('dhcp', sec, opt);
+		changed = true;
+	};
+	if (want) {
+		if (!holder) {
+			uci.set('dhcp', sec, 'nordvpn_noresolv_prev', uci.get('dhcp', sec, 'noresolv') || '');
+			uci.set('dhcp', sec, 'nordvpn_dns_lock', iface);
+			changed = true;
+		}
+		if (uci.get('dhcp', sec, 'noresolv') != '1') {
+			uci.set('dhcp', sec, 'noresolv', '1');
+			changed = true;
+		}
+		set_list('server', [ ...theirs, ...want ]);
+		set_list('nordvpn_dns_servers', want);
+		let plain = filter(theirs, (x) => substr(x, 0, 1) != '/');
+		if (length(plain))
+			push(notes, 'dnsmasq also forwards to your own servers (' + join(', ', plain) + '); those lookups bypass the VPN');
+	} else if (holder == iface) {
+		let prev = uci.get('dhcp', sec, 'nordvpn_noresolv_prev');
+		if (prev == null || prev == '')
+			uci.delete('dhcp', sec, 'noresolv');
+		else
+			uci.set('dhcp', sec, 'noresolv', prev);
+		set_list('server', theirs);
+		uci.delete('dhcp', sec, 'nordvpn_dns_servers');
+		uci.delete('dhcp', sec, 'nordvpn_noresolv_prev');
+		uci.delete('dhcp', sec, 'nordvpn_dns_lock');
+		changed = true;
+	}
+	return { changed: changed, notes: notes };
+}
+
 // Reconcile stamped firewall forwardings (into the instance zone) with the
 // desired source-zone list. Returns true on change.
 function reconcile_forwardings(uci, iface, dest_zone, want_srcs) {
@@ -1353,8 +1448,45 @@ function enforce(uci, s, opts) {
 	}, 'nordvpn_key'))
 		cn = true;
 
+	// 5c. DNS lock for the instance routing all LAN traffic: dnsmasq forwards
+	//     only to the NordVPN resolvers (see reconcile_dns_lock), except that
+	//     nordvpn.com names keep using the WAN's resolvers, so the router can
+	//     still resolve server hostnames to reconnect or rotate while the
+	//     tunnel is down. Excluded devices resolve through the VPN as well
+	//     (their traffic itself still goes direct).
+	let lock = null;
+	if ((auto || !!all_lan) && mode && VPN_DNS[mode]) {
+		let wans = (opts && opts.wan_dns != null) ? opts.wan_dns : wan_resolvers(uci, det.wan_zone);
+		wans = filter(wans, (ip) => index(split(VPN_DNS[mode], ' '), ip) < 0);
+		if (!length(wans))
+			push(notes, 'could not find the WAN DNS servers; DNS not locked to the VPN');
+		else {
+			lock = split(VPN_DNS[mode], ' ');
+			for (let ip in wans)
+				push(lock, '/nordvpn.com/' + ip);
+		}
+	}
+	let dl = reconcile_dns_lock(uci, iface, lock);
+	if (dl.changed)
+		cd = true;
+	for (let n in dl.notes)
+		push(notes, n);
+	// With dnsmasq pinned to the NordVPN resolvers, a tunnel that is down
+	// would send those queries out of the WAN (the instance table is empty
+	// then, so the lookup above falls through to main). Block them instead.
+	// In the main-table variant of "Route all LAN" the tunnel's default and
+	// the WAN's share that table, so there is no rule to tell them apart.
+	let dns_ks = [];
+	if (lock && steer)
+		for (let ip in split(VPN_DNS[mode], ' '))
+			push(dns_ks, ip + '/32');
+	if (reconcile_rules(uci, 'rule', 'dns_ks', iface, dns_ks, function(ip) {
+		return { dest: ip, action: 'prohibit', priority: '19501' };
+	}, 'dest'))
+		cn = true;
+
 	return { changed_network: cn, changed_firewall: cf, changed_dhcp: cd,
-		domains_active: length(steer_doms) > 0 || length(byp_doms) > 0, notes: notes };
+		domains_active: length(steer_doms) > 0 || length(byp_doms) > 0, dns_locked: lock != null, notes: notes };
 }
 
 return { detect, enforce, find_wan_zone, find_lan_zone, count_user_routes, recommend_mtu,

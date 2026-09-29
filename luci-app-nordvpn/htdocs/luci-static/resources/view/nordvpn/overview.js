@@ -1280,7 +1280,7 @@ return view.extend({
 				this.v6Warn
 			]);
 			this.dnsRow = this.row(_('DNS'), [ this.dnsSel ],
-				_('Which resolver to use while connected. Threat Protection blocks ads and malware at the DNS level; both NordVPN options only work through the tunnel.'));
+				_('Which resolver to use while connected. Threat Protection blocks ads and malware at the DNS level; both NordVPN options only work through the tunnel. With "Route all LAN traffic", the router then forwards every lookup only to NordVPN (so none leak to your provider\'s resolver), and lookups fail while the tunnel is down.'));
 			body.appendChild(this.ksRow);
 			body.appendChild(this.v6Row);
 			body.appendChild(this.dnsRow);

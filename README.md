@@ -400,7 +400,13 @@ On every apply the backend first works out which routing mode applies:
   sets it on several anyway, the first one (main first) wins and the rest
   log a note and fall back to their steering. The kill switch and IPv6 rules
   belong to the instance that created them, so applying or deleting another
-  instance never removes them.
+  instance never removes them. With a NordVPN DNS option on, that instance
+  also locks dnsmasq to NordVPN's resolvers (`noresolv` plus stamped
+  `server` entries): otherwise dnsmasq keeps probing the WAN's resolvers too,
+  and some lookups leak to them. `nordvpn.com` names still go to the WAN's
+  resolvers, so the router can reconnect while the tunnel is down; everything
+  else is blocked then. Your own dnsmasq settings are restored when the lock
+  is released (routing or VPN DNS off, instance disabled or deleted).
 - **Steered.** Policy rules send only the selected traffic into the
   instance's routing table:
   - **Networks:** `in <network> lookup <table>` at priority 20000.
