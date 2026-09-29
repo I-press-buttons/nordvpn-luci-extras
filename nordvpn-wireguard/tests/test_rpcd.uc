@@ -11,6 +11,7 @@ const _cache = require('nordvpn.cache');
 const normalize = _cache.normalize, write_cache = _cache.write_cache;
 const _common = require('nordvpn.common');
 const _apply_mod = require('nordvpn.apply');
+const _creds = require('nordvpn.credentials');
 import { cursor } from 'uci';
 
 // Our own pid: the one process guaranteed alive while the apply-status
@@ -240,6 +241,88 @@ ok('create rejects bad name', m.create_instance.call({ args: { instance: 'no way
 eq('instances lists both', length(m.instances.call().instances), 2);
 ok('delete_instance ok', m.delete_instance.call({ args: { instance: 'extra' } }).ok == true);
 eq('instances back to one', length(m.instances.call().instances), 1);
+
+// credential bank: shared 'default' key, named extras, migration, sync
+{
+	const _api = require('nordvpn.api');
+	const real_key = _api.get_private_key;
+	const KEY2 = sprintf('%042dY=', 2);
+	let next_key = KEY;
+	_api.get_private_key = function(token) { return { private_key: next_key }; };
+	let tok = sprintf('%064d', 7);
+	let saved_uci = global.MOCK_UCI;
+
+	// An upgrade: two instances with the same key, one with its own.
+	global.MOCK_UCI = {
+		nordvpn: {
+			main: { '.type': 'instance', interface: 'nordvpn', cache_dir: cdir },
+			tv: { '.type': 'instance', interface: 'nv_tv' },
+			work: { '.type': 'instance', interface: 'nv_work' }
+		},
+		network: {
+			nordvpn: { '.type': 'interface', proto: 'wireguard', private_key: KEY, vpn_type: 'nordvpn' },
+			nv_tv: { '.type': 'interface', proto: 'wireguard', private_key: KEY, vpn_type: 'nordvpn' },
+			nv_work: { '.type': 'interface', proto: 'wireguard', private_key: KEY2, vpn_type: 'nordvpn' }
+		}
+	};
+	let b = m.credentials.call().credentials;
+	eq('before migration: default listed, not configured', [ b[0].id, b[0].name, b[0].configured ], [ 'default', 'Default', false ]);
+	ok('migration ran', _creds.migrate(cursor()) == true);
+	ok('migration is idempotent', _creds.migrate(cursor()) == false);
+	eq('main key became Default', global.MOCK_UCI.nordvpn_credentials['default'].private_key, KEY);
+	eq('same key shares default', global.MOCK_UCI.nordvpn.tv.credential, null);
+	eq('a different key gets its own entry', global.MOCK_UCI.nordvpn.work.credential, 'work');
+	eq('the entry holds that key', global.MOCK_UCI.nordvpn_credentials.work.private_key, KEY2);
+	b = m.credentials.call().credentials;
+	eq('bank lists default then work', map(b, (e) => e.id), [ 'default', 'work' ]);
+	eq('usage per entry', map(b, (e) => e.instances), [ [ 'main', 'tv' ], [ 'work' ] ]);
+	ok('the bank never returns a key', index(sprintf('%J', b), KEY) < 0 && index(sprintf('%J', b), KEY2) < 0);
+
+	// New instances default to the shared credentials.
+	let r = m.create_instance.call({ args: { instance: 'media' } });
+	ok('new instance uses default and is configured', r.ok == true && r.credential == 'default' && r.configured == true);
+	eq('its interface carries the default key', global.MOCK_UCI.network.nv_media.private_key, KEY);
+	eq('it is a managed wireguard interface',
+		[ global.MOCK_UCI.network.nv_media.proto, global.MOCK_UCI.network.nv_media.vpn_type ], [ 'wireguard', 'nordvpn' ]);
+	r = m.create_instance.call({ args: { instance: 'lab', credential: 'work' } });
+	ok('an instance can start on another entry', r.ok == true && global.MOCK_UCI.network.nv_lab.private_key == KEY2);
+	ok('an unknown entry is refused and nothing is created',
+		m.create_instance.call({ args: { instance: 'ghost', credential: 'nope' } }).error != null && global.MOCK_UCI.nordvpn.ghost == null);
+
+	// Replacing the default key reaches every instance on it, and only those.
+	next_key = sprintf('%042dZ=', 3);
+	r = m.set_credentials.call({ args: { token: tok, credential: 'default' } });
+	ok('replace default ok', r.ok == true && r.name == 'Default');
+	eq('all default users follow',
+		[ global.MOCK_UCI.network.nordvpn.private_key, global.MOCK_UCI.network.nv_tv.private_key, global.MOCK_UCI.network.nv_media.private_key ],
+		[ next_key, next_key, next_key ]);
+	eq('other entries are untouched', global.MOCK_UCI.network.nv_work.private_key, KEY2);
+
+	// Adding a named entry; names are unique.
+	next_key = sprintf('%042dW=', 4);
+	r = m.set_credentials.call({ args: { token: tok, name: 'Family plan' } });
+	ok('named entry added', r.ok == true && r.credential == 'family_plan' && r.name == 'Family plan');
+	ok('a duplicate name is refused', m.set_credentials.call({ args: { token: tok, name: 'family PLAN' } }).error != null);
+	ok('an unknown entry is refused', m.set_credentials.call({ args: { token: tok, credential: 'nope' } }).error != null);
+
+	// Switching an instance to another entry takes effect on sync (apply).
+	global.MOCK_UCI.nordvpn.tv.credential = 'family_plan';
+	eq('sync reports the change', _creds.sync_instance(cursor(), 'tv'), 'set');
+	eq('the instance now has that key', global.MOCK_UCI.network.nv_tv.private_key, next_key);
+
+	// Removing: in-use entries are refused, unused ones go, default keeps its name.
+	ok('an entry in use cannot be removed', index(m.remove_credentials.call({ args: { credential: 'family_plan' } }).error || '', 'tv') >= 0);
+	delete global.MOCK_UCI.nordvpn.tv.credential;
+	ok('an unused entry is removed', m.remove_credentials.call({ args: { credential: 'family_plan' } }).ok == true &&
+		global.MOCK_UCI.nordvpn_credentials.family_plan == null);
+	ok('removing default drops only its key', m.remove_credentials.call({ args: { credential: 'default' } }).ok == true &&
+		global.MOCK_UCI.nordvpn_credentials['default'].name == 'Default' && global.MOCK_UCI.nordvpn_credentials['default'].private_key == null);
+	eq('default users lose the key', [ global.MOCK_UCI.network.nordvpn.private_key, global.MOCK_UCI.network.nv_media.private_key ], [ null, null ]);
+	eq('others keep theirs', global.MOCK_UCI.network.nv_work.private_key, KEY2);
+
+	_api.get_private_key = real_key;
+	global.MOCK_UCI = saved_uci;
+}
 
 // deleting 'main' resets it to defaults instead of removing the section
 global.MOCK_UCI = { nordvpn: { main: { '.type': 'settings', interface: 'nordvpn',

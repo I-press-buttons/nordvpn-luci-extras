@@ -129,4 +129,9 @@ fi
 
 [ -n "$(uci -q changes "$pkg")" ] && uci commit "$pkg"
 
+# Move per-interface keys into the shared credential bank
+# (/etc/config/nordvpn_credentials): main's key becomes 'Default', any
+# instance with a different key gets its own entry. Idempotent.
+ucode -e 'require("nordvpn.credentials").migrate(require("uci").cursor());' 2>/dev/null
+
 exit 0

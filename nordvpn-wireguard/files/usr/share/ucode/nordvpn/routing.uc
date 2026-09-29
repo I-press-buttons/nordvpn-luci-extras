@@ -130,6 +130,59 @@ function find_managed(uci, sectype, role, iface) {
 	return found;
 }
 
+// The automatic kill switch / IPv6 block of instance `iface`. Rules from
+// before they were owned per instance carry no nordvpn_iface; those are
+// returned too (legacy: true) so the owner can adopt them.
+function find_owned(uci, role, iface) {
+	let own = find_managed(uci, 'rule', role, iface);
+	if (own)
+		return { name: own, legacy: false };
+	let legacy = null;
+	uci.foreach('firewall', 'rule', function(sec) {
+		if (sec[MARK] == '1' && sec[ROLE] == role && !sec.nordvpn_iface) {
+			legacy = sec['.name'];
+			return false;
+		}
+	});
+	return legacy ? { name: legacy, legacy: true } : null;
+}
+
+// Whether instance `iface` has its automatic `role` rule: its own, or an
+// unowned legacy one while it is the instance routing all LAN traffic.
+function owned_here(uci, role, iface, auto) {
+	let f = find_owned(uci, role, iface);
+	return f != null && (!f.legacy || !!auto);
+}
+
+// The instance that routes all LAN traffic, as seen by instance `name`: the
+// first enabled instance (main first) with "Route all LAN traffic" on that
+// comes before `name`. Only one instance can own the LAN's default path —
+// two would race for the same default route or policy-rule priority and one
+// tunnel would silently carry everything. null when `name` may have it.
+function all_lan_owner(uci, name) {
+	for (let n in _common.list_instances(uci)) {
+		if (n == name)
+			return null;
+		let o = _common.load_settings(uci, n);
+		if (o.enabled && o.auto_routing)
+			return n;
+	}
+	return null;
+}
+
+// True when an enabled instance other than `skip` has "Route all LAN
+// traffic" on.
+function any_all_lan(uci, skip) {
+	for (let n in _common.list_instances(uci)) {
+		if (n == skip)
+			continue;
+		let o = _common.load_settings(uci, n);
+		if (o.enabled && o.auto_routing)
+			return true;
+	}
+	return false;
+}
+
 // ── Local subnets (steering bypass) ──────────────────────────────────
 // A steered table's default swallows traffic to OTHER local subnets too, so
 // LAN↔VLAN and LAN↔tunnel-services connectivity would silently die. Steering
@@ -667,6 +720,101 @@ function reconcile_domain_dns(uci, iface, setname, domains, role) {
 	return changed;
 }
 
+// Resolvers the WAN networks hand out (netifd's dns-server, plus any static
+// `dns` option), IPv4/IPv6 literals only. `wan_zone` null -> none. Empty
+// off-device.
+function wan_resolvers(uci, wan_zone) {
+	let out = [];
+	for (let net in (wan_zone ? zone_networks(uci, wan_zone) : [])) {
+		if (!_common.validate_interface(net))
+			continue;
+		let list = [];
+		let r = run([ 'ubus', 'call', 'network.interface.' + net, 'status' ], true);
+		if (r.code == 0) {
+			try {
+				let st = json(r.stdout);
+				if (st && type(st['dns-server']) == 'array')
+					list = st['dns-server'];
+			} catch (e) {}
+		}
+		for (let d in as_list(uci.get('network', net, 'dns')))
+			push(list, d);
+		for (let ip in list)
+			if (type(ip) == 'string' && (_common.validate_ipv4(ip) || match(ip, /^[0-9A-Fa-f:]+$/) && index(ip, ':') >= 0) &&
+			    index(out, ip) < 0)
+				push(out, ip);
+	}
+	return out;
+}
+
+// DNS lock on the (first) dnsmasq instance: with `want` a server list,
+// dnsmasq stops reading the resolv file netifd writes (it merges the WAN's
+// resolvers with the tunnel's, and dnsmasq keeps probing all of them, so
+// lookups would leak to the WAN's resolver) and forwards only to `want`.
+// With `want` null the lock is released and the previous state restored.
+// Only the servers we added are touched; the user's own stay. One instance
+// holds the lock (nordvpn_dns_lock). Returns { changed, notes }.
+function reconcile_dns_lock(uci, iface, want) {
+	let notes = [];
+	let sec = null;
+	uci.foreach('dhcp', 'dnsmasq', function(x) {
+		sec = x['.name'];
+		return false;
+	});
+	if (!sec) {
+		if (want)
+			push(notes, 'no dnsmasq instance found; DNS not locked to the VPN');
+		return { changed: false, notes: notes };
+	}
+	let holder = uci.get('dhcp', sec, 'nordvpn_dns_lock');
+	if (holder && holder != iface) {
+		if (want)
+			push(notes, 'DNS is already locked by ' + holder);
+		return { changed: false, notes: notes };
+	}
+	let ours = as_list(uci.get('dhcp', sec, 'nordvpn_dns_servers'));
+	let cur = as_list(uci.get('dhcp', sec, 'server'));
+	let theirs = filter(cur, (x) => index(ours, x) < 0);
+	let changed = false;
+	let set_list = function(opt, list) {
+		if (sprintf('%J', as_list(uci.get('dhcp', sec, opt))) == sprintf('%J', list))
+			return;
+		if (length(list))
+			uci.set('dhcp', sec, opt, list);
+		else
+			uci.delete('dhcp', sec, opt);
+		changed = true;
+	};
+	if (want) {
+		if (!holder) {
+			uci.set('dhcp', sec, 'nordvpn_noresolv_prev', uci.get('dhcp', sec, 'noresolv') || '');
+			uci.set('dhcp', sec, 'nordvpn_dns_lock', iface);
+			changed = true;
+		}
+		if (uci.get('dhcp', sec, 'noresolv') != '1') {
+			uci.set('dhcp', sec, 'noresolv', '1');
+			changed = true;
+		}
+		set_list('server', [ ...theirs, ...want ]);
+		set_list('nordvpn_dns_servers', want);
+		let plain = filter(theirs, (x) => substr(x, 0, 1) != '/');
+		if (length(plain))
+			push(notes, 'dnsmasq also forwards to your own servers (' + join(', ', plain) + '); those lookups bypass the VPN');
+	} else if (holder == iface) {
+		let prev = uci.get('dhcp', sec, 'nordvpn_noresolv_prev');
+		if (prev == null || prev == '')
+			uci.delete('dhcp', sec, 'noresolv');
+		else
+			uci.set('dhcp', sec, 'noresolv', prev);
+		set_list('server', theirs);
+		uci.delete('dhcp', sec, 'nordvpn_dns_servers');
+		uci.delete('dhcp', sec, 'nordvpn_noresolv_prev');
+		uci.delete('dhcp', sec, 'nordvpn_dns_lock');
+		changed = true;
+	}
+	return { changed: changed, notes: notes };
+}
+
 // Reconcile stamped firewall forwardings (into the instance zone) with the
 // desired source-zone list. Returns true on change.
 function reconcile_forwardings(uci, iface, dest_zone, want_srcs) {
@@ -733,9 +881,13 @@ function detect(uci, s, runtime) {
 	let peer = find_peer(uci, iface);
 	let steering = length(s.source_networks || []) > 0 || length(s.source_devices || []) > 0 ||
 		length(s.source_domains || []) > 0;
+	// "Route all LAN traffic" already owned by an earlier instance: this one
+	// falls back to its steering (or none) and reports who holds it.
+	let owner = s.auto_routing ? all_lan_owner(uci, s.name) : null;
+	let auto = s.auto_routing && !owner;
 	// Exceptions only mean something while traffic is routed at all; with
 	// "Route all LAN traffic" they move it onto the steered machinery.
-	let exceptions = (s.auto_routing || steering) &&
+	let exceptions = (auto || steering) &&
 		(length(s.bypass_devices || []) > 0 || length(s.bypass_domains || []) > 0);
 	// With steering active, extra user routes INSIDE the instance's table are
 	// legitimate companions (e.g. a media→LAN route); only routes referencing
@@ -751,7 +903,8 @@ function detect(uci, s, runtime) {
 
 	let wanmtu = runtime ? wan_l3_mtu(uci) : null;
 	return {
-		mode: manual ? 'manual' : (s.auto_routing ? 'auto' : (steering ? 'steered' : 'none')),
+		mode: manual ? 'manual' : (auto ? 'auto' : (steering ? 'steered' : 'none')),
+		all_lan_owner: owner,
 		zone: zone ? zone.name : null,
 		zone_managed: zone ? zone.managed : false,
 		user_routes: user_routes,
@@ -765,9 +918,9 @@ function detect(uci, s, runtime) {
 		domain_steering: (runtime && (length(s.source_domains || []) > 0 || length(s.bypass_domains || []) > 0))
 			? (nftset_supported() ? 'ok' : 'unsupported') : null,
 		route_allowed_ips: peer ? (uci.get('network', peer, 'route_allowed_ips') == '1') : false,
-		killswitch: find_managed(uci, 'rule', 'killswitch') != null ||
+		killswitch: owned_here(uci, 'killswitch', iface, auto) ||
 			length(find_managed_rules(uci, 'rule', 'steer_ks', iface)) > 0,
-		ipv6_block: find_managed(uci, 'rule', 'ipv6block') != null ||
+		ipv6_block: owned_here(uci, 'ipv6block', iface, auto) ||
 			length(find_managed_rules(uci, 'rule6', 'steer_v6', iface)) > 0,
 		wan_zone: find_wan_zone(uci),
 		lan_zone: find_lan_zone(uci),
@@ -797,6 +950,8 @@ function enforce(uci, s, opts) {
 	let active = (s.enabled == null) ? true : !!s.enabled;
 	let auto = (det.mode == 'auto') && active;
 	let steer = (det.mode == 'steered') && active;
+	if (det.all_lan_owner && active)
+		push(notes, 'route all LAN traffic is already enabled on instance ' + det.all_lan_owner + '; not applied here');
 	let has_table = s.routing_table != null && s.routing_table != '';
 	if (steer && !has_table) {
 		push(notes, 'steering needs a routing table; set one for this instance');
@@ -917,6 +1072,10 @@ function enforce(uci, s, opts) {
 			push(notes, 'device steering needs a routing table with an id of 1-255; ' + table + ' has none');
 			steer_devs = [];
 		}
+		if (!det.lan_zone && length(steer_devs)) {
+			push(notes, 'device steering: could not determine the LAN zone');
+			steer_devs = [];
+		}
 	}
 	// 1b''. Domain steering: dnsmasq resolves the listed domains into a fw4
 	//       nft set, and one MARK rule gives packets to those addresses the
@@ -945,7 +1104,7 @@ function enforce(uci, s, opts) {
 	}, 'name', 'firewall'))
 		cf = true;
 	if (reconcile_rules(uci, 'rule', 'domain_mark', iface, dom_sets, function(n) {
-		return { name: 'NordVPN domains ' + iface, src: det.lan_zone, ipset: n, family: 'ipv4',
+		return { name: 'NordVPN domains ' + iface, src: det.lan_zone, dest: '*', ipset: n, family: 'ipv4',
 			proto: 'all', target: 'MARK', set_xmark: mark };
 	}, 'ipset', 'firewall'))
 		cf = true;
@@ -954,22 +1113,18 @@ function enforce(uci, s, opts) {
 
 	let marks = (mark && (length(steer_devs) || length(steer_doms))) ? [ mark ] : [];
 	if (reconcile_rules(uci, 'rule', 'device_mark', iface, steer_devs, function(mac) {
-		return { name: 'NordVPN device ' + mac, src: '*', src_mac: mac, proto: 'all',
+		return { name: 'NordVPN device ' + mac, src: det.lan_zone, dest: '*', src_mac: mac, proto: 'all',
 			target: 'MARK', set_xmark: mark };
 	}, 'src_mac', 'firewall'))
 		cf = true;
-	// A table change moves the mark: rewrite MARK rules carrying a stale one
-	// (and a domain rule whose LAN zone was renamed).
+	// A table change moves the mark: rewrite MARK rules carrying a stale one.
+	// (A renamed LAN zone is handled with the zone fix-up further down.)
 	if (length(marks))
 		uci.foreach('firewall', 'rule', function(sec) {
 			if (sec[MARK] != '1' || sec.nordvpn_iface != iface)
 				return;
 			if ((sec[ROLE] == 'device_mark' || sec[ROLE] == 'domain_mark') && sec.set_xmark != mark) {
 				uci.set('firewall', sec['.name'], 'set_xmark', mark);
-				cf = true;
-			}
-			if (sec[ROLE] == 'domain_mark' && det.lan_zone && sec.src != det.lan_zone) {
-				uci.set('firewall', sec['.name'], 'src', det.lan_zone);
 				cf = true;
 			}
 		});
@@ -1001,6 +1156,10 @@ function enforce(uci, s, opts) {
 			push(notes, 'exceptions need a routing table other than main');
 		else {
 			byp_devs = s.bypass_devices || [];
+			if (length(byp_devs) && !det.lan_zone) {
+				push(notes, 'excluded devices: could not determine the LAN zone');
+				byp_devs = [];
+			}
 			if (length(s.bypass_domains || []) > 0) {
 				let supported = (opts && opts.nftset != null) ? !!opts.nftset : nftset_supported();
 				if (!supported)
@@ -1038,14 +1197,14 @@ function enforce(uci, s, opts) {
 	}, 'name', 'firewall'))
 		cf = true;
 	if (reconcile_rules(uci, 'rule', 'bypass_domain_mark', iface, byp_sets, function(n) {
-		return { name: 'NordVPN exceptions ' + iface, src: det.lan_zone, ipset: n, family: 'ipv4',
+		return { name: 'NordVPN exceptions ' + iface, src: det.lan_zone, dest: '*', ipset: n, family: 'ipv4',
 			proto: 'all', target: 'MARK', set_xmark: bmark };
 	}, 'ipset', 'firewall'))
 		cf = true;
 	if (reconcile_domain_dns(uci, iface, bset, byp_doms, 'bypass_dns'))
 		cd = true;
 	if (reconcile_rules(uci, 'rule', 'bypass_mark', iface, byp_devs, function(mac) {
-		return { name: 'NordVPN exception ' + mac, src: '*', src_mac: mac, proto: 'all',
+		return { name: 'NordVPN exception ' + mac, src: det.lan_zone, dest: '*', src_mac: mac, proto: 'all',
 			target: 'MARK', set_xmark: bmark };
 	}, 'src_mac', 'firewall'))
 		cf = true;
@@ -1058,6 +1217,26 @@ function enforce(uci, s, opts) {
 		return { mark: m, lookup: 'main', priority: '18000' };
 	}, 'mark'))
 		cn = true;
+
+	// fw4 places a MARK rule by its zones: only 'src <zone>' with 'dest *' lands
+	// in mangle_prerouting, ahead of the routing decision these marks feed. A
+	// rule without 'dest' is put in mangle_input and only sees traffic to the
+	// router itself, which is how older versions wrote them (src '*', no dest):
+	// nothing forwarded was ever marked. Marks are applied to LAN-zone traffic,
+	// the zone the tunnel forwards from. Correct any rule still in the old shape.
+	if (det.lan_zone)
+		uci.foreach('firewall', 'rule', function(sec) {
+			if (sec[MARK] != '1' || sec.nordvpn_iface != iface || sec.target != 'MARK')
+				return;
+			if (sec.src != det.lan_zone) {
+				uci.set('firewall', sec['.name'], 'src', det.lan_zone);
+				cf = true;
+			}
+			if (sec.dest != '*') {
+				uci.set('firewall', sec['.name'], 'dest', '*');
+				cf = true;
+			}
+		});
 
 	// 1c. Bypass routes for local subnets, so the steered default does not
 	//     swallow LAN↔VLAN or LAN↔local-tunnel traffic. The nordvpn instances'
@@ -1159,8 +1338,25 @@ function enforce(uci, s, opts) {
 
 	// 3. Kill switch: our own REJECT rule LAN->WAN. fw4 evaluates traffic rules
 	//    before zone forwardings, so the user's forwardings stay untouched.
+	// Each instance owns its rule (nordvpn_iface), so applying or deleting
+	// another instance never removes it. An unowned rule from an older version
+	// is adopted by the instance that wants it, and dropped once no instance
+	// routes all LAN traffic any more.
 	let want_ks = auto && s.killswitch;
-	let ks = find_managed(uci, 'rule', 'killswitch');
+	let ksf = find_owned(uci, 'killswitch', iface);
+	let ks = ksf ? ksf.name : null;
+	if (ksf && ksf.legacy) {
+		if (want_ks) {
+			uci.set('firewall', ks, 'nordvpn_iface', iface);
+			cf = true;
+		} else {
+			if (!any_all_lan(uci, s.name)) {
+				uci.delete('firewall', ks);
+				cf = true;
+			}
+			ks = null;
+		}
+	}
 	if (want_ks && !ks) {
 		if (det.lan_zone && det.wan_zone) {
 			let r = uci.add('firewall', 'rule');
@@ -1171,6 +1367,7 @@ function enforce(uci, s, opts) {
 			uci.set('firewall', r, 'target', 'REJECT');
 			uci.set('firewall', r, MARK, '1');
 			uci.set('firewall', r, ROLE, 'killswitch');
+			uci.set('firewall', r, 'nordvpn_iface', iface);
 			cf = true;
 		} else {
 			push(notes, 'could not determine the LAN/WAN zones; kill switch not installed');
@@ -1182,7 +1379,20 @@ function enforce(uci, s, opts) {
 
 	// 4. IPv6 leak block: same shape, family ipv6 only.
 	let want_v6 = auto && s.block_ipv6;
-	let v6 = find_managed(uci, 'rule', 'ipv6block');
+	let v6f = find_owned(uci, 'ipv6block', iface);
+	let v6 = v6f ? v6f.name : null;
+	if (v6f && v6f.legacy) {
+		if (want_v6) {
+			uci.set('firewall', v6, 'nordvpn_iface', iface);
+			cf = true;
+		} else {
+			if (!any_all_lan(uci, s.name)) {
+				uci.delete('firewall', v6);
+				cf = true;
+			}
+			v6 = null;
+		}
+	}
 	if (want_v6 && !v6) {
 		if (det.lan_zone && det.wan_zone) {
 			let r = uci.add('firewall', 'rule');
@@ -1194,6 +1404,7 @@ function enforce(uci, s, opts) {
 			uci.set('firewall', r, 'target', 'REJECT');
 			uci.set('firewall', r, MARK, '1');
 			uci.set('firewall', r, ROLE, 'ipv6block');
+			uci.set('firewall', r, 'nordvpn_iface', iface);
 			cf = true;
 		} else {
 			push(notes, 'could not determine the LAN/WAN zones; IPv6 block not installed');
@@ -1237,9 +1448,98 @@ function enforce(uci, s, opts) {
 	}, 'nordvpn_key'))
 		cn = true;
 
+	// 5c. DNS lock for the instance routing all LAN traffic: dnsmasq forwards
+	//     only to the NordVPN resolvers (see reconcile_dns_lock), except that
+	//     nordvpn.com names keep using the WAN's resolvers, so the router can
+	//     still resolve server hostnames to reconnect or rotate while the
+	//     tunnel is down. Excluded devices resolve through the VPN as well
+	//     (their traffic itself still goes direct).
+	let wans = null;
+	let wan_dns = function() {
+		if (wans == null) {
+			wans = (opts && opts.wan_dns != null) ? opts.wan_dns : wan_resolvers(uci, det.wan_zone);
+			wans = filter(wans, (ip) => index(split(VPN_DNS[mode], ' '), ip) < 0);
+		}
+		return wans;
+	};
+	let lock = null;
+	if ((auto || !!all_lan) && mode && VPN_DNS[mode]) {
+		wan_dns();
+		if (!length(wans))
+			push(notes, 'could not find the WAN DNS servers; DNS not locked to the VPN');
+		else {
+			lock = split(VPN_DNS[mode], ' ');
+			for (let ip in wans)
+				push(lock, '/nordvpn.com/' + ip);
+		}
+	}
+	let dl = reconcile_dns_lock(uci, iface, lock);
+	if (dl.changed)
+		cd = true;
+	for (let n in dl.notes)
+		push(notes, n);
+	// With dnsmasq pinned to the NordVPN resolvers, a tunnel that is down
+	// would send those queries out of the WAN (the instance table is empty
+	// then, so the lookup above falls through to main). Block them instead.
+	// In the main-table variant of "Route all LAN" the tunnel's default and
+	// the WAN's share that table, so there is no rule to tell them apart.
+	let dns_ks = [];
+	if (lock && steer)
+		for (let ip in split(VPN_DNS[mode], ' '))
+			push(dns_ks, ip + '/32');
+	if (reconcile_rules(uci, 'rule', 'dns_ks', iface, dns_ks, function(ip) {
+		return { dest: ip, action: 'prohibit', priority: '19501' };
+	}, 'dest'))
+		cn = true;
+
+	// 5d. Excluded devices keep the WAN's DNS while the others use NordVPN's.
+	//     dnsmasq cannot pick an upstream per client, so their lookups never
+	//     reach it: DHCP hands them the WAN's IPv4 resolvers (option 6, one
+	//     tag per MAC), and a DNAT sends any plain DNS they still send
+	//     (manual DNS, a lease not yet renewed) to the first of them. The
+	//     exception mark then routes it out of the WAN. IPv4 only: a device
+	//     asking the router over IPv6 still gets the NordVPN resolvers.
+	let byp_dns = [];
+	if (length(byp_devs) && mode && VPN_DNS[mode]) {
+		byp_dns = filter(wan_dns(), (ip) => _common.validate_ipv4(ip) != null);
+		if (!length(byp_dns))
+			push(notes, 'excluded devices: no IPv4 WAN DNS server found; they keep using the router\'s DNS');
+	}
+	let rdevs = length(byp_dns) ? byp_devs : [];
+	let dhcp_dns = length(byp_dns) ? [ '6,' + join(',', byp_dns) ] : [];
+	if (reconcile_rules(uci, 'redirect', 'bypass_dns_redirect', iface, rdevs, function(mac) {
+		let r = { name: 'NordVPN exception DNS ' + mac, src: det.lan_zone, src_mac: mac, proto: 'tcp udp',
+			src_dport: '53', dest_ip: byp_dns[0], dest_port: '53', family: 'ipv4', reflection: '0', target: 'DNAT' };
+		if (det.wan_zone)
+			r.dest = det.wan_zone;
+		return r;
+	}, 'src_mac', 'firewall'))
+		cf = true;
+	if (reconcile_rules(uci, 'mac', 'bypass_dhcp_dns', iface, rdevs, function(mac) {
+		return { mac: mac, networkid: 'nvx' + replace(mac, /:/g, ''), dhcp_option: dhcp_dns };
+	}, 'mac', 'dhcp'))
+		cd = true;
+	// The WAN's resolvers can change (DHCP on the WAN): follow them.
+	if (length(rdevs)) {
+		uci.foreach('firewall', 'redirect', function(sec) {
+			if (sec[MARK] == '1' && sec[ROLE] == 'bypass_dns_redirect' && sec.nordvpn_iface == iface &&
+			    sec.dest_ip != byp_dns[0]) {
+				uci.set('firewall', sec['.name'], 'dest_ip', byp_dns[0]);
+				cf = true;
+			}
+		});
+		uci.foreach('dhcp', 'mac', function(sec) {
+			if (sec[MARK] == '1' && sec[ROLE] == 'bypass_dhcp_dns' && sec.nordvpn_iface == iface &&
+			    sprintf('%J', as_list(sec.dhcp_option)) != sprintf('%J', dhcp_dns)) {
+				uci.set('dhcp', sec['.name'], 'dhcp_option', dhcp_dns);
+				cd = true;
+			}
+		});
+	}
+
 	return { changed_network: cn, changed_firewall: cf, changed_dhcp: cd,
-		domains_active: length(steer_doms) > 0 || length(byp_doms) > 0, notes: notes };
+		domains_active: length(steer_doms) > 0 || length(byp_doms) > 0, dns_locked: lock != null, notes: notes };
 }
 
 return { detect, enforce, find_wan_zone, find_lan_zone, count_user_routes, recommend_mtu,
-	rt_table_id, device_mark, device_owners, domain_set_name, bypass_set_name, nftset_supported };
+	rt_table_id, device_mark, device_owners, all_lan_owner, domain_set_name, bypass_set_name, nftset_supported };

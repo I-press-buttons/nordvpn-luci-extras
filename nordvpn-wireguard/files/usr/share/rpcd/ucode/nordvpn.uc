@@ -37,6 +37,7 @@ const read_events = require('nordvpn.history').read_events;
 const parse_insights = require('nordvpn.api').parse_insights;
 const list_clients = require('nordvpn.clients').clients;
 const detect_routing = require('nordvpn.routing').detect;
+const _creds = require('nordvpn.credentials');
 const _cache = require('nordvpn.cache');
 const read_cache = _cache.read_cache,
       read_fetch_status = _cache.read_fetch_status,
@@ -235,17 +236,24 @@ methods.external_ip = {
 
 // ── Write methods ────────────────────────────────────────────────────
 
+// Store a token's key in the credential bank. `credential` replaces that
+// entry's key; `name` alone adds a new named entry; otherwise the entry of
+// `instance` ('main' by default, which uses 'default') is replaced.
 methods.set_credentials = {
-	args: { token: '', instance: '' },
+	args: { token: '', instance: '', credential: '', name: '' },
 	call: function(request) {
-		let token = request.args ? request.args.token : null;
-		if (!validate_token(token))
+		let a = request.args || {};
+		if (!validate_token(a.token))
 			return { error: 'invalid token format' };
 		let uci = cursor();
+		if ((a.credential != null && a.credential != '') || (a.name != null && a.name != '')) {
+			_creds.migrate(uci);
+			return _creds.set(uci, a.token, a.credential, a.name, null);
+		}
 		let name = req_instance(uci, request);
 		if (!name)
 			return { error: 'no such instance' };
-		return set_credentials(uci, token, name);
+		return set_credentials(uci, a.token, name);
 	}
 };
 
@@ -321,10 +329,35 @@ methods.disconnect = {
 	}
 };
 
+// The credential bank: names, whether a key is stored and which instances use
+// each entry. Never returns a key. Read-only (the one-time migration to the
+// bank runs on the first write, apply or service start).
+methods.credentials = {
+	call: function() {
+		return { credentials: _creds.list(cursor()) };
+	}
+};
+
+// Delete a bank entry (refused while in use); for 'default', drop its key.
+methods.remove_credentials = {
+	args: { credential: '' },
+	call: function(request) {
+		let a = request.args || {};
+		let uci = cursor();
+		_creds.migrate(uci);
+		return _creds.remove(uci, a.credential);
+	}
+};
+
 methods.clear_credentials = {
-	args: { instance: '' },
+	args: { instance: '', credential: '' },
 	call: function(request) {
 		let uci = cursor();
+		let a = request.args || {};
+		if (a.credential != null && a.credential != '') {
+			_creds.migrate(uci);
+			return _creds.clear_key(uci, a.credential);
+		}
 		let name = req_instance(uci, request);
 		if (!name)
 			return { error: 'no such instance' };
@@ -333,10 +366,16 @@ methods.clear_credentials = {
 };
 
 methods.create_instance = {
-	args: { instance: '' },
+	args: { instance: '', credential: '' },
 	call: function(request) {
 		let a = request.args || {};
-		return create_instance(cursor(), a.instance);
+		let cred = null;
+		if (a.credential != null && a.credential != '') {
+			cred = validate_instance(a.credential);
+			if (!cred)
+				return { error: 'no such credentials' };
+		}
+		return create_instance(cursor(), a.instance, cred);
 	}
 };
 
