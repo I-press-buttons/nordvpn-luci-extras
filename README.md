@@ -116,6 +116,8 @@ that adds the extra features marked **(fork)** below.
   your normal connection, even while the kill switch blocks the rest.
 - **Kill switch and IPv6 leak block.** When the tunnel is down, steered
   traffic is blocked rather than leaking out through the WAN.
+- **IP masquerading (fork).** Like GL.iNet's option of the same name, NAT on
+  the VPN zone is on by default and can be switched off per tunnel.
 - **NordVPN DNS.** Optionally use NordVPN's resolvers, or Threat Protection,
   which blocks ads and malware at the DNS level. The router's own lookups to
   them go through the tunnel in steered mode too. With *Route all LAN

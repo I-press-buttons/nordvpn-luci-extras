@@ -1217,6 +1217,8 @@ return view.extend({
 			this.ksBox.checked = (g('killswitch', '0') === '1');
 			this.v6Box = E('input', { type: 'checkbox', change: L.bind(this.onRoutingToggle, this) });
 			this.v6Box.checked = (g('block_ipv6', '1') === '1');
+			this.masqBox = E('input', { type: 'checkbox', change: L.bind(this.markDirty, this) });
+			this.masqBox.checked = (g('vpn_masq', '1') === '1');
 			// DNS mode: prefer the enum, fall back to the legacy boolean.
 			var dnsMode = g('vpn_dns', '');
 			if (dnsMode !== 'off' && dnsMode !== 'standard' && dnsMode !== 'threat')
@@ -1279,9 +1281,13 @@ return view.extend({
 				E('label', { class: 'nv-check' }, [ this.v6Box, _('Block direct IPv6 to prevent leaks') ]),
 				this.v6Warn
 			]);
+			this.masqRow = this.row(_('IP masquerading'), [
+				E('label', { class: 'nv-check' }, [ this.masqBox, _('Hide LAN addresses behind the tunnel address (NAT)') ])
+			], _('Leave this on unless the VPN provider can route replies back to your LAN. Turning it off usually breaks internet access through NordVPN.'));
 			this.dnsRow = this.row(_('DNS'), [ this.dnsSel ],
 				_('Which resolver to use while connected. Threat Protection blocks ads and malware at the DNS level; both NordVPN options only work through the tunnel. With "Route all LAN traffic", the router then forwards every lookup only to NordVPN (so none leak to your provider\'s resolver), and lookups fail while the tunnel is down.'));
 			body.appendChild(this.ksRow);
+			body.appendChild(this.masqRow);
 			body.appendChild(this.v6Row);
 			body.appendChild(this.dnsRow);
 			this.onRoutingToggle(true);
@@ -2652,6 +2658,7 @@ return view.extend({
 			uci.set('nordvpn', inst, 'auto_routing', autoOn ? '1' : '0');
 			uci.set('nordvpn', inst, 'killswitch', (this.ksBox && this.ksBox.checked) ? '1' : '0');
 			uci.set('nordvpn', inst, 'block_ipv6', (this.v6Box && this.v6Box.checked) ? '1' : '0');
+			uci.set('nordvpn', inst, 'vpn_masq', (this.masqBox && this.masqBox.checked) ? '1' : '0');
 			uci.set('nordvpn', inst, 'vpn_dns', (this.dnsSel && this.dnsSel.value) || 'off');
 			// Drop the legacy boolean so it cannot contradict the enum.
 			uci.unset('nordvpn', inst, 'use_vpn_dns');

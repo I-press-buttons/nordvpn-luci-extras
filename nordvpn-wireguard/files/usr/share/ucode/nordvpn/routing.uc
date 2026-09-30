@@ -1272,7 +1272,7 @@ function enforce(uci, s, opts) {
 				uci.set('firewall', z, 'input', 'REJECT');
 				uci.set('firewall', z, 'output', 'ACCEPT');
 				uci.set('firewall', z, 'forward', 'REJECT');
-				uci.set('firewall', z, 'masq', '1');
+				uci.set('firewall', z, 'masq', s.vpn_masq === false ? '0' : '1');
 				uci.set('firewall', z, 'mtu_fix', '1');
 				uci.set('firewall', z, 'network', [ iface ]);
 				uci.set('firewall', z, MARK, '1');
@@ -1280,6 +1280,15 @@ function enforce(uci, s, opts) {
 				uci.set('firewall', z, 'nordvpn_iface', iface);
 				cf = true;
 				det.zone = iface;
+			}
+		}
+		// Keep the masquerading flag of our own zone in step with the setting.
+		let ownz = find_managed(uci, 'zone', 'zone', iface);
+		if (ownz) {
+			let want_masq = (s.vpn_masq === false) ? '0' : '1';
+			if ((uci.get('firewall', ownz, 'masq') || '0') != want_masq) {
+				uci.set('firewall', ownz, 'masq', want_masq);
+				cf = true;
 			}
 		}
 		if (det.zone) {
