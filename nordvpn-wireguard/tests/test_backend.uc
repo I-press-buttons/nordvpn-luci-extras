@@ -1782,6 +1782,19 @@ write_cache(cache, cpath);
 	eq('dns lock: threat protection resolvers', dm().server,
 		[ '/home.lan/192.168.1.5', '103.86.96.96', '103.86.99.99', '/nordvpn.com/192.168.10.166' ]);
 
+	// Custom resolvers: invalid entries are dropped, the list drives the lock.
+	global.MOCK_UCI.nordvpn.main.vpn_dns = 'custom';
+	global.MOCK_UCI.nordvpn.main.vpn_dns_server = [ '9.9.9.9', 'bad', '1.1.1.1', '9.9.9.9' ];
+	enforce_routing(cursor(), load_settings(cursor(), 'main'), o);
+	eq('dns lock: custom resolvers', dm().server,
+		[ '/home.lan/192.168.1.5', '9.9.9.9', '1.1.1.1', '/nordvpn.com/192.168.10.166' ]);
+	eq('dns custom: interface dns', global.MOCK_UCI.network.nordvpn.dns, [ '9.9.9.9', '1.1.1.1' ]);
+	// Custom without any valid server behaves like off.
+	global.MOCK_UCI.nordvpn.main.vpn_dns_server = [ 'bad' ];
+	enforce_routing(cursor(), load_settings(cursor(), 'main'), o);
+	eq('dns custom: no valid server, no override', global.MOCK_UCI.network.nordvpn.dns, null);
+	delete global.MOCK_UCI.nordvpn.main.vpn_dns_server;
+
 	// Turning VPN DNS off restores dnsmasq exactly.
 	global.MOCK_UCI.nordvpn.main.vpn_dns = 'off';
 	enforce_routing(cursor(), load_settings(cursor(), 'main'), o);

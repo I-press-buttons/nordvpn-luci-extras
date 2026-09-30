@@ -1415,14 +1415,21 @@ function enforce(uci, s, opts) {
 	}
 
 	// 5. DNS override on the interface (stamped, netifd-managed lifecycle). The
-	// stamp records the mode, so switching resolvers (standard <-> threat)
+	// stamp records the mode, so switching resolvers (standard <-> threat <-> custom)
 	// re-applies instead of being skipped as "already set".
+	// 'custom' uses the user's own resolvers (vpn_dns_servers); the stamp then
+	// carries the list, so editing it re-applies too.
 	let mode = (managed && s.vpn_dns && s.vpn_dns != 'off') ? s.vpn_dns : null;
+	let dns_ips = !mode ? [] : (mode == 'custom' ? (s.vpn_dns_servers || []) :
+		(VPN_DNS[mode] ? split(VPN_DNS[mode], ' ') : []));
+	if (!length(dns_ips))
+		mode = null;
+	let dns_stamp = mode ? (mode == 'custom' ? 'custom:' + join(',', dns_ips) : mode) : null;
 	let stamped = uci.get('network', iface, MARK + '_dns');
-	if (mode && VPN_DNS[mode]) {
-		if (stamped != mode) {
-			uci.set('network', iface, 'dns', split(VPN_DNS[mode], ' '));
-			uci.set('network', iface, MARK + '_dns', mode);
+	if (mode) {
+		if (stamped != dns_stamp) {
+			uci.set('network', iface, 'dns', dns_ips);
+			uci.set('network', iface, MARK + '_dns', dns_stamp);
 			cn = true;
 		}
 	} else if (stamped != null && stamped != '') {
@@ -1439,8 +1446,8 @@ function enforce(uci, s, opts) {
 	//     rule is needed. Keyed by resolver AND table, so a table change
 	//     replaces the rules instead of leaving a stale lookup.
 	let dns_keys = [];
-	if (steer && mode && VPN_DNS[mode])
-		for (let ip in split(VPN_DNS[mode], ' '))
+	if (steer && mode)
+		for (let ip in dns_ips)
 			push(dns_keys, ip + '/32 ' + table);
 	if (reconcile_rules(uci, 'rule', 'dns_lookup', iface, dns_keys, function(k) {
 		let p = split(k, ' ');
@@ -1458,17 +1465,17 @@ function enforce(uci, s, opts) {
 	let wan_dns = function() {
 		if (wans == null) {
 			wans = (opts && opts.wan_dns != null) ? opts.wan_dns : wan_resolvers(uci, det.wan_zone);
-			wans = filter(wans, (ip) => index(split(VPN_DNS[mode], ' '), ip) < 0);
+			wans = filter(wans, (ip) => index(dns_ips, ip) < 0);
 		}
 		return wans;
 	};
 	let lock = null;
-	if ((auto || !!all_lan) && mode && VPN_DNS[mode]) {
+	if ((auto || !!all_lan) && mode) {
 		wan_dns();
 		if (!length(wans))
 			push(notes, 'could not find the WAN DNS servers; DNS not locked to the VPN');
 		else {
-			lock = split(VPN_DNS[mode], ' ');
+			lock = slice(dns_ips);
 			for (let ip in wans)
 				push(lock, '/nordvpn.com/' + ip);
 		}
@@ -1485,7 +1492,7 @@ function enforce(uci, s, opts) {
 	// the WAN's share that table, so there is no rule to tell them apart.
 	let dns_ks = [];
 	if (lock && steer)
-		for (let ip in split(VPN_DNS[mode], ' '))
+		for (let ip in dns_ips)
 			push(dns_ks, ip + '/32');
 	if (reconcile_rules(uci, 'rule', 'dns_ks', iface, dns_ks, function(ip) {
 		return { dest: ip, action: 'prohibit', priority: '19501' };
@@ -1500,7 +1507,7 @@ function enforce(uci, s, opts) {
 	//     exception mark then routes it out of the WAN. IPv4 only: a device
 	//     asking the router over IPv6 still gets the NordVPN resolvers.
 	let byp_dns = [];
-	if (length(byp_devs) && mode && VPN_DNS[mode]) {
+	if (length(byp_devs) && mode) {
 		byp_dns = filter(wan_dns(), (ip) => _common.validate_ipv4(ip) != null);
 		if (!length(byp_dns))
 			push(notes, 'excluded devices: no IPv4 WAN DNS server found; they keep using the router\'s DNS');
