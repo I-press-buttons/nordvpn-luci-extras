@@ -6,7 +6,7 @@
 
 'use strict';
 
-import { readfile } from 'fs';
+import { readfile, stat } from 'fs';
 const _common = require('nordvpn.common');
 const open_cmd = _common.open_cmd,
       SERVERS_URL = _common.SERVERS_URL,
@@ -31,6 +31,10 @@ const open_cmd = _common.open_cmd,
 const MAX_RESPONSE = 16 * 1024 * 1024; // hard cap per API response
 const CONNECT_TIMEOUT = 15;
 const TOTAL_TIMEOUT = 60;
+// Longest plausible gap between two progress writes of a running refresh: one
+// page (TOTAL_TIMEOUT) or the final sort and cache write, with ample slack for
+// a slow router. A 'running' record older than this has no live worker.
+const FETCH_STALL = 300;
 
 // ── JSON / HTTP helpers ──────────────────────────────────────────────
 
@@ -56,26 +60,34 @@ function http_get(url) {
 	if (!proc)
 		return { ok: false, error: 'failed to start curl' };
 
-	let body = '';
-	while (length(body) < MAX_RESPONSE) {
+	// Chunks are joined once at the end: appending each one to a growing
+	// string copies everything read so far, quadratic in a page of ~1 MB.
+	let chunks = [], size = 0;
+	while (size < MAX_RESPONSE) {
 		let chunk = proc.read(65536);
 		if (chunk == null || chunk == '')
 			break;
-		body += chunk;
+		push(chunks, chunk);
+		size += length(chunk);
 	}
 	let code = proc.close();
 
-	if (length(body) >= MAX_RESPONSE)
+	if (size >= MAX_RESPONSE)
 		return { ok: false, error: 'response exceeded size limit' };
 	if (code != 0)
 		return { ok: false, error: 'curl exit ' + code };
-	return { ok: true, body: body };
+	return { ok: true, body: join('', chunks) };
 }
 
 // ── Fetch-status file (progress for the UI) ──────────────────────────
 
+// Every record carries the writer's pid and an epoch stamp, so a refresh
+// whose worker died can be told from a slow one (fetch_status_report()).
 function write_fetch_status(status) {
-	status.updated_at = iso_ts();
+	let now = time();
+	status.updated_at = iso_ts(now);
+	status.updated_at_epoch = now;
+	status.pid = (status.state == 'running') ? _common.self_pid() : null;
 	return atomic_write(FETCH_STATUS_FILE, sprintf('%J', status));
 }
 
@@ -84,6 +96,38 @@ function read_fetch_status() {
 	if (!data)
 		return null;
 	return safe_json(data);
+}
+
+// Is this 'running' record backed by a live worker? Its writer must still
+// exist and have reported progress recently. `now` is injectable for tests.
+// Pure apart from the /proc lookup.
+function fetch_running(st, now) {
+	if (type(st) != 'object' || st.state != 'running')
+		return false;
+	now = now || time();
+	let at = (type(st.updated_at_epoch) == 'int') ? st.updated_at_epoch : 0;
+	// Routers have no RTC: a stamp far in the future is as implausible as an
+	// old one once NTP moves the clock.
+	if (!at || (now - at) > FETCH_STALL || at > (now + 60))
+		return false;
+	if (type(st.pid) == 'int' && st.pid > 0 && stat('/proc/self') && !stat('/proc/' + st.pid))
+		return false;
+	return true;
+}
+
+// The fetch status as the UI should see it. A worker killed mid-refresh (the
+// OOM killer, a reboot of the daemon) leaves its last 'running' record behind
+// for good, which would keep the refresh button disabled and every new
+// refresh refused; such a record is reported as an error instead. Read-only.
+function fetch_status_report(now) {
+	let st = read_fetch_status();
+	if (type(st) != 'object' || st.state != 'running' || fetch_running(st, now))
+		return st;
+	st.state = 'error';
+	st.stale = true;
+	st.pid = null;
+	st.message = 'the server list refresh stopped unexpectedly';
+	return st;
 }
 
 // ── Normalization ────────────────────────────────────────────────────
@@ -478,13 +522,20 @@ function read_cache(path) {
 	return obj;
 }
 
-// True when the cache is missing, unreadable, incompatible, lacks the server
-// group flags or is older than the staleness threshold.
-function cache_is_stale(path) {
-	let obj = read_cache(path);
-	if (!obj || type(obj.cached_at) != 'int' || !obj.groups)
+// True when an already-parsed cache object is missing, incompatible, lacks
+// the server group flags or is older than the staleness threshold. Callers
+// holding the parsed cache use this instead of cache_is_stale(), which reads
+// and parses the multi-megabyte file again.
+function is_stale(obj, now) {
+	if (type(obj) != 'object' || obj.schema_version != CACHE_SCHEMA_VERSION ||
+	    type(obj.cached_at) != 'int' || !obj.groups)
 		return true;
-	return (time() - obj.cached_at) > CACHE_MAX_AGE;
+	return ((now || time()) - obj.cached_at) > CACHE_MAX_AGE;
+}
+
+// is_stale() for the cache file at `path`.
+function cache_is_stale(path) {
+	return is_stale(read_cache(path));
 }
 
 function write_cache(response, path) {
@@ -522,7 +573,8 @@ function fetch_and_build(path) {
 }
 
 return {
-	write_fetch_status, read_fetch_status, add_server, normalize,
+	FETCH_STALL,
+	write_fetch_status, read_fetch_status, fetch_running, fetch_status_report, add_server, normalize,
 	locations_tree, city_relays, pool_relays,
-	fetch_servers, read_cache, cache_is_stale, write_cache, fetch_and_build
+	fetch_servers, read_cache, is_stale, cache_is_stale, write_cache, fetch_and_build
 };

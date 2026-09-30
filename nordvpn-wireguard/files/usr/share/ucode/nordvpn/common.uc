@@ -9,7 +9,7 @@
 
 'use strict';
 
-import { open, stat, unlink, rename, popen } from 'fs';
+import { open, stat, unlink, rename, popen, readfile } from 'fs';
 
 // ── Constants ────────────────────────────────────────────────────────
 
@@ -52,6 +52,9 @@ const MAX_VERIFY_TIMEOUT = 30;
 // candidates at MAX_VERIFY_TIMEOUT each, with slack for the routing reload.
 // Past it a 'running' apply record is an abandoned one.
 const APPLY_MAX_RUNTIME = 300;
+// Upper bound for any job ceiling derived from the settings (a rotation with
+// max_retries 50 at verify_timeout 30 is the slowest job there is).
+const JOB_MAX_RUNTIME_CAP = 3600;
 
 // Watchdog (auto-reconnect) tuning: how long an instance must stay unhealthy
 // before recovering, and the min/max pause between recovery attempts
@@ -615,24 +618,65 @@ function atomic_write(path, data) {
 	return true;
 }
 
+// Own pid — the first field of /proc/self/stat — or null when /proc is
+// unavailable. Read every time rather than cached: a uloop.task child is a
+// fork and must not report its parent's pid.
+function self_pid() {
+	let raw = readfile('/proc/self/stat');
+	if (!raw)
+		return null;
+	let first = split(trim(raw), ' ')[0];
+	return full_match(first, /^[0-9]+$/) ? int(first) : null;
+}
+
+// Is the lock file at `path` abandoned? Either older than `max_age` seconds,
+// or naming a holder process that no longer exists: a worker killed mid-job
+// (the OOM killer on a small router, a reboot of the daemon) releases
+// nothing, and waiting out the whole age would stall every rotation, refresh
+// or state write behind it for minutes. The pid is only trusted when /proc
+// can confirm it; the age check stays as the fallback (and covers a pid that
+// was reused by an unrelated process).
+function lock_stale(path, max_age) {
+	let st = stat(path);
+	if (!st)
+		return false;
+	if (st.mtime && (time() - st.mtime) > max_age)
+		return true;
+	let m = match(readfile(path) || '', /^[0-9]+ ([0-9]+)/);
+	if (!m || int(m[1]) <= 0 || !stat('/proc/self'))
+		return false;
+	return stat('/proc/' + m[1]) == null;
+}
+
 // Best-effort exclusive lock via an O_EXCL lock file. Returns a token to pass
-// to release_lock(), or null when another holder is active. Stale locks older
-// than `max_age` seconds are reclaimed.
+// to release_lock(), or null when another holder is active. Stale locks (see
+// lock_stale()) are reclaimed. The file records "<time> <pid>".
 function acquire_lock(path, max_age) {
 	max_age = max_age || 600;
 	let fh = open(path, 'wx');
-	if (!fh) {
-		let st = stat(path);
-		if (st && st.mtime && (time() - st.mtime) > max_age) {
-			unlink(path);
-			fh = open(path, 'wx');
-		}
+	if (!fh && lock_stale(path, max_age)) {
+		unlink(path);
+		fh = open(path, 'wx');
 	}
 	if (!fh)
 		return null;
-	fh.write(sprintf('%d\n', time()));
+	fh.write(sprintf('%d %d\n', time(), self_pid() || 0));
 	fh.close();
 	return path;
+}
+
+// How long one rotation of an instance with settings `s` may plausibly take:
+// every candidate rewrites the peer, restarts the interface and waits up to
+// verify_timeout for a handshake, then the WAN default route is re-checked.
+// Used as the rotation lock's age and the UI job's ceiling, so a slow but
+// healthy rotation is never mistaken for an abandoned one.
+function rotation_max_runtime(s) {
+	let tries = (s && type(s.max_retries) == 'int' && s.max_retries > 0) ? s.max_retries : 10;
+	let wait = (s && type(s.verify_timeout) == 'int' && s.verify_timeout > 0) ? s.verify_timeout : 8;
+	let t = tries * (wait + 10) + 60;
+	if (t < APPLY_MAX_RUNTIME)
+		t = APPLY_MAX_RUNTIME;
+	return (t > JOB_MAX_RUNTIME_CAP) ? JOB_MAX_RUNTIME_CAP : t;
 }
 
 function release_lock(token) {
@@ -675,7 +719,7 @@ return {
 	VERSION, API_BASE, CREDS_URL, SERVERS_URL, IP_INSIGHTS_URL,
 	DEFAULT_INTERFACE, DEFAULT_PORT, DEFAULT_KEEPALIVE, FIXED_ADDRESS,
 	CACHE_FILENAME, DEFAULT_CACHE_DIR, FETCH_STATUS_FILE, CACHE_LOCK_FILE,
-	APPLY_STATUS_FILE, APPLY_LOCK_FILE, APPLY_MAX_RUNTIME,
+	APPLY_STATUS_FILE, APPLY_LOCK_FILE, APPLY_MAX_RUNTIME, JOB_MAX_RUNTIME_CAP,
 	CACHE_MAX_AGE, CACHE_SCHEMA_VERSION, PAGE_SIZE, MAX_PAGES,
 	MIN_ROTATION_INTERVAL, MAX_ROTATION_INTERVAL, MIN_CACHE_REFRESH, MAX_CACHE_REFRESH,
 	MIN_VERIFY_TIMEOUT, MAX_VERIFY_TIMEOUT,
@@ -686,5 +730,6 @@ return {
 	validate_country_code, validate_location_code, validate_instance, validate_routing_table, validate_dir,
 	validate_mac, validate_domain, clean_label, validate_ipv4,
 	managed_interface, load_settings, list_instances, globals_section, cache_file_path, iso_ts, redact, log,
-	atomic_write, acquire_lock, release_lock, sh_quote, open_cmd, run
+	atomic_write, self_pid, lock_stale, acquire_lock, release_lock, rotation_max_runtime,
+	sh_quote, open_cmd, run
 };

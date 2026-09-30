@@ -322,10 +322,31 @@ write_cache(cache, cpath);
 	let s = { cache_refresh_interval: 21600, enabled: true, rotation_enabled: true,
 		fixed_server: '', rotation_mode: 'interval', rotation_interval: 360, rotation_time: '04:30' };
 
-	ok('refresh on first tick if stale', should_refresh(s, 0, 1000, true) == true);
-	ok('no refresh on first tick if fresh', should_refresh(s, 0, 1000, false) == false);
-	ok('refresh after interval', should_refresh(s, 1000, 1000 + 21600, false) == true);
-	ok('no refresh before interval', should_refresh(s, 1000, 1000 + 100, false) == false);
+	// A real clock, not a small epoch: the old first-tick rule compared
+	// now - 0 with the interval and refreshed on every daemon restart.
+	let now = 1790000000;
+	let refresh_seed = _service.refresh_seed, RETRY = _service.REFRESH_RETRY_BASE;
+	ok('refresh without a usable cache', should_refresh(s, 0, now, 0) == true);
+	ok('refresh after interval', should_refresh(s, 1000, 1000 + 21600, 0) == true);
+	ok('no refresh before interval', should_refresh(s, 1000, 1000 + 100, 0) == false);
+
+	// Restart: the clock comes from the cache's own write time.
+	eq('seed: a stale cache refreshes now', refresh_seed(now - 100, true, now), 0);
+	eq('seed: a missing cache refreshes now', refresh_seed(null, true, now), 0);
+	eq('seed: a fresh cache keeps its write time', refresh_seed(now - 3600, false, now), now - 3600);
+	eq('seed: a write time in the future counts as now', refresh_seed(now + 3600, false, now), now);
+	ok('no refresh on restart with a fresh cache',
+		should_refresh(s, refresh_seed(now - 3600, false, now), now, 0) == false);
+	ok('refresh on restart once the interval since the write passed',
+		should_refresh(s, refresh_seed(now - 21600, false, now), now, 0) == true);
+
+	// A failed refresh retries sooner, backing off, never beyond the interval.
+	ok('retry: not before the first backoff', should_refresh(s, now, now + RETRY - 1, 1) == false);
+	ok('retry: after the first backoff', should_refresh(s, now, now + RETRY, 1) == true);
+	ok('retry: the backoff doubles', should_refresh(s, now, now + RETRY, 2) == false &&
+		should_refresh(s, now, now + 2 * RETRY, 2) == true);
+	ok('retry: capped at the interval', should_refresh(s, now, now + 21600, 30) == true &&
+		should_refresh(s, now, now + 21599, 30) == false);
 
 	ok('rotate after interval', should_rotate(s, 1000, 1000 + 360 * 60, '12:00') == true);
 	ok('no rotate before interval', should_rotate(s, 1000, 1000 + 60, '12:00') == false);
@@ -1879,6 +1900,74 @@ write_cache(cache, cpath);
 	res = enforce_routing(cursor(), load_settings(cursor(), 'main'), { nftset: true, wan_dns: [ 'fd00::1' ] });
 	ok('exc dns: skipped without an IPv4 WAN resolver', length(find('firewall', 'bypass_dns_redirect')) == 0 &&
 		index(join(' ', res.notes), 'excluded devices') >= 0);
+}
+
+// 12. Locks name their holder: a lock left by a killed worker is reclaimed at
+//     once instead of after its whole age, a live holder's never is.
+{
+	let lp = '/tmp/nordvpn_test_' + time() + '.lock';
+	let own = _cmn.self_pid();
+	ok('lock: own pid known', type(own) == 'int' && own > 0);
+	let t = _cmn.acquire_lock(lp, 600);
+	ok('lock: taken', t != null);
+	ok('lock: records time and pid', match(readfile(lp), /^[0-9]+ [0-9]+\n$/) != null);
+	ok('lock: a live holder keeps it', _cmn.acquire_lock(lp, 600) == null);
+	writefile(lp, sprintf('%d %d\n', time(), 1073741824));
+	ok('lock: a dead holder is detected', _cmn.lock_stale(lp, 600) == true);
+	ok('lock: a dead holder\'s lock is reclaimed', _cmn.acquire_lock(lp, 600) != null);
+	// Locks written by older versions carry no pid: the age rule alone applies.
+	writefile(lp, sprintf('%d\n', time()));
+	ok('lock: a pid-less lock is not stale while young', _cmn.lock_stale(lp, 600) == false);
+	ok('lock: a missing lock is not stale', _cmn.lock_stale(lp + '.none', 600) == false);
+	_cmn.release_lock(lp);
+
+	// The rotation lock's age follows the instance's worst case.
+	eq('lock: default rotation ceiling', _cmn.rotation_max_runtime({ max_retries: 10, verify_timeout: 8 }), 300);
+	eq('lock: slow rotation ceiling', _cmn.rotation_max_runtime({ max_retries: 50, verify_timeout: 30 }), 2060);
+	eq('lock: ceiling is capped', _cmn.rotation_max_runtime({ max_retries: 500, verify_timeout: 30 }), 3600);
+	eq('lock: missing settings fall back', _cmn.rotation_max_runtime(null), 300);
+}
+
+// 13. Refresh status: a 'running' record whose worker is gone must not lock
+//     the refresh button (and every new refresh) forever.
+{
+	let FETCH_STATUS = '/tmp/nordvpn_fetch_status.json';
+	let now = time();
+	ok('fetch: a fresh running record is running', _cache.fetch_running({ state: 'running',
+		updated_at_epoch: now, pid: _cmn.self_pid() }, now) == true);
+	ok('fetch: a dead worker is not running', _cache.fetch_running({ state: 'running',
+		updated_at_epoch: now, pid: 1073741824 }, now) == false);
+	ok('fetch: a stalled record is not running', _cache.fetch_running({ state: 'running',
+		updated_at_epoch: now - _cache.FETCH_STALL - 1 }, now) == false);
+	ok('fetch: a record from the future is not running', _cache.fetch_running({ state: 'running',
+		updated_at_epoch: now + 3600 }, now) == false);
+	ok('fetch: a record without a stamp is not running', _cache.fetch_running({ state: 'running' }, now) == false);
+	ok('fetch: a finished record is not running', _cache.fetch_running({ state: 'done',
+		updated_at_epoch: now }, now) == false);
+
+	_cache.write_fetch_status({ state: 'running', pages: 3 });
+	let st = _cache.read_fetch_status();
+	ok('fetch: records carry the writer and a stamp', st.pid == _cmn.self_pid() && type(st.updated_at_epoch) == 'int');
+	eq('fetch: a live refresh reports running', _cache.fetch_status_report().state, 'running');
+	writefile(FETCH_STATUS, sprintf('%J', { ...st, pid: 1073741824 }));
+	let rep = _cache.fetch_status_report();
+	eq('fetch: a dead refresh reports an error', [ rep.state, rep.stale, rep.pages ], [ 'error', true, 3 ]);
+	_cache.write_fetch_status({ state: 'done' });
+	eq('fetch: a finished record carries no pid', _cache.read_fetch_status().pid, null);
+	unlink(FETCH_STATUS);
+	eq('fetch: no record reports null', _cache.fetch_status_report(), null);
+}
+
+// 14. Staleness of a parsed cache, without reading the file again.
+{
+	let now = time();
+	let c = { schema_version: 1, cached_at: now - 60, groups: true };
+	ok('stale: a fresh cache is not stale', _cache.is_stale(c, now) == false);
+	ok('stale: an old cache is stale', _cache.is_stale({ ...c, cached_at: now - 86401 }, now) == true);
+	ok('stale: a cache without group flags is stale', _cache.is_stale({ ...c, groups: null }, now) == true);
+	ok('stale: another schema is stale', _cache.is_stale({ ...c, schema_version: 99 }, now) == true);
+	ok('stale: no cache is stale', _cache.is_stale(null, now) == true);
+	ok('stale: the file check agrees', _cache.cache_is_stale(cpath) == _cache.is_stale(_cache.read_cache(cpath)));
 }
 
 unlink(cpath);

@@ -215,10 +215,13 @@ function rotation_event(res, reason) {
 }
 
 // Public entry point: serialize with any other rotation of the same instance
-// via a per-instance lock. `reason` only labels the history entry.
+// via a per-instance lock. `reason` only labels the history entry. The lock
+// ages out after the longest this instance's rotation can take, so a slow but
+// healthy one (many candidates, a long verify_timeout) is never run over.
 function rotate(uci, instance, reason) {
 	uci = uci || cursor();
-	let lock = acquire_lock(lock_path(instance), 300);
+	let lock = acquire_lock(lock_path(instance),
+		_common.rotation_max_runtime(load_settings(uci, instance)));
 	if (!lock)
 		return { skipped: true, reason: 'rotation already running' };
 
@@ -236,4 +239,13 @@ function rotate(uci, instance, reason) {
 	return res;
 }
 
-return { shuffle, current_key, plan_candidates, read_state, record, last_attempt_ts, mark_attempt, rotation_event, rotate };
+// A manual rotation as an asynchronous job (the `nordvpn-rotate --job` worker
+// the UI starts through rpcd's rotate_start): the outcome lands in the job
+// status file the page polls, like an apply's. See nordvpn.apply.run_job().
+function run_job(instance) {
+	return _apply.run_job(instance, 'rotate', function(name) {
+		return rotate(cursor(), name, 'manual');
+	});
+}
+
+return { shuffle, current_key, plan_candidates, read_state, record, last_attempt_ts, mark_attempt, rotation_event, rotate, run_job };

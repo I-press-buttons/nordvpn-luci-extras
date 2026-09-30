@@ -10,6 +10,7 @@
 'use strict';
 
 import * as uloop from 'uloop';
+import { stat } from 'fs';
 import { cursor } from 'uci';
 const _common = require('nordvpn.common');
 const load_settings = _common.load_settings,
@@ -18,15 +19,16 @@ const load_settings = _common.load_settings,
       log = _common.log;
 const _cache = require('nordvpn.cache');
 const fetch_and_build = _cache.fetch_and_build,
-      cache_is_stale = _cache.cache_is_stale;
+      read_cache = _cache.read_cache,
+      is_stale = _cache.is_stale;
 const _rotate = require('nordvpn.rotate');
 const rotate = _rotate.rotate,
-      last_attempt_ts = _rotate.last_attempt_ts,
       mark_attempt = _rotate.mark_attempt,
       read_state = _rotate.read_state,
       record = _rotate.record;
 const _service = require('nordvpn.service');
 const should_refresh = _service.should_refresh,
+      refresh_seed = _service.refresh_seed,
       should_rotate = _service.should_rotate,
       should_recover = _service.should_recover,
       watchdog_update = _service.watchdog_update,
@@ -40,29 +42,65 @@ const status = _status.status,
       egress_probe = _status.egress_probe;
 const record_event = require('nordvpn.history').record_event;
 
+// uloop only calls a task's result callback for a result the child actually
+// sent, so a child that is killed (the OOM killer, a stray `kill`) never
+// reports back. A job in flight for longer than this is presumed dead and may
+// be started again. Generous on purpose: a refresh is dozens of paged API
+// calls, a probe a few pings.
+const REFRESH_STUCK = 1800;
+const PROBE_STUCK = 120;
+
+function errmsg(e) {
+	return (type(e) == 'object' && e.message) ? e.message : ('' + e);
+}
+
 // One-time move of per-interface keys into the credential bank (idempotent).
-require('nordvpn.credentials').migrate(cursor());
+// A failure here must not keep the scheduler from starting.
+try {
+	require('nordvpn.credentials').migrate(cursor());
+} catch (e) {
+	log('credential migration failed: ' + errmsg(e));
+}
 
 uloop.init();
 
-let last_cache = 0;
-// Instances with a probe child in flight: a slow probe (every target timing
-// out) must not pile up a second one behind it.
+// Server-list refresh clock: epoch of the last refresh (attempt), seeded from
+// the cache file on the first tick; the cache path it belongs to; consecutive
+// failed attempts (retry backoff); and the start of a refresh still in flight
+// (0 = none).
+let last_cache = null;
+let cache_path = null;
+let refresh_fails = 0;
+let refreshing = 0;
+// Instances with a probe child in flight, by start epoch: a slow probe (every
+// target timing out) must not pile up a second one behind it.
 let probing = {};
+
+// Is a job started at epoch `since` still plausibly running? A clock that
+// jumped backwards releases it rather than blocking until it catches up.
+function in_flight(since, now, ceiling) {
+	return since > 0 && now >= since && (now - since) < ceiling;
+}
 
 // Ping through the tunnel in a child and fold the result into the persisted
 // probe fields when it returns. Only transitions reach the event history.
 function start_probe(inst, dev, gateway, targets) {
-	probing[inst] = true;
+	probing[inst] = time();
 	uloop.task(
-		function() { return egress_probe(dev, targets); },
+		function() {
+			try {
+				return egress_probe(dev, targets);
+			} catch (e) {
+				return null;
+			}
+		},
 		function(result) {
 			delete probing[inst];
-			// A child that died without a result says nothing about the
+			// A child that failed without a result says nothing about the
 			// tunnel; do not count it as a failed probe.
 			if (type(result) != 'object')
 				return;
-			let u =probe_update(read_state(inst) || {}, result, gateway, time());
+			let u = probe_update(read_state(inst) || {}, result, gateway, time());
 			record(u.fields, inst);
 			if (u.event == 'egress_lost') {
 				log('egress probe: ' + inst + ' forwards no traffic through ' + gateway);
@@ -76,107 +114,193 @@ function start_probe(inst, dev, gateway, targets) {
 	);
 }
 
-function tick() {
-	// Fresh cursor each tick so committed config changes are picked up.
-	let uci = cursor();
-	let now = time();
-	let lt = localtime();
-	let hm = sprintf('%02d:%02d', lt.hour, lt.min);
-
-	// The server-list cache is shared by all instances; refresh it once.
+// The server-list cache is shared by all instances; refresh it once.
+function refresh_step(uci, now) {
 	let shared = load_settings(uci);
 	let path = cache_file_path(shared);
-	if (should_refresh(shared, last_cache, now, cache_is_stale(path))) {
-		last_cache = now;
-		uloop.task(function() { fetch_and_build(path); });
+
+	// Read the cache once to seed the clock (again only if cache_dir moved),
+	// never on every tick: it is a multi-megabyte JSON document, and parsing
+	// it every 30 s cost a small router seconds of CPU and tens of MB each
+	// time. Seeding from the file's own write time is also what keeps a
+	// restart (procd restarts the daemon on every config save) from
+	// refetching a list that is still fresh.
+	if (last_cache == null || path != cache_path) {
+		let c = read_cache(path);
+		last_cache = refresh_seed(c ? c.cached_at : null, is_stale(c, now), now);
+		cache_path = path;
+		refresh_fails = 0;
+	} else {
+		// Between seeds, follow the file with a stat: a refresh from the UI
+		// (written by rename, so its mtime is its write time) restarts the
+		// clock and ends a failure streak; a vanished file (deleted, /tmp
+		// cleared) is due now.
+		let fst = stat(path);
+		if (!fst) {
+			if (!refresh_fails)
+				last_cache = 0;
+		} else if (last_cache && fst.mtime > last_cache && fst.mtime <= now) {
+			last_cache = fst.mtime;
+			refresh_fails = 0;
+		}
 	}
+
+	if (in_flight(refreshing, now, REFRESH_STUCK) ||
+	    !should_refresh(shared, last_cache, now, refresh_fails))
+		return;
+	last_cache = now;
+	refreshing = now;
+	uloop.task(
+		function() {
+			// Only the outcome crosses the pipe, never the server list.
+			try {
+				let r = fetch_and_build(path);
+				return (r && !r.error) ? { ok: true } : { ok: false, error: r ? r.error : 'fetch failed' };
+			} catch (e) {
+				return { ok: false, error: errmsg(e) };
+			}
+		},
+		function(res) {
+			refreshing = 0;
+			if (type(res) == 'object' && res.ok) {
+				refresh_fails = 0;
+				return;
+			}
+			// Another refresh (the UI's) holding the lock is not a failure.
+			if (type(res) == 'object' && res.error == 'refresh already in progress')
+				return;
+			refresh_fails++;
+			log('server list refresh failed: ' +
+				((type(res) == 'object' && res.error) ? res.error : 'unknown error') +
+				'; retrying with backoff');
+		}
+	);
+}
+
+function instance_step(uci, inst, now, hm) {
+	let s = load_settings(uci, inst);
+	// One read of the per-instance state serves the rotation clock and the
+	// watchdog below (mark_attempt only adds the clock field).
+	let st = read_state(inst) || {};
+	let last = (type(st.last_attempt) == 'int') ? st.last_attempt : 0;
 
 	// The rotation clock is persisted (nordvpn.rotate state), not in memory:
 	// procd restarts this daemon on every config change, and an in-memory
 	// counter would reset to 0 each time and make should_rotate() fire on the
 	// next tick. The first time rotation is active we only start the clock, so
 	// enabling rotation waits a full interval instead of rotating immediately.
-	for (let name in list_instances(uci)) {
-		let inst = name; // fresh binding for the task closure
-		let s = load_settings(uci, inst);
-		let last = last_attempt_ts(inst);
-		if (last == 0 && s.enabled && s.rotation_enabled && !(s.fixed_server && s.fixed_server != '')) {
-			mark_attempt(now, inst);
-		} else if (should_rotate(s, last, now, hm)) {
-			mark_attempt(now, inst);
-			uloop.task(function() { rotate(null, inst, 'schedule'); });
-		}
+	if (last == 0 && s.enabled && s.rotation_enabled && !(s.fixed_server && s.fixed_server != '')) {
+		mark_attempt(now, inst);
+	} else if (should_rotate(s, last, now, hm)) {
+		mark_attempt(now, inst);
+		uloop.task(function() { rotate(null, inst, 'schedule'); });
+	}
 
-		// Watchdog timers persist in the per-instance rotate state across daemon
-		// restarts. Ineligible instances clear that state without a status probe,
-		// so enabling or unpinning always starts with a fresh grace window. The
-		// egress probe is independent of the watchdog (it also feeds the status
-		// page), so a status read happens when either one is on.
-		let st = read_state(inst) || {};
-		let ds = (type(st.degraded_since) == 'int') ? st.degraded_since : 0;
-		let last_recover = (type(st.last_recover) == 'int') ? st.last_recover : 0;
-		let fails = (type(st.recover_fails) == 'int') ? st.recover_fails : 0;
-		let active = s.enabled && s.watchdog &&
-			!(s.fixed_server && s.fixed_server != '');
-		let probe_on = s.enabled && s.egress_probe;
-		if (!probe_on) {
-			let clr = probe_clear(st);
-			if (clr)
-				record(clr, inst);
-		}
-		if (!active) {
-			let upd = watchdog_update(null, {
-				degraded_since: ds,
-				last_recover: last_recover,
-				recover_fails: fails
-			}, now, false);
-			if (upd.degraded_since != ds || upd.last_recover != last_recover ||
-			    upd.recover_fails != fails)
-				record(upd, inst);
-			if (!probe_on)
-				continue;
-		}
-
-		let cur = status(uci, inst);
-		if (should_probe(s, cur.state) && cur.device && cur.gateway && !probing[inst])
-			start_probe(inst, cur.device, cur.gateway, s.probe_targets);
-		if (!active)
-			continue;
-
-		// A tunnel whose handshake is fresh but whose probe keeps failing is
-		// 'no_egress' here, which the watchdog treats like a stale handshake.
-		let state = effective_state(s, cur.state, st, cur.gateway);
-		let upd = watchdog_update(state, {
+	// Watchdog timers persist in the per-instance rotate state across daemon
+	// restarts. Ineligible instances clear that state without a status probe,
+	// so enabling or unpinning always starts with a fresh grace window. The
+	// egress probe is independent of the watchdog (it also feeds the status
+	// page), so a status read happens when either one is on.
+	let ds = (type(st.degraded_since) == 'int') ? st.degraded_since : 0;
+	let last_recover = (type(st.last_recover) == 'int') ? st.last_recover : 0;
+	let fails = (type(st.recover_fails) == 'int') ? st.recover_fails : 0;
+	let active = s.enabled && s.watchdog &&
+		!(s.fixed_server && s.fixed_server != '');
+	let probe_on = s.enabled && s.egress_probe;
+	if (!probe_on) {
+		let clr = probe_clear(st);
+		if (clr)
+			record(clr, inst);
+	}
+	if (!active) {
+		let upd = watchdog_update(null, {
 			degraded_since: ds,
 			last_recover: last_recover,
 			recover_fails: fails
-		}, now, true);
+		}, now, false);
 		if (upd.degraded_since != ds || upd.last_recover != last_recover ||
-		    upd.recover_fails != fails) {
+		    upd.recover_fails != fails)
 			record(upd, inst);
-			ds = upd.degraded_since;
-			last_recover = upd.last_recover;
-			fails = upd.recover_fails;
-		}
-		if (should_recover(s, state, ds, last_recover, fails, now)) {
-			// Claim the attempt before forking so overlapping ticks cannot
-			// double-fire. The worker result advances backoff only for a real
-			// failed recovery, not when another rotation owns the lock.
-			record({ last_recover: now }, inst);
-			record_event(inst, 'watchdog', { server: cur.gateway, reason: state,
-				detail: sprintf('unhealthy for %d s', now - ds) });
-			uloop.task(
-				function() { return rotate(null, inst, 'watchdog'); },
-				function(result) {
-					let latest = read_state(inst) || {};
-					let current = (type(latest.recover_fails) == 'int')
-						? latest.recover_fails : 0;
-					let next = watchdog_result_update(result, current);
-					if (next != current)
-						record({ recover_fails: next }, inst);
+		if (!probe_on)
+			return;
+	}
+
+	let cur = status(uci, inst, s);
+	if (should_probe(s, cur.state) && cur.device && cur.gateway &&
+	    !in_flight(probing[inst] || 0, now, PROBE_STUCK))
+		start_probe(inst, cur.device, cur.gateway, s.probe_targets);
+	if (!active)
+		return;
+
+	// A tunnel whose handshake is fresh but whose probe keeps failing is
+	// 'no_egress' here, which the watchdog treats like a stale handshake.
+	let state = effective_state(s, cur.state, st, cur.gateway);
+	let upd = watchdog_update(state, {
+		degraded_since: ds,
+		last_recover: last_recover,
+		recover_fails: fails
+	}, now, true);
+	if (upd.degraded_since != ds || upd.last_recover != last_recover ||
+	    upd.recover_fails != fails) {
+		record(upd, inst);
+		ds = upd.degraded_since;
+		last_recover = upd.last_recover;
+		fails = upd.recover_fails;
+	}
+	if (should_recover(s, state, ds, last_recover, fails, now)) {
+		// Claim the attempt before forking so overlapping ticks cannot
+		// double-fire. The worker result advances backoff only for a real
+		// failed recovery, not when another rotation owns the lock.
+		record({ last_recover: now }, inst);
+		record_event(inst, 'watchdog', { server: cur.gateway, reason: state,
+			detail: sprintf('unhealthy for %d s', now - ds) });
+		uloop.task(
+			function() {
+				try {
+					return rotate(null, inst, 'watchdog');
+				} catch (e) {
+					return { error: 'rotation error: ' + errmsg(e) };
 				}
-			);
+			},
+			function(result) {
+				let latest = read_state(inst) || {};
+				let current = (type(latest.recover_fails) == 'int')
+					? latest.recover_fails : 0;
+				let next = watchdog_result_update(result, current);
+				if (next != current)
+					record({ recover_fails: next }, inst);
+			}
+		);
+	}
+}
+
+// An exception escaping a uloop callback ends uloop.run() and with it the
+// daemon — procd stops respawning it after a few crashes an hour, which would
+// silently end rotation, the watchdog and the cache refresh for good. Every
+// step is therefore isolated and logged, so one broken instance cannot starve
+// the others either.
+function tick() {
+	try {
+		// Fresh cursor each tick so committed config changes are picked up.
+		let uci = cursor();
+		let now = time();
+		let lt = localtime();
+		let hm = sprintf('%02d:%02d', lt.hour, lt.min);
+
+		try {
+			refresh_step(uci, now);
+		} catch (e) {
+			log('scheduler: server list refresh: ' + errmsg(e));
 		}
+		for (let name in list_instances(uci)) {
+			try {
+				instance_step(uci, name, now, hm);
+			} catch (e) {
+				log('scheduler: instance ' + name + ': ' + errmsg(e));
+			}
+		}
+	} catch (e) {
+		log('scheduler: ' + errmsg(e));
 	}
 }
 
