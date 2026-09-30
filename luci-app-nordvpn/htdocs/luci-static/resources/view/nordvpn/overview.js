@@ -1176,6 +1176,9 @@ return view.extend({
 		this.autoRouting = null;
 		this.steerBoxes = {};
 		this.steerRow = null;
+		this.ipArea = null;
+		this.ipNote = null;
+		this.ipRow = null;
 		this.devRow = null;
 		this.domRow = null;
 		this.bypDevRow = null;
@@ -1267,6 +1270,8 @@ return view.extend({
 			body.appendChild(this.devRow);
 			this.domRow = this.buildDomainEditor(rt, 'steer');
 			body.appendChild(this.domRow);
+			this.ipRow = this.buildIpEditor();
+			body.appendChild(this.ipRow);
 			// Exceptions: shown whenever traffic is routed (all-LAN or steered).
 			this.bypDevRow = this.buildDevicePicker('bypass');
 			body.appendChild(this.bypDevRow);
@@ -1339,6 +1344,59 @@ return view.extend({
 		// entries are raw editor/UCI text (see the E() note at the top).
 		dom.content(ed.note, [ msgs.join(' ') ]);
 		ed.note.classList.toggle('hidden', !msgs.length);
+	},
+
+	/* ---- destination IP steering --------------------------------------- */
+
+	// Mirror of the backend's validate_ipv4_cidr(): an IPv4 address with an
+	// optional /1-/32 prefix.
+	normIp: function(s) {
+		var m = String(s || '').trim().match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})(?:\/(\d{1,2}))?$/);
+		if (!m || [ m[1], m[2], m[3], m[4] ].some(function(o) { return +o > 255; }))
+			return null;
+		if (m[5] != null && (+m[5] < 1 || +m[5] > 32))
+			return null;
+		return m[0];
+	},
+
+	parseIps: function() {
+		var valid = [], invalid = [];
+		var raw = (this.ipArea ? (this.ipArea.value || '') : '').split(/[\s,]+/).filter(Boolean);
+		raw.forEach(L.bind(function(x) {
+			var a = this.normIp(x);
+			if (!a)
+				invalid.push(x);
+			else if (valid.indexOf(a) < 0)
+				valid.push(a);
+		}, this));
+		return { valid: valid.slice(0, 64), invalid: invalid, capped: valid.length > 64 };
+	},
+
+	steeredIps: function() {
+		return this.parseIps().valid;
+	},
+
+	updateIpNote: function() {
+		if (!this.ipNote)
+			return;
+		var p = this.parseIps();
+		var msgs = [];
+		if (p.invalid.length)
+			msgs.push(_('Ignored (not an IPv4 address or range): %s').format(p.invalid.join(' ')));
+		if (p.capped)
+			msgs.push(_('Only the first 64 entries are used.'));
+		dom.content(this.ipNote, [ msgs.join(' ') ]);
+		this.ipNote.classList.toggle('hidden', !msgs.length);
+	},
+
+	buildIpEditor: function() {
+		var cur = L.toArray(uci.get('nordvpn', this.instance, 'steer_ip'));
+		this.ipArea = E('textarea', { class: 'cbi-input-textarea', rows: 3, style: 'width:100%;max-width:420px',
+			placeholder: '203.0.113.0/24\n198.51.100.9',
+			input: L.bind(function() { this.updateIpNote(); this.onRoutingToggle(); }, this) }, cur.join('\n'));
+		this.ipNote = E('div', { class: 'cbi-value-description nv-inline-note hidden' });
+		return this.row(_('Steered IP addresses'), [ this.ipArea, this.ipNote ],
+			_('Route only traffic to these IPv4 addresses or ranges through this instance, one per line (for example 203.0.113.0/24). Works for every client, without dnsmasq-full.'));
 	},
 
 	// One domain editor per list: 'steer' (steer_domain) or 'bypass'
@@ -1662,7 +1720,8 @@ return view.extend({
 			this.markDirty();
 		var auto = this.autoRouting && this.autoRouting.checked;
 		var on = auto || this.steeredNetworks().length > 0 || this.steeredDevices().length > 0 ||
-			this.steeredDomains().length > 0;
+			this.steeredDomains().length > 0 || this.steeredIps().length > 0;
+		if (this.ipRow) this.ipRow.classList.toggle('hidden', !!auto);
 		if (this.steerRow) this.steerRow.classList.toggle('hidden', !!auto);
 		if (this.devRow) this.devRow.classList.toggle('hidden', !!auto);
 		if (this.domRow) this.domRow.classList.toggle('hidden', !!auto);
@@ -2668,6 +2727,11 @@ return view.extend({
 				uci.set('nordvpn', inst, 'steer_domain', domains);
 			else if (this.domEds.steer)
 				uci.unset('nordvpn', inst, 'steer_domain');
+			var ips = autoOn ? [] : this.steeredIps();
+			if (ips.length)
+				uci.set('nordvpn', inst, 'steer_ip', ips);
+			else if (this.ipArea)
+				uci.unset('nordvpn', inst, 'steer_ip');
 			// Exceptions. With "Route all LAN traffic" the backend supplies a
 			// routing table itself (the interface name) and drops it again once
 			// the list is empty, so none is written here for that case.
@@ -2681,7 +2745,7 @@ return view.extend({
 				uci.set('nordvpn', inst, 'bypass_domain', bypDoms);
 			else if (this.domEds.bypass)
 				uci.unset('nordvpn', inst, 'bypass_domain');
-			if (steered.length || devices.length || domains.length) {
+			if (steered.length || devices.length || domains.length || ips.length) {
 				// Steering needs a routing table; default to the interface name.
 				var rtb = this.refs.routing_table ? (this.refs.routing_table.value || '').trim()
 					: (uci.get('nordvpn', inst, 'routing_table') || '');

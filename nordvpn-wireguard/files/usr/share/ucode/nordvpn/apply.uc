@@ -672,6 +672,7 @@ function delete_instance(uci, name) {
 	s.source_networks = [];
 	s.source_devices = [];
 	s.source_domains = [];
+	s.source_ips = [];
 	s.bypass_devices = [];
 	s.bypass_domains = [];
 	let routing = enforce_routing(uci, s);

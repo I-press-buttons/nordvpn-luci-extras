@@ -1332,6 +1332,15 @@ write_cache(cache, cpath);
 	eq('domain: hyphen edge refused', _cmn.validate_domain('-a.com'), null);
 	eq('domain: empty refused', _cmn.validate_domain('*.'), null);
 
+	eq('cidr: bare address', _cmn.validate_ipv4_cidr('203.0.113.7'), '203.0.113.7');
+	eq('cidr: range', _cmn.validate_ipv4_cidr('203.0.113.0/24'), '203.0.113.0/24');
+	eq('cidr: prefix > 32 refused', _cmn.validate_ipv4_cidr('203.0.113.0/33'), null);
+	eq('cidr: /0 refused', _cmn.validate_ipv4_cidr('0.0.0.0/0'), null);
+	eq('cidr: octet out of range', _cmn.validate_ipv4_cidr('300.1.1.1/8'), null);
+	eq('cidr: hostname refused', _cmn.validate_ipv4_cidr('example.com'), null);
+	eq('cidr: shell metachar refused', _cmn.validate_ipv4_cidr('1.1.1.1/8;reboot'), null);
+	eq('cidr: newline refused', _cmn.validate_ipv4_cidr('1.1.1.1/8\n2.2.2.2'), null);
+
 	global.MOCK_UCI = { nordvpn: { main: { '.type': 'instance', enabled: '1',
 		steer_domain: [ 'Example.com', 'example.com.', 'bad domain', 'b.org' ] } } };
 	eq('load_settings: domains validated + deduped', load_settings(cursor()).source_domains, [ 'example.com', 'b.org' ]);
@@ -1441,6 +1450,16 @@ write_cache(cache, cpath);
 	enforce_routing(uci, msteer({ enabled: false }), yes);
 	ok('disabling the instance releases domain objects', length(count('dhcp', 'domain_dns')) == 0 &&
 		length(count('firewall', 'domain_set')) == 0);
+
+	// destination IP steering: one MARK rule per entry, released with the instance
+	global.MOCK_UCI.nordvpn.media = { '.type': 'instance', steer_ip: [ '203.0.113.0/24', 'bad', '198.51.100.9' ] };
+	eq('load_settings: steer_ip validated', load_settings(cursor()).source_ips, [ '203.0.113.0/24', '198.51.100.9' ]);
+	enforce_routing(uci, msteer({ source_domains: [], source_ips: [ '203.0.113.0/24', '198.51.100.9' ] }), yes);
+	eq('ip steering: one mark rule per entry', length(count('firewall', 'ip_mark')), 2);
+	enforce_routing(uci, msteer({ source_domains: [], source_ips: [ '198.51.100.9' ] }), yes);
+	eq('ip steering: removed entries drop their rule', length(count('firewall', 'ip_mark')), 1);
+	enforce_routing(uci, msteer({ enabled: false, source_domains: [], source_ips: [ '198.51.100.9' ] }), yes);
+	eq('ip steering: disabling releases the rules', length(count('firewall', 'ip_mark')), 0);
 
 	enforce_routing(uci, msteer({}), yes);
 	global.MOCK_UCI.nordvpn.media.steer_domain = [ 'example.com' ];
