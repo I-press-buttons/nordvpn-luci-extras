@@ -133,7 +133,10 @@ that adds the extra features marked **(fork)** below.
   LAN through Germany and a media network through Serbia. Each has its own
   locations, schedule and routing. All tunnels share the *Default*
   credentials, so you paste a token once; add more named credentials to the
-  bank if some tunnels should use another account.
+  bank if some tunnels should use another account. Earlier versions gave
+  every tunnel its own token because NordVPN was reported to lock a key used
+  from several places at once. If a tunnel's key stops working while others
+  use it, give that tunnel its own entry with a separate token.
 
   ![VPN instances](docs/screenshots/instances.png)
 
