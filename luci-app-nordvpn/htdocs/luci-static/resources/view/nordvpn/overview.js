@@ -103,7 +103,8 @@ var STATUS_POLL_S = 5;
 // other change (server, location, hop mode, table, MTU, …) reconnects.
 var NO_RECONNECT_OPTS = [
 	'source_device', 'bypass_device', 'source_network', 'steer_domain', 'bypass_domain',
-	'auto_routing', 'killswitch', 'block_ipv6', 'vpn_dns', 'use_vpn_dns',
+	'steer_ip', 'bypass_ip',
+	'auto_routing', 'killswitch', 'block_ipv6', 'vpn_masq', 'vpn_dns', 'use_vpn_dns', 'custom_dns',
 	'rotation_enabled', 'rotation_mode', 'rotation_interval', 'rotation_time',
 	'watchdog', 'egress_probe', 'probe_target', 'verify_timeout', 'max_retries'
 ];
