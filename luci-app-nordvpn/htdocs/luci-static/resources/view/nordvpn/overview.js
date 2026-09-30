@@ -1304,26 +1304,48 @@ return view.extend({
 		return /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$/.test(d) ? d : null;
 	},
 
-	// Split an editor's text into { valid (deduped), invalid } entries.
+	// Mirror of the backend's validate_cidr4(): 'a.b.c.d' or 'a.b.c.d/1-32'.
+	normIp: function(s) {
+		var m = String(s || '').trim().match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})(?:\/(\d{1,2}))?$/);
+		if (!m || m.slice(1, 5).some(function(o) { return +o > 255; }))
+			return null;
+		if (m[5] != null && (+m[5] < 1 || +m[5] > 32))
+			return null;
+		return m[0];
+	},
+
+	// Split an editor's text into { valid (domains), ips (addresses and
+	// networks), invalid } entries; each list is deduped and capped at 64.
 	parseDomains: function(ed) {
-		var valid = [], invalid = [];
+		var valid = [], ips = [], invalid = [];
 		var raw = (ed && ed.area) ? (ed.area.value || '').split(/[\s,]+/).filter(Boolean) : [];
 		raw.forEach(L.bind(function(x) {
-			var d = this.normDomain(x);
-			if (!d)
+			var ip = this.normIp(x), d = ip ? null : this.normDomain(x);
+			if (!ip && !d)
 				invalid.push(x);
-			else if (valid.indexOf(d) < 0)
+			else if (ip && ips.indexOf(ip) < 0)
+				ips.push(ip);
+			else if (d && valid.indexOf(d) < 0)
 				valid.push(d);
 		}, this));
-		return { valid: valid.slice(0, 64), invalid: invalid, capped: valid.length > 64 };
+		return { valid: valid.slice(0, 64), ips: ips.slice(0, 64), invalid: invalid,
+			capped: valid.length > 64 || ips.length > 64 };
 	},
 
 	steeredDomains: function() {
 		return this.parseDomains((this.domEds || {}).steer).valid;
 	},
 
+	steeredIps: function() {
+		return this.parseDomains((this.domEds || {}).steer).ips;
+	},
+
 	excludedDomains: function() {
 		return this.parseDomains((this.domEds || {}).bypass).valid;
+	},
+
+	excludedIps: function() {
+		return this.parseDomains((this.domEds || {}).bypass).ips;
 	},
 
 	updateDomainNote: function(ed) {
@@ -1332,9 +1354,9 @@ return view.extend({
 		var p = this.parseDomains(ed);
 		var msgs = [];
 		if (p.invalid.length)
-			msgs.push(_('Ignored (not a domain name): %s').format(p.invalid.join(' ')));
+			msgs.push(_('Ignored (not a domain name or IPv4 address): %s').format(p.invalid.join(' ')));
 		if (p.capped)
-			msgs.push(_('Only the first 64 domains are used.'));
+			msgs.push(_('Only the first 64 domains and 64 addresses are used.'));
 		// Array-wrapped: a bare string goes to innerHTML, and the ignored
 		// entries are raw editor/UCI text (see the E() note at the top).
 		dom.content(ed.note, [ msgs.join(' ') ]);
@@ -1345,21 +1367,22 @@ return view.extend({
 	// (bypass_domain, always the normal connection).
 	buildDomainEditor: function(rt, kind) {
 		var ed = { kind: kind };
-		var cur = L.toArray(uci.get('nordvpn', this.instance, (kind === 'bypass') ? 'bypass_domain' : 'steer_domain'));
+		var cur = L.toArray(uci.get('nordvpn', this.instance, (kind === 'bypass') ? 'bypass_domain' : 'steer_domain'))
+			.concat(L.toArray(uci.get('nordvpn', this.instance, (kind === 'bypass') ? 'bypass_ip' : 'steer_ip')));
 		ed.area = E('textarea', { class: 'cbi-input-textarea', rows: 3, style: 'width:100%;max-width:420px',
-			placeholder: (kind === 'bypass') ? 'bank.example.com' : 'example.com\nvideo.example.org',
+			placeholder: (kind === 'bypass') ? 'bank.example.com\n203.0.113.0/24' : 'example.com\nvideo.example.org\n198.51.100.0/24',
 			input: L.bind(function() { this.updateDomainNote(ed); this.onRoutingToggle(); }, this) }, cur.join('\n'));
 		ed.note = E('div', { class: 'cbi-value-description nv-inline-note hidden' });
 		this.domEds[kind] = ed;
-		var unsupported = (rt.domain_steering === 'unsupported' && cur.length)
+		var unsupported = (rt.domain_steering === 'unsupported' && cur.some(function(x) { return !this.normIp(x); }, this))
 			? E('div', { class: 'cbi-value-description nv-inline-note' },
 				_('⚠ The installed dnsmasq cannot fill nftables sets, so these domains are ignored. Install dnsmasq-full (replacing dnsmasq) and save again.'))
 			: '';
 		if (kind === 'bypass')
-			return this.row(_('Excluded domains'), [ ed.area, ed.note, unsupported ],
-				_('Traffic to these domains (and their subdomains) always uses your normal connection, for example a bank or a streaming site that blocks VPNs. One per line. Works for clients that use this router for DNS; IPv4 only; needs dnsmasq-full.'));
-		return this.row(_('Steered domains'), [ ed.area, ed.note, unsupported ],
-			_('Route only traffic to these domains (and their subdomains) through this instance, one per line. Works for clients that use this router for DNS; apps with their own encrypted DNS bypass it. IPv4 only; needs dnsmasq-full.'));
+			return this.row(_('Excluded domains and addresses'), [ ed.area, ed.note, unsupported ],
+				_('Traffic to these domains (and their subdomains) or IPv4 addresses and networks (for example 203.0.113.0/24) always uses your normal connection, for example a bank or a streaming site that blocks VPNs. One per line. Domains work for clients that use this router for DNS and need dnsmasq-full; addresses need neither.'));
+		return this.row(_('Steered domains and addresses'), [ ed.area, ed.note, unsupported ],
+			_('Route only traffic to these domains (and their subdomains) or IPv4 addresses and networks (for example 198.51.100.0/24) through this instance, one per line. Domains work for clients that use this router for DNS (apps with their own encrypted DNS bypass it) and need dnsmasq-full; addresses need neither. IPv4 only.'));
 	},
 
 	/* ---- per-device steering picker ------------------------------------ */
@@ -1662,7 +1685,7 @@ return view.extend({
 			this.markDirty();
 		var auto = this.autoRouting && this.autoRouting.checked;
 		var on = auto || this.steeredNetworks().length > 0 || this.steeredDevices().length > 0 ||
-			this.steeredDomains().length > 0;
+			this.steeredDomains().length > 0 || this.steeredIps().length > 0;
 		if (this.steerRow) this.steerRow.classList.toggle('hidden', !!auto);
 		if (this.devRow) this.devRow.classList.toggle('hidden', !!auto);
 		if (this.domRow) this.domRow.classList.toggle('hidden', !!auto);
@@ -2663,6 +2686,16 @@ return view.extend({
 				uci.set('nordvpn', inst, 'source_network', steered);
 			else
 				uci.unset('nordvpn', inst, 'source_network');
+			var ips = autoOn ? [] : this.steeredIps();
+			if (ips.length)
+				uci.set('nordvpn', inst, 'steer_ip', ips);
+			else if (this.domEds.steer)
+				uci.unset('nordvpn', inst, 'steer_ip');
+			var bypIps = this.excludedIps();
+			if (bypIps.length)
+				uci.set('nordvpn', inst, 'bypass_ip', bypIps);
+			else if (this.domEds.bypass)
+				uci.unset('nordvpn', inst, 'bypass_ip');
 			var domains = autoOn ? [] : this.steeredDomains();
 			if (domains.length)
 				uci.set('nordvpn', inst, 'steer_domain', domains);
@@ -2681,7 +2714,7 @@ return view.extend({
 				uci.set('nordvpn', inst, 'bypass_domain', bypDoms);
 			else if (this.domEds.bypass)
 				uci.unset('nordvpn', inst, 'bypass_domain');
-			if (steered.length || devices.length || domains.length) {
+			if (steered.length || devices.length || domains.length || ips.length) {
 				// Steering needs a routing table; default to the interface name.
 				var rtb = this.refs.routing_table ? (this.refs.routing_table.value || '').trim()
 					: (uci.get('nordvpn', inst, 'routing_table') || '');

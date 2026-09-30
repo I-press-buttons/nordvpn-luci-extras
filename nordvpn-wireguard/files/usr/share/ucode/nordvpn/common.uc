@@ -233,6 +233,21 @@ function validate_ipv4(a) {
 	return a;
 }
 
+// A destination network to steer or exclude: an IPv4 address or 'a.b.c.d/len'
+// with len 1-32 (a /0 would capture everything and is refused). Returned in
+// the same spelling, a bare address staying bare, else null.
+function validate_cidr4(c) {
+	if (type(c) != 'string')
+		return null;
+	c = trim(c);
+	let m = match(c, /^([0-9.]+)(\/([0-9]{1,2}))?$/);
+	if (!m || !validate_ipv4(m[1]))
+		return null;
+	if (m[3] != null && (int(m[3]) < 1 || int(m[3]) > 32))
+		return null;
+	return c;
+}
+
 // Client MAC address: 'aa:bb:cc:dd:ee:ff', '-' separators, or 12 bare hex
 // digits. Normalized to lowercase colon form, the form stored in UCI.
 // A DNS domain to steer: lower-cased, a leading '*.'/'.' and a trailing '.'
@@ -420,6 +435,16 @@ function load_settings(uci, instance) {
 			push(steer_domains, d);
 	}
 
+	// `list steer_ip` — destination IPv4 addresses/networks steered through
+	// this instance (marked by an fw4 rule, no dnsmasq needed).
+	let sip = uci.get('nordvpn', name, 'steer_ip');
+	let steer_ips = [];
+	for (let x in ((type(sip) == 'array') ? sip : (sip != null ? [ sip ] : []))) {
+		let c = validate_cidr4(x);
+		if (c && index(steer_ips, c) < 0 && length(steer_ips) < MAX_STEER_DOMAINS)
+			push(steer_ips, c);
+	}
+
 	// `list bypass_device` / `list bypass_domain` — exceptions: devices and
 	// domains that always take the normal connection, even while the kill
 	// switch blocks the rest. An entry that is both steered and excluded
@@ -438,6 +463,14 @@ function load_settings(uci, instance) {
 		if (d && index(bypass_domains, d) < 0 && length(bypass_domains) < MAX_STEER_DOMAINS)
 			push(bypass_domains, d);
 	}
+	let bip = uci.get('nordvpn', name, 'bypass_ip');
+	let bypass_ips = [];
+	for (let x in ((type(bip) == 'array') ? bip : (bip != null ? [ bip ] : []))) {
+		let c = validate_cidr4(x);
+		if (c && index(bypass_ips, c) < 0 && length(bypass_ips) < MAX_STEER_DOMAINS)
+			push(bypass_ips, c);
+	}
+	steer_ips = filter(steer_ips, (c) => index(bypass_ips, c) < 0);
 	source_devices = filter(source_devices, (m) => index(bypass_devices, m) < 0);
 	steer_domains = filter(steer_domains, (d) => index(bypass_domains, d) < 0);
 
@@ -483,7 +516,7 @@ function load_settings(uci, instance) {
 	// interface's name. Never written to the config, so removing the
 	// exceptions restores plain automatic routing through the main table.
 	if (routing_table == '' && g('auto_routing', '0') == '1' &&
-	    (length(bypass_devices) > 0 || length(bypass_domains) > 0))
+	    (length(bypass_devices) > 0 || length(bypass_domains) > 0 || length(bypass_ips) > 0))
 		routing_table = iface;
 
 	return {
@@ -491,8 +524,10 @@ function load_settings(uci, instance) {
 		source_networks: source_networks,
 		source_devices: source_devices,
 		source_domains: steer_domains,
+		source_ips: steer_ips,
 		bypass_devices: bypass_devices,
 		bypass_domains: bypass_domains,
+		bypass_ips: bypass_ips,
 		locations: locations,
 		enabled: g('enabled', '0') == '1',
 		interface: iface,
@@ -684,7 +719,7 @@ return {
 	full_match, bounded_int, validate_interface, validate_token, validate_wg_key, validate_hostname, validate_nordvpn_host,
 	validate_port, validate_hop_mode, validate_dns_mode, relay_kind, validate_selection, validate_server_group, validate_rotation_mode, validate_interval, validate_time,
 	validate_country_code, validate_location_code, validate_instance, validate_routing_table, validate_dir,
-	validate_mac, validate_domain, clean_label, validate_ipv4,
+	validate_mac, validate_domain, validate_cidr4, clean_label, validate_ipv4,
 	managed_interface, load_settings, list_instances, globals_section, cache_file_path, iso_ts, redact, log,
 	atomic_write, acquire_lock, release_lock, sh_quote, open_cmd, run
 };

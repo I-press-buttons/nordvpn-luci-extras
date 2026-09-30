@@ -880,7 +880,7 @@ function detect(uci, s, runtime) {
 	let zone = find_zone_of(uci, iface);
 	let peer = find_peer(uci, iface);
 	let steering = length(s.source_networks || []) > 0 || length(s.source_devices || []) > 0 ||
-		length(s.source_domains || []) > 0;
+		length(s.source_domains || []) > 0 || length(s.source_ips || []) > 0;
 	// "Route all LAN traffic" already owned by an earlier instance: this one
 	// falls back to its steering (or none) and reports who holds it.
 	let owner = s.auto_routing ? all_lan_owner(uci, s.name) : null;
@@ -888,7 +888,8 @@ function detect(uci, s, runtime) {
 	// Exceptions only mean something while traffic is routed at all; with
 	// "Route all LAN traffic" they move it onto the steered machinery.
 	let exceptions = (auto || steering) &&
-		(length(s.bypass_devices || []) > 0 || length(s.bypass_domains || []) > 0);
+		(length(s.bypass_devices || []) > 0 || length(s.bypass_domains || []) > 0 ||
+			length(s.bypass_ips || []) > 0);
 	// With steering active, extra user routes INSIDE the instance's table are
 	// legitimate companions (e.g. a media→LAN route); only routes referencing
 	// the interface itself signal a hand-built scheme. Without steering, a
@@ -911,6 +912,8 @@ function detect(uci, s, runtime) {
 		source_networks: s.source_networks || [],
 		source_devices: s.source_devices || [],
 		source_domains: s.source_domains || [],
+		source_ips: s.source_ips || [],
+		bypass_ips: s.bypass_ips || [],
 		exceptions: exceptions,
 		// 'unsupported' when steered or excluded domains are configured but
 		// dnsmasq cannot fill nft sets (needs dnsmasq-full); null when not
@@ -1111,7 +1114,27 @@ function enforce(uci, s, opts) {
 	if (reconcile_domain_dns(uci, iface, setname, steer_doms))
 		cd = true;
 
-	let marks = (mark && (length(steer_devs) || length(steer_doms))) ? [ mark ] : [];
+	// 1b-ip. Destination steering: same mark, matched on the destination
+	//        address or network instead of a dnsmasq-filled set, so it needs
+	//        neither dnsmasq-full nor clients that use the router's DNS.
+	let steer_ips = [];
+	if (steer && !all_lan && length(s.source_ips || []) > 0) {
+		if (!mark)
+			mark = device_mark(rt_table_id(table));
+		if (!det.lan_zone)
+			push(notes, 'address steering: could not determine the LAN zone');
+		else if (!mark)
+			push(notes, 'address steering needs a routing table with an id of 1-255; ' + table + ' has none');
+		else
+			steer_ips = s.source_ips;
+	}
+	if (reconcile_rules(uci, 'rule', 'ip_mark', iface, steer_ips, function(c) {
+		return { name: 'NordVPN address ' + c, src: det.lan_zone, dest: '*', dest_ip: c, family: 'ipv4',
+			proto: 'all', target: 'MARK', set_xmark: mark };
+	}, 'dest_ip', 'firewall'))
+		cf = true;
+
+	let marks = (mark && (length(steer_devs) || length(steer_doms) || length(steer_ips))) ? [ mark ] : [];
 	if (reconcile_rules(uci, 'rule', 'device_mark', iface, steer_devs, function(mac) {
 		return { name: 'NordVPN device ' + mac, src: det.lan_zone, dest: '*', src_mac: mac, proto: 'all',
 			target: 'MARK', set_xmark: mark };
@@ -1123,7 +1146,7 @@ function enforce(uci, s, opts) {
 		uci.foreach('firewall', 'rule', function(sec) {
 			if (sec[MARK] != '1' || sec.nordvpn_iface != iface)
 				return;
-			if ((sec[ROLE] == 'device_mark' || sec[ROLE] == 'domain_mark') && sec.set_xmark != mark) {
+			if ((sec[ROLE] == 'device_mark' || sec[ROLE] == 'domain_mark' || sec[ROLE] == 'ip_mark') && sec.set_xmark != mark) {
 				uci.set('firewall', sec['.name'], 'set_xmark', mark);
 				cf = true;
 			}
@@ -1149,7 +1172,7 @@ function enforce(uci, s, opts) {
 	//        ahead of every steering lookup (19000, 20000) and prohibit
 	//        (21000) rule: excluded traffic skips the tunnel and the kill
 	//        switch, and keeps its IPv6.
-	let byp_devs = [], byp_doms = [];
+	let byp_devs = [], byp_doms = [], byp_ips = [];
 	let bmark = device_mark(BYPASS_TABLE_ID);
 	if (steer && det.exceptions) {
 		if (rt_table_id(table) == BYPASS_TABLE_ID)
@@ -1159,6 +1182,12 @@ function enforce(uci, s, opts) {
 			if (length(byp_devs) && !det.lan_zone) {
 				push(notes, 'excluded devices: could not determine the LAN zone');
 				byp_devs = [];
+			}
+			if (length(s.bypass_ips || []) > 0) {
+				if (det.lan_zone)
+					byp_ips = s.bypass_ips;
+				else
+					push(notes, 'excluded addresses: could not determine the LAN zone');
 			}
 			if (length(s.bypass_domains || []) > 0) {
 				let supported = (opts && opts.nftset != null) ? !!opts.nftset : nftset_supported();
@@ -1180,9 +1209,9 @@ function enforce(uci, s, opts) {
 		if (sec[MARK] != '1')
 			return;
 		let r = sec[ROLE];
-		if ((r == 'bypass_mark' || r == 'bypass_domain_mark') && sec.nordvpn_iface == iface)
+		if ((r == 'bypass_mark' || r == 'bypass_domain_mark' || r == 'bypass_ip_mark') && sec.nordvpn_iface == iface)
 			push(byp_secs, sec['.name']);
-		else if (length(byp_secs) && (r == 'device_mark' || r == 'domain_mark'))
+		else if (length(byp_secs) && (r == 'device_mark' || r == 'domain_mark' || r == 'ip_mark'))
 			late = true;
 	});
 	if (late) {
@@ -1208,7 +1237,12 @@ function enforce(uci, s, opts) {
 			target: 'MARK', set_xmark: bmark };
 	}, 'src_mac', 'firewall'))
 		cf = true;
-	let bmarks = (length(byp_devs) || length(byp_doms)) ? [ bmark ] : [];
+	if (reconcile_rules(uci, 'rule', 'bypass_ip_mark', iface, byp_ips, function(c) {
+		return { name: 'NordVPN exception ' + c, src: det.lan_zone, dest: '*', dest_ip: c, family: 'ipv4',
+			proto: 'all', target: 'MARK', set_xmark: bmark };
+	}, 'dest_ip', 'firewall'))
+		cf = true;
+	let bmarks = (length(byp_devs) || length(byp_doms) || length(byp_ips)) ? [ bmark ] : [];
 	if (reconcile_rules(uci, 'rule', 'bypass_lookup', iface, bmarks, function(m) {
 		return { mark: m, lookup: 'main', priority: '18000' };
 	}, 'mark'))
