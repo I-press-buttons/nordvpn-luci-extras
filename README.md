@@ -299,6 +299,13 @@ Your own dnsmasq `server` entries and `noresolv` setting are kept.
 - **The router's own traffic.** Package updates, time sync, the NordVPN API
   and the server-list download leave through the WAN when the instance uses
   a routing table. That is by design; only your devices' traffic is routed.
+- **The router's own lookups while the tunnel is down.** The router resolves
+  names through dnsmasq too, so with the DNS lock on and a routing table set,
+  it can only resolve `nordvpn.com` names until the tunnel is back:
+  reconnecting and rotating keep working, but time sync by hostname,
+  package updates and other lookups fail in the meantime. If you need them
+  then, turn the lock off by choosing no NordVPN DNS, or give the router an
+  NTP server by IP address.
 - **A changed WAN resolver.** The lock, the `nordvpn.com` exception and the
   excluded devices' DNS use the WAN's resolvers as they were at the last save
   or reconnect. If your provider changes them, save once.
