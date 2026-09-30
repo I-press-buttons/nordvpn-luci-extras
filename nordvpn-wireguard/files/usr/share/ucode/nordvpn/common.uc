@@ -163,7 +163,21 @@ function validate_hop_mode(m) {
 // (NordVPN's plain resolver) or 'threat' (NordVPN Threat Protection, blocks
 // ads and malware). null for anything else so the caller can fall back.
 function validate_dns_mode(m) {
-	return (m == 'off' || m == 'standard' || m == 'threat') ? m : null;
+	return (m == 'off' || m == 'standard' || m == 'threat' || m == 'custom') ? m : null;
+}
+
+// A resolver address for the 'custom' DNS mode: an IPv4 literal that is
+// reachable through the tunnel, so not loopback, private, link-local or
+// unspecified (those would point at the router or the LAN, not the VPN).
+function validate_custom_dns(a) {
+	if (!validate_ipv4(a))
+		return null;
+	let o = map(split(a, '.'), int);
+	if (o[0] == 0 || o[0] == 10 || o[0] == 127 || o[0] >= 224 ||
+	    (o[0] == 169 && o[1] == 254) || (o[0] == 172 && o[1] >= 16 && o[1] <= 31) ||
+	    (o[0] == 192 && o[1] == 168) || (o[0] == 100 && o[1] >= 64 && o[1] <= 127))
+		return null;
+	return a;
 }
 
 // Classify a relay from the normalized cache: 'multihop' (Double VPN),
@@ -475,6 +489,14 @@ function load_settings(uci, instance) {
 	if (length(probe_targets) == 0)
 		probe_targets = [ ...DEFAULT_PROBE_TARGETS ];
 
+	// `list dns_server` — resolvers for vpn_dns 'custom'. Invalid entries are
+	// dropped, at most four kept.
+	let ds = uci.get('nordvpn', name, 'dns_server');
+	let dns_servers = [];
+	for (let x in (type(ds) == 'array') ? ds : (type(ds) == 'string' ? [ ds ] : []))
+		if (validate_custom_dns(x) && index(dns_servers, x) < 0 && length(dns_servers) < 4)
+			push(dns_servers, x);
+
 	let iface = validate_interface(g('interface', DEFAULT_INTERFACE)) || DEFAULT_INTERFACE;
 	// Invalid names fall back to the main table (see validate_routing_table).
 	let routing_table = validate_routing_table(g('routing_table', '')) || '';
@@ -540,12 +562,17 @@ function load_settings(uci, instance) {
 		// as a derived boolean for the enforce condition and any other consumer.
 		vpn_dns: (function() {
 			let m = validate_dns_mode(g('vpn_dns', ''));
+			// 'custom' without a usable resolver is the same as 'off'.
+			if (m == 'custom' && !length(dns_servers))
+				return 'off';
 			if (m)
 				return m;
 			return (g('use_vpn_dns', '0') == '1') ? 'standard' : 'off';
 		})(),
+		dns_servers: dns_servers,
 		use_vpn_dns: validate_dns_mode(g('vpn_dns', '')) ?
-			(g('vpn_dns', '') != 'off') : (g('use_vpn_dns', '0') == '1'),
+			(g('vpn_dns', '') != 'off' && (g('vpn_dns', '') != 'custom' || length(dns_servers) > 0)) :
+			(g('use_vpn_dns', '0') == '1'),
 		cache_dir: gs('cache_dir', ''),
 		cache_refresh_interval: (function() {
 			let v = bounded_int(gs('cache_refresh_interval', '21600'), MIN_CACHE_REFRESH, MAX_CACHE_REFRESH);
@@ -684,7 +711,7 @@ return {
 	full_match, bounded_int, validate_interface, validate_token, validate_wg_key, validate_hostname, validate_nordvpn_host,
 	validate_port, validate_hop_mode, validate_dns_mode, relay_kind, validate_selection, validate_server_group, validate_rotation_mode, validate_interval, validate_time,
 	validate_country_code, validate_location_code, validate_instance, validate_routing_table, validate_dir,
-	validate_mac, validate_domain, clean_label, validate_ipv4,
+	validate_mac, validate_domain, clean_label, validate_ipv4, validate_custom_dns,
 	managed_interface, load_settings, list_instances, globals_section, cache_file_path, iso_ts, redact, log,
 	atomic_write, acquire_lock, release_lock, sh_quote, open_cmd, run
 };

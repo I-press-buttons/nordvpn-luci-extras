@@ -80,7 +80,10 @@ config instance 'main'
 	# DNS resolver while the tunnel is up: 'off' (system/WAN), 'standard'
 	# (NordVPN 103.86.96.100/99.100) or 'threat' (NordVPN Threat Protection
 	# 103.86.96.96/99.99, blocks ads and malware).
+	# 'custom' uses your own resolvers from `list dns_server` (1-4 public IPv4
+	# addresses, sent through the tunnel); without any it behaves like 'off'.
 	option vpn_dns 'off'
+	# list dns_server '9.9.9.9'
 	# Server-list cache directory (empty = /tmp) and background refresh period.
 	# System trees (/etc, /usr, /root, ...) are refused and fall back to /tmp.
 	option cache_dir ''

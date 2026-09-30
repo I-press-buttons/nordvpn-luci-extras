@@ -94,6 +94,17 @@ var HISTORY_LIMIT = 25;
 // A probe target: a dotted-quad IPv4 literal (the backend accepts nothing else).
 var IPV4_RE = /^(25[0-5]|2[0-4]\d|1?\d?\d)(\.(25[0-5]|2[0-4]\d|1?\d?\d)){3}$/;
 
+// A resolver the tunnel can reach: not loopback, private, link-local, CGNAT or
+// multicast (mirrors the backend's validate_custom_dns).
+function isPublicIPv4(a) {
+	if (!IPV4_RE.test(a))
+		return false;
+	var o = a.split('.').map(Number);
+	return !(o[0] === 0 || o[0] === 10 || o[0] === 127 || o[0] >= 224 ||
+		(o[0] === 169 && o[1] === 254) || (o[0] === 172 && o[1] >= 16 && o[1] <= 31) ||
+		(o[0] === 192 && o[1] === 168) || (o[0] === 100 && o[1] >= 64 && o[1] <= 127));
+}
+
 var STYLE = '' +
 	'.nv-status-main{display:flex;flex-wrap:wrap;align-items:baseline;gap:.75em;font-size:1.05em}' +
 	'.nv-state{font-weight:700}' +
@@ -677,12 +688,16 @@ return view.extend({
 		    (rt.mode !== 'auto' && rt.mode !== 'steered'))
 			return null;
 		var mode = uci.get('nordvpn', this.instance, 'vpn_dns');
-		if (mode !== 'off' && mode !== 'standard' && mode !== 'threat')
+		if (mode !== 'off' && mode !== 'standard' && mode !== 'threat' && mode !== 'custom')
 			mode = (uci.get('nordvpn', this.instance, 'use_vpn_dns') === '1') ? 'standard' : 'off';
+		if (mode === 'custom' && !this.customDnsList().length)
+			mode = 'off';
 		if (mode === 'off')
 			return E('div', { class: 'nv-status-details', style: 'color:var(--warning-color,#b8860b)' },
 				_('DNS: the router\'s upstream resolver (usually your ISP), which can see every site looked up. Choose NordVPN DNS under Traffic routing to change that.'));
-		return E('div', { class: 'nv-status-details' }, (mode === 'threat')
+		return E('div', { class: 'nv-status-details' }, (mode === 'custom')
+			? _('DNS: custom (%s), through the tunnel').format(this.customDnsList().join(', '))
+			: (mode === 'threat')
 			? _('DNS: NordVPN Threat Protection, through the tunnel')
 			: _('DNS: NordVPN, through the tunnel'));
 	},
@@ -1219,14 +1234,23 @@ return view.extend({
 			this.v6Box.checked = (g('block_ipv6', '1') === '1');
 			// DNS mode: prefer the enum, fall back to the legacy boolean.
 			var dnsMode = g('vpn_dns', '');
-			if (dnsMode !== 'off' && dnsMode !== 'standard' && dnsMode !== 'threat')
+			if (dnsMode !== 'off' && dnsMode !== 'standard' && dnsMode !== 'threat' && dnsMode !== 'custom')
 				dnsMode = (g('use_vpn_dns', '0') === '1') ? 'standard' : 'off';
-			this.dnsSel = E('select', { class: 'cbi-input-select', change: L.bind(this.markDirty, this) }, [
+			this.customDnsInput = E('input', { type: 'text', class: 'cbi-input-text', style: 'width:240px',
+				placeholder: '9.9.9.9 149.112.112.112', value: this.customDnsList().join(' '),
+				input: L.bind(this.markDirty, this) });
+			this.customDnsWrap = E('div', { class: 'nv-inline' }, [ this.customDnsInput ]);
+			this.dnsSel = E('select', { class: 'cbi-input-select', change: L.bind(function() {
+				this.customDnsWrap.classList.toggle('hidden', this.dnsSel.value !== 'custom');
+				this.markDirty();
+			}, this) }, [
 				E('option', { value: 'off' }, _('Off — use system DNS')),
 				E('option', { value: 'standard' }, _('NordVPN — standard')),
-				E('option', { value: 'threat' }, _('NordVPN Threat Protection — blocks ads & malware'))
+				E('option', { value: 'threat' }, _('NordVPN Threat Protection — blocks ads & malware')),
+				E('option', { value: 'custom' }, _('Custom — your own DNS servers'))
 			]);
 			this.dnsSel.value = dnsMode;
+			this.customDnsWrap.classList.toggle('hidden', dnsMode !== 'custom');
 			this.v6Warn = E('div', { class: 'cbi-value-description nv-inline-note hidden' },
 				_('⚠ IPv6 stays outside the tunnel and can leak your address.'));
 
@@ -1279,7 +1303,7 @@ return view.extend({
 				E('label', { class: 'nv-check' }, [ this.v6Box, _('Block direct IPv6 to prevent leaks') ]),
 				this.v6Warn
 			]);
-			this.dnsRow = this.row(_('DNS'), [ this.dnsSel ],
+			this.dnsRow = this.row(_('DNS'), [ this.dnsSel, this.customDnsWrap ],
 				_('Which resolver to use while connected. Threat Protection blocks ads and malware at the DNS level; both NordVPN options only work through the tunnel. With "Route all LAN traffic", the router then forwards every lookup only to NordVPN (so none leak to your provider\'s resolver), and lookups fail while the tunnel is down.'));
 			body.appendChild(this.ksRow);
 			body.appendChild(this.v6Row);
@@ -2653,6 +2677,11 @@ return view.extend({
 			uci.set('nordvpn', inst, 'killswitch', (this.ksBox && this.ksBox.checked) ? '1' : '0');
 			uci.set('nordvpn', inst, 'block_ipv6', (this.v6Box && this.v6Box.checked) ? '1' : '0');
 			uci.set('nordvpn', inst, 'vpn_dns', (this.dnsSel && this.dnsSel.value) || 'off');
+			var customDns = this.customDnsInput ? this.customDnsInput.value.split(/[\s,]+/).filter(Boolean) : [];
+			if (customDns.length)
+				uci.set('nordvpn', inst, 'dns_server', customDns);
+			else
+				uci.unset('nordvpn', inst, 'dns_server');
 			// Drop the legacy boolean so it cannot contradict the enum.
 			uci.unset('nordvpn', inst, 'use_vpn_dns');
 			if (devices.length)
@@ -2718,6 +2747,14 @@ return view.extend({
 			uci.unset('nordvpn', inst, 'probe_target');
 	},
 
+	// Resolvers for the 'custom' DNS mode: the live input once the routing
+	// section is built, otherwise what is saved in UCI.
+	customDnsList: function() {
+		if (this.customDnsInput)
+			return this.customDnsInput.value.split(/[\s,]+/).filter(Boolean);
+		return L.toArray(uci.get('nordvpn', this.instance, 'dns_server'));
+	},
+
 	probeTargetList: function() {
 		var el = this.refs.probe_target;
 		return el ? (el.value || '').split(/[\s,]+/).filter(Boolean) : [];
@@ -2730,6 +2767,13 @@ return view.extend({
 		if (!validCount) {
 			this.notice(_('Please add at least one country or city for this hop mode.'), 'error');
 			return Promise.resolve();
+		}
+		if (this.dnsSel && this.dnsSel.value === 'custom') {
+			var dnsList = this.customDnsList();
+			if (!dnsList.length || dnsList.length > 4 || !dnsList.every(isPublicIPv4)) {
+				this.notice(_('Enter one to four public IPv4 DNS server addresses, separated by spaces.'), 'error');
+				return Promise.resolve();
+			}
 		}
 		var badTarget = this.probeTargetList().filter(function(t) { return !IPV4_RE.test(t); })[0];
 		if (badTarget) {

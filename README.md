@@ -117,7 +117,9 @@ that adds the extra features marked **(fork)** below.
 - **Kill switch and IPv6 leak block.** When the tunnel is down, steered
   traffic is blocked rather than leaking out through the WAN.
 - **NordVPN DNS.** Optionally use NordVPN's resolvers, or Threat Protection,
-  which blocks ads and malware at the DNS level. The router's own lookups to
+  which blocks ads and malware at the DNS level. **Custom DNS (fork)** sends
+  lookups to one to four resolvers of your choice (for example Quad9) through
+  the tunnel instead. The router's own lookups to
   them go through the tunnel in steered mode too. With *Route all LAN
   traffic*, no lookup falls back to your provider's resolver, and excluded
   devices keep your provider's DNS. See [Preventing leaks](#preventing-leaks).
@@ -380,7 +382,8 @@ config instance 'main'
 	list bypass_domain 'bank.example.com'   #   (excluded domains need dnsmasq-full)
 	option killswitch '0'            # block steered traffic while VPN is down
 	option block_ipv6 '1'            # block direct IPv6 (leak prevention)
-	option vpn_dns 'off'             # off | standard | threat (NordVPN resolvers)
+	option vpn_dns 'off'             # off | standard | threat (NordVPN resolvers) | custom
+	list dns_server '9.9.9.9'        # resolvers for 'custom': 1-4 public IPv4 addresses
 	option cache_dir ''              # empty = /tmp, shared by all instances; /etc, /usr, /root etc. are refused
 	option cache_refresh_interval '21600'   # seconds, background refresh
 ```
