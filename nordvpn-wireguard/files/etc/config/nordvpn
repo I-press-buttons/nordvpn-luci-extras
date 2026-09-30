@@ -81,6 +81,8 @@ config instance 'main'
 	# (NordVPN 103.86.96.100/99.100) or 'threat' (NordVPN Threat Protection
 	# 103.86.96.96/99.99, blocks ads and malware).
 	option vpn_dns 'off'
+	# 'custom' uses your own public IPv4 resolvers (at most 4) from this list:
+	# list dns_server '9.9.9.9'
 	# Server-list cache directory (empty = /tmp) and background refresh period.
 	# System trees (/etc, /usr, /root, ...) are refused and fall back to /tmp.
 	option cache_dir ''

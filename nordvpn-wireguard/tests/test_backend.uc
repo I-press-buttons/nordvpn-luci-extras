@@ -677,6 +677,18 @@ write_cache(cache, cpath);
 	enforce_routing(uci, mks({ auto_routing: true, vpn_dns: 'off' }));
 	eq('dns: off removes the override', global.MOCK_UCI.network.nordvpn.dns, null);
 	eq('dns: off clears the stamp', global.MOCK_UCI.network.nordvpn.nordvpn_managed_dns, null);
+
+	// Custom resolvers: the instance's own list, re-applied when it changes.
+	enforce_routing(uci, mks({ auto_routing: true, vpn_dns: 'custom', dns_servers: [ '9.9.9.9', '149.112.112.112' ] }));
+	eq('dns: custom list applied', global.MOCK_UCI.network.nordvpn.dns, [ '9.9.9.9', '149.112.112.112' ]);
+	enforce_routing(uci, mks({ auto_routing: true, vpn_dns: 'custom', dns_servers: [ '1.1.1.1' ] }));
+	eq('dns: edited custom list re-applies', global.MOCK_UCI.network.nordvpn.dns, [ '1.1.1.1' ]);
+	enforce_routing(uci, mks({ auto_routing: true, vpn_dns: 'custom', dns_servers: [] }));
+	eq('dns: custom without resolvers removes the override', global.MOCK_UCI.network.nordvpn.dns, null);
+
+	ok('dns: public resolver accepted', _cmn.validate_dns_server('9.9.9.9') == '9.9.9.9');
+	for (let bad in [ '192.168.1.1', '10.0.0.1', '172.20.0.1', '127.0.0.1', '169.254.1.1', '100.64.0.1', '0.0.0.0', '224.0.0.1', '1.2.3', '::1', 'dns.example' ])
+		ok('dns: refuses ' + bad, _cmn.validate_dns_server(bad) == null);
 }
 
 // 8b. source-network steering: lookup/prohibit rules, reconciliation, teardown

@@ -94,6 +94,16 @@ var HISTORY_LIMIT = 25;
 // A probe target: a dotted-quad IPv4 literal (the backend accepts nothing else).
 var IPV4_RE = /^(25[0-5]|2[0-4]\d|1?\d?\d)(\.(25[0-5]|2[0-4]\d|1?\d?\d)){3}$/;
 
+// Public unicast IPv4 only, mirroring the backend's custom DNS validation.
+function PUBLIC_IPV4(a) {
+	if (!IPV4_RE.test(a))
+		return false;
+	var o = a.split('.').map(Number);
+	return !(o[0] === 0 || o[0] === 10 || o[0] === 127 || o[0] >= 224 ||
+		(o[0] === 169 && o[1] === 254) || (o[0] === 172 && o[1] >= 16 && o[1] <= 31) ||
+		(o[0] === 192 && o[1] === 168) || (o[0] === 100 && o[1] >= 64 && o[1] <= 127));
+}
+
 var STYLE = '' +
 	'.nv-status-main{display:flex;flex-wrap:wrap;align-items:baseline;gap:.75em;font-size:1.05em}' +
 	'.nv-state{font-weight:700}' +
@@ -677,11 +687,14 @@ return view.extend({
 		    (rt.mode !== 'auto' && rt.mode !== 'steered'))
 			return null;
 		var mode = uci.get('nordvpn', this.instance, 'vpn_dns');
-		if (mode !== 'off' && mode !== 'standard' && mode !== 'threat')
+		if (mode !== 'off' && mode !== 'standard' && mode !== 'threat' && mode !== 'custom')
 			mode = (uci.get('nordvpn', this.instance, 'use_vpn_dns') === '1') ? 'standard' : 'off';
 		if (mode === 'off')
 			return E('div', { class: 'nv-status-details', style: 'color:var(--warning-color,#b8860b)' },
 				_('DNS: the router\'s upstream resolver (usually your ISP), which can see every site looked up. Choose NordVPN DNS under Traffic routing to change that.'));
+		if (mode === 'custom')
+			return E('div', { class: 'nv-status-details' },
+				_('DNS: %s, through the tunnel').format(L.toArray(uci.get('nordvpn', this.instance, 'dns_server')).join(', ')));
 		return E('div', { class: 'nv-status-details' }, (mode === 'threat')
 			? _('DNS: NordVPN Threat Protection, through the tunnel')
 			: _('DNS: NordVPN, through the tunnel'));
@@ -1219,14 +1232,22 @@ return view.extend({
 			this.v6Box.checked = (g('block_ipv6', '1') === '1');
 			// DNS mode: prefer the enum, fall back to the legacy boolean.
 			var dnsMode = g('vpn_dns', '');
-			if (dnsMode !== 'off' && dnsMode !== 'standard' && dnsMode !== 'threat')
+			if (dnsMode !== 'off' && dnsMode !== 'standard' && dnsMode !== 'threat' && dnsMode !== 'custom')
 				dnsMode = (g('use_vpn_dns', '0') === '1') ? 'standard' : 'off';
-			this.dnsSel = E('select', { class: 'cbi-input-select', change: L.bind(this.markDirty, this) }, [
+			this.dnsSel = E('select', { class: 'cbi-input-select', change: L.bind(this.onDnsChange, this) }, [
 				E('option', { value: 'off' }, _('Off — use system DNS')),
 				E('option', { value: 'standard' }, _('NordVPN — standard')),
-				E('option', { value: 'threat' }, _('NordVPN Threat Protection — blocks ads & malware'))
+				E('option', { value: 'threat' }, _('NordVPN Threat Protection — blocks ads & malware')),
+				E('option', { value: 'custom' }, _('Custom — my own resolvers'))
 			]);
 			this.dnsSel.value = dnsMode;
+			this.dnsCustom = E('input', {
+				type: 'text', class: 'cbi-input-text', style: 'width:240px', placeholder: '9.9.9.9 149.112.112.112',
+				value: L.toArray(uci.get('nordvpn', this.instance, 'dns_server')).join(' '),
+				input: L.bind(this.markDirty, this)
+			});
+			this.dnsCustomWrap = E('div', { style: 'margin-top:.4em' }, [ this.dnsCustom ]);
+			this.dnsCustomWrap.classList.toggle('hidden', dnsMode !== 'custom');
 			this.v6Warn = E('div', { class: 'cbi-value-description nv-inline-note hidden' },
 				_('⚠ IPv6 stays outside the tunnel and can leak your address.'));
 
@@ -1279,8 +1300,8 @@ return view.extend({
 				E('label', { class: 'nv-check' }, [ this.v6Box, _('Block direct IPv6 to prevent leaks') ]),
 				this.v6Warn
 			]);
-			this.dnsRow = this.row(_('DNS'), [ this.dnsSel ],
-				_('Which resolver to use while connected. Threat Protection blocks ads and malware at the DNS level; both NordVPN options only work through the tunnel. With "Route all LAN traffic", the router then forwards every lookup only to NordVPN (so none leak to your provider\'s resolver), and lookups fail while the tunnel is down.'));
+			this.dnsRow = this.row(_('DNS'), [ this.dnsSel, this.dnsCustomWrap ],
+				_('Which resolver to use while connected. Custom takes up to four public IPv4 resolvers (for example Quad9 or Cloudflare), separated by spaces; they are reached through the tunnel like the NordVPN ones. Threat Protection blocks ads and malware at the DNS level; both NordVPN options only work through the tunnel. With "Route all LAN traffic", the router then forwards every lookup only to NordVPN (so none leak to your provider\'s resolver), and lookups fail while the tunnel is down.'));
 			body.appendChild(this.ksRow);
 			body.appendChild(this.v6Row);
 			body.appendChild(this.dnsRow);
@@ -2590,6 +2611,15 @@ return view.extend({
 
 	/* ---- dirty / save / discard --------------------------------------- */
 
+	onDnsChange: function() {
+		this.dnsCustomWrap.classList.toggle('hidden', this.dnsSel.value !== 'custom');
+		this.markDirty();
+	},
+
+	dnsCustomList: function() {
+		return this.dnsCustom ? (this.dnsCustom.value || '').split(/[\s,]+/).filter(Boolean) : [];
+	},
+
 	markDirty: function() {
 		if (this._building)
 			return;
@@ -2655,6 +2685,11 @@ return view.extend({
 			uci.set('nordvpn', inst, 'vpn_dns', (this.dnsSel && this.dnsSel.value) || 'off');
 			// Drop the legacy boolean so it cannot contradict the enum.
 			uci.unset('nordvpn', inst, 'use_vpn_dns');
+			var dnsList = this.dnsCustomList();
+			if (this.dnsSel && this.dnsSel.value === 'custom' && dnsList.length)
+				uci.set('nordvpn', inst, 'dns_server', dnsList);
+			else
+				uci.unset('nordvpn', inst, 'dns_server');
 			if (devices.length)
 				uci.set('nordvpn', inst, 'source_device', devices);
 			else
@@ -2735,6 +2770,16 @@ return view.extend({
 		if (badTarget) {
 			this.notice(_('Internet check target "%s" is not an IPv4 address.').format(badTarget), 'error');
 			return Promise.resolve();
+		}
+		if (this.dnsSel && this.dnsSel.value === 'custom') {
+			var dl = this.dnsCustomList();
+			var badDns = dl.filter(function(a) { return !PUBLIC_IPV4(a); })[0];
+			if (!dl.length || dl.length > 4 || badDns) {
+				this.notice(badDns
+					? _('Custom DNS "%s" is not a public IPv4 address.').format(badDns)
+					: _('Enter one to four public IPv4 resolvers for custom DNS.'), 'error');
+				return Promise.resolve();
+			}
 		}
 		this.collectIntoUci();
 		this.saveBtn.disabled = true;

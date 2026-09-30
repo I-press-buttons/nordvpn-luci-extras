@@ -121,6 +121,10 @@ that adds the extra features marked **(fork)** below.
   them go through the tunnel in steered mode too. With *Route all LAN
   traffic*, no lookup falls back to your provider's resolver, and excluded
   devices keep your provider's DNS. See [Preventing leaks](#preventing-leaks).
+- **Custom DNS (fork).** Like GL.iNet's manual DNS: use up to four public
+  IPv4 resolvers of your choice (Quad9, Cloudflare, your own server) instead
+  of NordVPN's. They are reached through the tunnel and get the same leak
+  protections as NordVPN's resolvers.
 - **Leaves your own setup alone.** If you already route traffic by hand, the
   app detects it and doesn't touch it. Everything it creates is tagged and
   removed cleanly.
@@ -380,7 +384,8 @@ config instance 'main'
 	list bypass_domain 'bank.example.com'   #   (excluded domains need dnsmasq-full)
 	option killswitch '0'            # block steered traffic while VPN is down
 	option block_ipv6 '1'            # block direct IPv6 (leak prevention)
-	option vpn_dns 'off'             # off | standard | threat (NordVPN resolvers)
+	option vpn_dns 'off'             # off | standard | threat (NordVPN resolvers) | custom
+	list dns_server '9.9.9.9'        # resolvers for vpn_dns 'custom' (public IPv4, max 4)
 	option cache_dir ''              # empty = /tmp, shared by all instances; /etc, /usr, /root etc. are refused
 	option cache_refresh_interval '21600'   # seconds, background refresh
 ```
