@@ -28,6 +28,9 @@ const PKG_FILE = '/etc/config/' + PKG;
 const DEFAULT_ID = 'default';
 const DEFAULT_NAME = 'Default';
 const MAX_NAME = 32;
+// Section recording that the one-time move to the bank has happened.
+// make_id() never produces a leading underscore, so no entry can take it.
+const STATE = '_state';
 
 // uci cannot write a package whose file does not exist; create it root-only.
 function ensure_file() {
@@ -247,40 +250,49 @@ function remove(uci, id) {
 
 // One-time move from per-interface keys to the bank. The first configured
 // instance (main first) seeds 'default'; an instance holding a different key
-// gets its own entry named after it. Idempotent: does nothing once 'default'
-// has a key. Returns true when it changed anything.
+// gets its own entry named after it. Runs once: a stamp in the bank records
+// it, and a bank that already holds entries (set up by this version, before
+// the stamp existed) is only stamped. Keying it on "default has no key"
+// instead re-ran it whenever Default's key was removed, refilling Default
+// from another entry's key and moving that entry's instances onto it.
+// Returns true when it moved any key.
 function migrate(uci) {
-	if (key_of(uci, DEFAULT_ID))
+	if (uci.get(PKG, STATE, 'migrated') == '1')
 		return false;
-	let def = null, changed = false;
-	for (let name in list_instances(uci)) {
-		let iface = validate_interface(load_settings(uci, name).interface);
-		let key = (iface && managed_interface(uci, iface)) ?
-			validate_wg_key(uci.get('network', iface, 'private_key')) : null;
-		if (!key)
-			continue;
-		ensure_file();
-		if (def == null || key == def) {
-			if (def == null) {
-				def = key;
-				uci.set(PKG, DEFAULT_ID, 'credential');
-				uci.set(PKG, DEFAULT_ID, 'name', DEFAULT_NAME);
-				uci.set(PKG, DEFAULT_ID, 'private_key', key);
+	let changed = false;
+	if (!length(entry_ids(uci))) {
+		let def = null;
+		for (let name in list_instances(uci)) {
+			let iface = validate_interface(load_settings(uci, name).interface);
+			let key = (iface && managed_interface(uci, iface)) ?
+				validate_wg_key(uci.get('network', iface, 'private_key')) : null;
+			if (!key)
+				continue;
+			ensure_file();
+			if (def == null || key == def) {
+				if (def == null) {
+					def = key;
+					uci.set(PKG, DEFAULT_ID, 'credential');
+					uci.set(PKG, DEFAULT_ID, 'name', DEFAULT_NAME);
+					uci.set(PKG, DEFAULT_ID, 'private_key', key);
+				}
+				uci.delete('nordvpn', name, 'credential');
+			} else {
+				let id = make_id(name, entry_ids(uci));
+				uci.set(PKG, id, 'credential');
+				uci.set(PKG, id, 'name', clean_label(name) || name);
+				uci.set(PKG, id, 'private_key', key);
+				uci.set('nordvpn', name, 'credential', id);
 			}
-			uci.delete('nordvpn', name, 'credential');
-		} else {
-			let id = make_id(name, entry_ids(uci));
-			uci.set(PKG, id, 'credential');
-			uci.set(PKG, id, 'name', clean_label(name) || name);
-			uci.set(PKG, id, 'private_key', key);
-			uci.set('nordvpn', name, 'credential', id);
+			changed = true;
 		}
-		changed = true;
 	}
-	if (changed) {
-		uci.commit(PKG);
+	ensure_file();
+	uci.set(PKG, STATE, 'state');
+	uci.set(PKG, STATE, 'migrated', '1');
+	uci.commit(PKG);
+	if (changed)
 		uci.commit('nordvpn');
-	}
 	return changed;
 }
 

@@ -320,6 +320,56 @@ eq('instances back to one', length(m.instances.call().instances), 1);
 	eq('default users lose the key', [ global.MOCK_UCI.network.nordvpn.private_key, global.MOCK_UCI.network.nv_media.private_key ], [ null, null ]);
 	eq('others keep theirs', global.MOCK_UCI.network.nv_work.private_key, KEY2);
 
+	// The migration runs once. Every apply, service start and most rpcd calls
+	// run migrate(); a cleared Default must stay cleared rather than being
+	// refilled from another entry's key, which also moved 'work' onto it.
+	ok('migration does not run again', _creds.migrate(cursor()) == false);
+	eq('default stays without a key', global.MOCK_UCI.nordvpn_credentials['default'].private_key, null);
+	eq('work stays on its entry', global.MOCK_UCI.nordvpn.work.credential, 'work');
+	eq('main is not handed work\'s key', _creds.sync_instance(cursor(), 'main'), null);
+	eq('main still has no key', global.MOCK_UCI.network.nordvpn.private_key, null);
+	eq('the bank still lists both', map(m.credentials.call().credentials, (e) => [ e.id, e.configured ]),
+		[ [ 'default', false ], [ 'work', true ] ]);
+
+	// A fresh install: nothing to move, but the bank is stamped, so adding a
+	// named entry first never gets folded into Default later.
+	global.MOCK_UCI = {
+		nordvpn: {
+			main: { '.type': 'instance', interface: 'nordvpn', cache_dir: cdir },
+			lab: { '.type': 'instance', interface: 'nv_lab' }
+		},
+		network: {}
+	};
+	ok('fresh install: nothing moved', _creds.migrate(cursor()) == false);
+	eq('fresh install: stamped', global.MOCK_UCI.nordvpn_credentials._state.migrated, '1');
+	next_key = KEY2;
+	r = m.set_credentials.call({ args: { token: tok, name: 'Lab' } });
+	ok('named entry first', r.ok == true && r.credential == 'lab');
+	global.MOCK_UCI.nordvpn.lab.credential = 'lab';
+	eq('lab gets its key', _creds.sync_instance(cursor(), 'lab'), 'set');
+	ok('later calls move nothing', _creds.migrate(cursor()) == false);
+	eq('default still empty', global.MOCK_UCI.nordvpn_credentials['default'], null);
+	eq('lab still on its own entry', global.MOCK_UCI.nordvpn.lab.credential, 'lab');
+
+	// A router already running the bank (from before the stamp): only stamped.
+	global.MOCK_UCI = {
+		nordvpn: {
+			main: { '.type': 'instance', interface: 'nordvpn', cache_dir: cdir },
+			work: { '.type': 'instance', interface: 'nv_work', credential: 'work' }
+		},
+		nordvpn_credentials: {
+			'default': { '.type': 'credential', name: 'Default' },
+			work: { '.type': 'credential', name: 'work', private_key: KEY2 }
+		},
+		network: {
+			nv_work: { '.type': 'interface', proto: 'wireguard', private_key: KEY2, vpn_type: 'nordvpn' }
+		}
+	};
+	ok('existing bank: nothing moved', _creds.migrate(cursor()) == false);
+	eq('existing bank: stamped', global.MOCK_UCI.nordvpn_credentials._state.migrated, '1');
+	eq('existing bank: default untouched', global.MOCK_UCI.nordvpn_credentials['default'].private_key, null);
+	eq('existing bank: work untouched', global.MOCK_UCI.nordvpn.work.credential, 'work');
+
 	_api.get_private_key = real_key;
 	global.MOCK_UCI = saved_uci;
 }
