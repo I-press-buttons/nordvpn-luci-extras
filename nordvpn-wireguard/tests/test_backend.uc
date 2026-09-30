@@ -1110,6 +1110,13 @@ write_cache(cache, cpath);
 	eq('exceptions: an excluded device is not also steered', ls.source_devices, [ D2 ]);
 	eq('exceptions: an excluded domain is not also steered', ls.source_domains, [ 'video.example.org' ]);
 	eq('exceptions: all-LAN gets the interface as implicit table', ls.routing_table, 'nordvpn');
+	global.MOCK_UCI.nordvpn.main.bypass_ip = [ '10.9.0.0/16', '10.9.0.0/33', '0.0.0.0/0', 'x.y', '8.8.8.8' ];
+	global.MOCK_UCI.nordvpn.main.steer_ip = [ '8.8.8.8', '1.1.1.1/32' ];
+	ls = load_settings(cursor());
+	eq('exceptions: addresses validated', ls.bypass_ips, [ '10.9.0.0/16', '8.8.8.8' ]);
+	eq('exceptions: an excluded address is not also steered', ls.source_ips, [ '1.1.1.1/32' ]);
+	delete global.MOCK_UCI.nordvpn.main.bypass_ip;
+	delete global.MOCK_UCI.nordvpn.main.steer_ip;
 	global.MOCK_UCI.nordvpn.main.routing_table = '100';
 	eq('exceptions: an explicit table wins', load_settings(cursor()).routing_table, '100');
 	delete global.MOCK_UCI.nordvpn.main.routing_table;
@@ -1191,6 +1198,24 @@ write_cache(cache, cpath);
 		length(count('firewall', 'bypass_set')) == 0 && length(count('dhcp', 'bypass_dns')) == 0 &&
 		length(filter(res.notes, (n) => index(n, 'dnsmasq-full') >= 0)) == 1);
 	eq('exceptions: ... the excluded device stays', length(count('firewall', 'bypass_mark')), 1);
+
+	// Excluded addresses: a MARK rule on the destination, no dnsmasq needed.
+	res = enforce_routing(uci, ex({ bypass_ips: [ '203.0.113.0/24' ] }), no);
+	let bip = count('firewall', 'bypass_ip_mark');
+	ok('exceptions: destination MARK rule for an excluded network', length(bip) == 1 && bip[0].dest_ip == '203.0.113.0/24' &&
+		bip[0].src == 'lan' && bip[0].dest == '*' && bip[0].set_xmark == BMARK);
+	ok('exceptions: excluded addresses work without dnsmasq-full', length(filter(res.notes, (n) => index(n, 'dnsmasq-full') >= 0)) == 0);
+	enforce_routing(uci, ex({}), no);
+	eq('exceptions: excluded address removed with its entry', length(count('firewall', 'bypass_ip_mark')), 0);
+
+	// Steered addresses ride the device mark and lookup.
+	res = enforce_routing(uci, ex({ auto_routing: false, bypass_devices: [], source_networks: [], source_ips: [ '198.51.100.7', '192.0.2.0/24' ] }), no);
+	let sip = count('firewall', 'ip_mark');
+	ok('steer: a MARK rule per steered address', length(sip) == 2 && sip[0].dest_ip == '198.51.100.7' && sip[0].src == 'lan' &&
+		sip[0].dest == '*' && sip[0].target == 'MARK');
+	eq('steer: addresses use the tunnel table via the mark', length(count('network', 'dev_lookup')), 1);
+	enforce_routing(uci, ex({ auto_routing: false, bypass_devices: [], source_ips: [ '198.51.100.7' ] }), no);
+	eq('steer: dropped addresses lose their rule', length(count('firewall', 'ip_mark')), 1);
 
 	// Removing the exceptions returns to plain automatic routing.
 	enforce_routing(uci, ex({ bypass_devices: [], routing_table: '' }), yes);
