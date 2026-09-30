@@ -164,9 +164,10 @@ function validate_hop_mode(m) {
 
 // DNS override mode while connected: 'off' (system/WAN resolver), 'standard'
 // (NordVPN's plain resolver) or 'threat' (NordVPN Threat Protection, blocks
-// ads and malware). null for anything else so the caller can fall back.
+// ads and malware) or 'custom' (the user's own resolvers, `custom_dns`). null
+// for anything else so the caller can fall back.
 function validate_dns_mode(m) {
-	return (m == 'off' || m == 'standard' || m == 'threat') ? m : null;
+	return (m == 'off' || m == 'standard' || m == 'threat' || m == 'custom') ? m : null;
 }
 
 // Classify a relay from the normalized cache: 'multihop' (Double VPN),
@@ -584,6 +585,18 @@ function load_settings(uci, instance) {
 		})(),
 		use_vpn_dns: validate_dns_mode(g('vpn_dns', '')) ?
 			(g('vpn_dns', '') != 'off') : (g('use_vpn_dns', '0') == '1'),
+		// `list custom_dns`: IPv4 resolvers used when vpn_dns is 'custom'
+		// (at most 4, deduplicated, invalid entries dropped).
+		custom_dns: (function() {
+			let out = [];
+			let cd = uci.get('nordvpn', name, 'custom_dns');
+			for (let x in (type(cd) == 'array') ? cd : (type(cd) == 'string' ? [ cd ] : [])) {
+				x = trim('' + x);
+				if (validate_ipv4(x) && index(out, x) < 0 && length(out) < 4)
+					push(out, x);
+			}
+			return out;
+		})(),
 		cache_dir: gs('cache_dir', ''),
 		cache_refresh_interval: (function() {
 			let v = bounded_int(gs('cache_refresh_interval', '21600'), MIN_CACHE_REFRESH, MAX_CACHE_REFRESH);

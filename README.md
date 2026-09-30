@@ -125,6 +125,8 @@ that adds the extra features marked **(fork)** below.
   them go through the tunnel in steered mode too. With *Route all LAN
   traffic*, no lookup falls back to your provider's resolver, and excluded
   devices keep your provider's DNS. See [Preventing leaks](#preventing-leaks).
+  Or choose **custom DNS servers (fork)**, such as Quad9 or your own Pi-hole; they
+  are reached through the tunnel and get the same DNS lock and kill switch.
 - **Leaves your own setup alone.** If you already route traffic by hand, the
   app detects it and doesn't touch it. Everything it creates is tagged and
   removed cleanly.
@@ -392,7 +394,8 @@ config instance 'main'
 	list bypass_ip '203.0.113.7'     # destination IPv4 address/network to exclude
 	option killswitch '0'            # block steered traffic while VPN is down
 	option block_ipv6 '1'            # block direct IPv6 (leak prevention)
-	option vpn_dns 'off'             # off | standard | threat (NordVPN resolvers)
+	option vpn_dns 'off'             # off | standard | threat | custom
+	list custom_dns '9.9.9.9'        # with vpn_dns 'custom': up to 4 IPv4 resolvers
 	option cache_dir ''              # empty = /tmp, shared by all instances; /etc, /usr, /root etc. are refused
 	option cache_refresh_interval '21600'   # seconds, background refresh
 ```

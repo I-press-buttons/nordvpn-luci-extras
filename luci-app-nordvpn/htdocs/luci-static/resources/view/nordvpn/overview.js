@@ -697,8 +697,10 @@ return view.extend({
 		    (rt.mode !== 'auto' && rt.mode !== 'steered'))
 			return null;
 		var mode = uci.get('nordvpn', this.instance, 'vpn_dns');
-		if (mode !== 'off' && mode !== 'standard' && mode !== 'threat')
+		if (mode !== 'off' && mode !== 'standard' && mode !== 'threat' && mode !== 'custom')
 			mode = (uci.get('nordvpn', this.instance, 'use_vpn_dns') === '1') ? 'standard' : 'off';
+		if (mode === 'custom')
+			return E('div', { class: 'nv-status-details' }, _('DNS: your custom servers, through the tunnel'));
 		if (mode === 'off')
 			return E('div', { class: 'nv-status-details', style: 'color:var(--warning-color,#b8860b)' },
 				_('DNS: the router\'s upstream resolver (usually your ISP), which can see every site looked up. Choose NordVPN DNS under Traffic routing to change that.'));
@@ -1264,14 +1266,23 @@ return view.extend({
 			this.v6Box.checked = (g('block_ipv6', '1') === '1');
 			// DNS mode: prefer the enum, fall back to the legacy boolean.
 			var dnsMode = g('vpn_dns', '');
-			if (dnsMode !== 'off' && dnsMode !== 'standard' && dnsMode !== 'threat')
+			if (dnsMode !== 'off' && dnsMode !== 'standard' && dnsMode !== 'threat' && dnsMode !== 'custom')
 				dnsMode = (g('use_vpn_dns', '0') === '1') ? 'standard' : 'off';
-			this.dnsSel = E('select', { class: 'cbi-input-select', change: L.bind(this.markDirty, this) }, [
+			this.dnsSel = E('select', { class: 'cbi-input-select', change: L.bind(function() {
+				this.dnsCustom.classList.toggle('hidden', this.dnsSel.value !== 'custom');
+				this.markDirty();
+			}, this) }, [
 				E('option', { value: 'off' }, _('Off — use system DNS')),
 				E('option', { value: 'standard' }, _('NordVPN — standard')),
-				E('option', { value: 'threat' }, _('NordVPN Threat Protection — blocks ads & malware'))
+				E('option', { value: 'threat' }, _('NordVPN Threat Protection — blocks ads & malware')),
+				E('option', { value: 'custom' }, _('Custom — your own DNS servers'))
 			]);
 			this.dnsSel.value = dnsMode;
+			var customDns = L.toArray(uci.get('nordvpn', this.instance, 'custom_dns'));
+			this.dnsCustom = E('input', { type: 'text', class: 'cbi-input-text', style: 'margin-top:.4em',
+				placeholder: '9.9.9.9 149.112.112.112', value: customDns.join(' '),
+				input: L.bind(this.markDirty, this) });
+			this.dnsCustom.classList.toggle('hidden', dnsMode !== 'custom');
 			this.v6Warn = E('div', { class: 'cbi-value-description nv-inline-note hidden' },
 				_('⚠ IPv6 stays outside the tunnel and can leak your address.'));
 
@@ -1324,8 +1335,8 @@ return view.extend({
 				E('label', { class: 'nv-check' }, [ this.v6Box, _('Block direct IPv6 to prevent leaks') ]),
 				this.v6Warn
 			]);
-			this.dnsRow = this.row(_('DNS'), [ this.dnsSel ],
-				_('Which resolver to use while connected. Threat Protection blocks ads and malware at the DNS level; both NordVPN options only work through the tunnel. With "Route all LAN traffic", the router then forwards every lookup only to NordVPN (so none leak to your provider\'s resolver), and lookups fail while the tunnel is down.'));
+			this.dnsRow = this.row(_('DNS'), [ this.dnsSel, this.dnsCustom ],
+				_('Which resolver to use while connected. Custom takes up to 4 IPv4 addresses separated by spaces, for example Quad9 or your own Pi-hole; they are reached through the tunnel. Threat Protection blocks ads and malware at the DNS level; both NordVPN options only work through the tunnel. With "Route all LAN traffic", the router then forwards every lookup only to NordVPN (so none leak to your provider\'s resolver), and lookups fail while the tunnel is down.'));
 			body.appendChild(this.ksRow);
 			body.appendChild(this.v6Row);
 			body.appendChild(this.dnsRow);
@@ -2720,7 +2731,18 @@ return view.extend({
 			uci.set('nordvpn', inst, 'auto_routing', autoOn ? '1' : '0');
 			uci.set('nordvpn', inst, 'killswitch', (this.ksBox && this.ksBox.checked) ? '1' : '0');
 			uci.set('nordvpn', inst, 'block_ipv6', (this.v6Box && this.v6Box.checked) ? '1' : '0');
-			uci.set('nordvpn', inst, 'vpn_dns', (this.dnsSel && this.dnsSel.value) || 'off');
+			var dnsVal = (this.dnsSel && this.dnsSel.value) || 'off';
+			var customList = (dnsVal === 'custom' && this.dnsCustom)
+				? this.dnsCustom.value.split(/[\s,]+/).filter(function(x) {
+					return /^(\d{1,3}\.){3}\d{1,3}$/.test(x) && x.split('.').every(function(o) { return +o <= 255; });
+				}).slice(0, 4) : [];
+			if (dnsVal === 'custom' && !customList.length)
+				dnsVal = 'off';
+			uci.set('nordvpn', inst, 'vpn_dns', dnsVal);
+			if (customList.length)
+				uci.set('nordvpn', inst, 'custom_dns', customList);
+			else
+				uci.unset('nordvpn', inst, 'custom_dns');
 			// Drop the legacy boolean so it cannot contradict the enum.
 			uci.unset('nordvpn', inst, 'use_vpn_dns');
 			if (devices.length)
