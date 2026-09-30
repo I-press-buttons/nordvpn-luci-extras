@@ -43,6 +43,9 @@ config instance 'main'
 	# Steering by destination: traffic to these domains (and subdomains) from
 	# LAN clients using the router's DNS. Needs dnsmasq-full (nftset support).
 	# list steer_domain 'example.com'
+	# Steering by destination address: traffic from LAN clients to these IPv4
+	# addresses / networks ('a.b.c.d' or 'a.b.c.d/len'). No dnsmasq-full needed.
+	# list steer_ip '198.51.100.0/24'
 	# Exceptions: these devices (by MAC) and domains always take the normal
 	# connection, even while the kill switch blocks the rest. Used together
 	# with auto_routing or steering; excluded domains need dnsmasq-full.

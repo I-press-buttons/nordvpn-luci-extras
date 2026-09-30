@@ -1178,6 +1178,8 @@ return view.extend({
 		this.steerRow = null;
 		this.devRow = null;
 		this.domRow = null;
+		this.ipRow = null;
+		this.ipEd = null;
 		this.bypDevRow = null;
 		this.bypDomRow = null;
 		this.pickers = {};
@@ -1267,6 +1269,8 @@ return view.extend({
 			body.appendChild(this.devRow);
 			this.domRow = this.buildDomainEditor(rt, 'steer');
 			body.appendChild(this.domRow);
+			this.ipRow = this.buildIpEditor();
+			body.appendChild(this.ipRow);
 			// Exceptions: shown whenever traffic is routed (all-LAN or steered).
 			this.bypDevRow = this.buildDevicePicker('bypass');
 			body.appendChild(this.bypDevRow);
@@ -1360,6 +1364,61 @@ return view.extend({
 				_('Traffic to these domains (and their subdomains) always uses your normal connection, for example a bank or a streaming site that blocks VPNs. One per line. Works for clients that use this router for DNS; IPv4 only; needs dnsmasq-full.'));
 		return this.row(_('Steered domains'), [ ed.area, ed.note, unsupported ],
 			_('Route only traffic to these domains (and their subdomains) through this instance, one per line. Works for clients that use this router for DNS; apps with their own encrypted DNS bypass it. IPv4 only; needs dnsmasq-full.'));
+	},
+
+	/* ---- per-destination-IP steering ----------------------------------- */
+
+	// Mirror of the backend's validate_ipv4_net(): an IPv4 address or a
+	// 'a.b.c.d/1-32' network; null otherwise.
+	normIpNet: function(s) {
+		var m = String(s || '').trim().match(/^(\d{1,3}(?:\.\d{1,3}){3})(?:\/(\d{1,2}))?$/);
+		if (!m || m[1].split('.').some(function(o) { return +o > 255; }))
+			return null;
+		if (m[2] != null && (+m[2] < 1 || +m[2] > 32 || (m[2].length > 1 && m[2][0] === '0')))
+			return null;
+		return m[0];
+	},
+
+	parseIps: function() {
+		var valid = [], invalid = [];
+		var raw = (this.ipEd && this.ipEd.area) ? (this.ipEd.area.value || '').split(/[\s,]+/).filter(Boolean) : [];
+		raw.forEach(L.bind(function(x) {
+			var n = this.normIpNet(x);
+			if (!n)
+				invalid.push(x);
+			else if (valid.indexOf(n) < 0)
+				valid.push(n);
+		}, this));
+		return { valid: valid.slice(0, 64), invalid: invalid, capped: valid.length > 64 };
+	},
+
+	steeredIps: function() {
+		return this.parseIps().valid;
+	},
+
+	updateIpNote: function() {
+		var ed = this.ipEd;
+		if (!ed || !ed.note)
+			return;
+		var p = this.parseIps(), msgs = [];
+		if (p.invalid.length)
+			msgs.push(_('Ignored (not an IPv4 address or network): %s').format(p.invalid.join(' ')));
+		if (p.capped)
+			msgs.push(_('Only the first 64 entries are used.'));
+		dom.content(ed.note, [ msgs.join(' ') ]);
+		ed.note.classList.toggle('hidden', !msgs.length);
+	},
+
+	// steer_ip: destination addresses/networks routed through this instance.
+	buildIpEditor: function() {
+		var ed = this.ipEd = {};
+		var cur = L.toArray(uci.get('nordvpn', this.instance, 'steer_ip'));
+		ed.area = E('textarea', { class: 'cbi-input-textarea', rows: 3, style: 'width:100%;max-width:420px',
+			placeholder: '203.0.113.7\n198.51.100.0/24',
+			input: L.bind(function() { this.updateIpNote(); this.onRoutingToggle(); }, this) }, cur.join('\n'));
+		ed.note = E('div', { class: 'cbi-value-description nv-inline-note hidden' });
+		return this.row(_('Steered IP addresses'), [ ed.area, ed.note ],
+			_('Route only traffic to these IPv4 addresses or networks (for example 198.51.100.0/24) through this instance, one per line. Works without DNS, unlike domains. IPv4 only.'));
 	},
 
 	/* ---- per-device steering picker ------------------------------------ */
@@ -1662,10 +1721,11 @@ return view.extend({
 			this.markDirty();
 		var auto = this.autoRouting && this.autoRouting.checked;
 		var on = auto || this.steeredNetworks().length > 0 || this.steeredDevices().length > 0 ||
-			this.steeredDomains().length > 0;
+			this.steeredDomains().length > 0 || this.steeredIps().length > 0;
 		if (this.steerRow) this.steerRow.classList.toggle('hidden', !!auto);
 		if (this.devRow) this.devRow.classList.toggle('hidden', !!auto);
 		if (this.domRow) this.domRow.classList.toggle('hidden', !!auto);
+		if (this.ipRow) this.ipRow.classList.toggle('hidden', !!auto);
 		if (this.bypDevRow) this.bypDevRow.classList.toggle('hidden', !on);
 		if (this.bypDomRow) this.bypDomRow.classList.toggle('hidden', !on);
 		if (this.ksRow) this.ksRow.classList.toggle('hidden', !on);
@@ -2671,6 +2731,11 @@ return view.extend({
 			// Exceptions. With "Route all LAN traffic" the backend supplies a
 			// routing table itself (the interface name) and drops it again once
 			// the list is empty, so none is written here for that case.
+			var ips = autoOn ? [] : this.steeredIps();
+			if (ips.length)
+				uci.set('nordvpn', inst, 'steer_ip', ips);
+			else if (this.ipEd)
+				uci.unset('nordvpn', inst, 'steer_ip');
 			var bypDevs = this.pickedDevices('bypass');
 			if (bypDevs.length)
 				uci.set('nordvpn', inst, 'bypass_device', bypDevs);
@@ -2681,7 +2746,7 @@ return view.extend({
 				uci.set('nordvpn', inst, 'bypass_domain', bypDoms);
 			else if (this.domEds.bypass)
 				uci.unset('nordvpn', inst, 'bypass_domain');
-			if (steered.length || devices.length || domains.length) {
+			if (steered.length || devices.length || domains.length || ips.length) {
 				// Steering needs a routing table; default to the interface name.
 				var rtb = this.refs.routing_table ? (this.refs.routing_table.value || '').trim()
 					: (uci.get('nordvpn', inst, 'routing_table') || '');

@@ -880,7 +880,7 @@ function detect(uci, s, runtime) {
 	let zone = find_zone_of(uci, iface);
 	let peer = find_peer(uci, iface);
 	let steering = length(s.source_networks || []) > 0 || length(s.source_devices || []) > 0 ||
-		length(s.source_domains || []) > 0;
+		length(s.source_domains || []) > 0 || length(s.source_ips || []) > 0;
 	// "Route all LAN traffic" already owned by an earlier instance: this one
 	// falls back to its steering (or none) and reports who holds it.
 	let owner = s.auto_routing ? all_lan_owner(uci, s.name) : null;
@@ -911,6 +911,7 @@ function detect(uci, s, runtime) {
 		source_networks: s.source_networks || [],
 		source_devices: s.source_devices || [],
 		source_domains: s.source_domains || [],
+		source_ips: s.source_ips || [],
 		exceptions: exceptions,
 		// 'unsupported' when steered or excluded domains are configured but
 		// dnsmasq cannot fill nft sets (needs dnsmasq-full); null when not
@@ -1098,6 +1099,25 @@ function enforce(uci, s, opts) {
 			steer_doms = s.source_domains;
 	}
 	let setname = domain_set_name(iface);
+	// 1b'''''. IP steering: one MARK rule per destination address/network, with
+	//       the same mark (and so the same lookup, kill switch and IPv6
+	//       block) as steered devices. LAN-zone traffic only, as for domains.
+	let steer_ips = [];
+	if (steer && !all_lan && length(s.source_ips || []) > 0) {
+		if (!mark)
+			mark = device_mark(rt_table_id(table));
+		if (!det.lan_zone)
+			push(notes, 'IP steering: could not determine the LAN zone');
+		else if (!mark)
+			push(notes, 'IP steering needs a routing table with an id of 1-255; ' + table + ' has none');
+		else
+			steer_ips = s.source_ips;
+	}
+	if (reconcile_rules(uci, 'rule', 'ip_mark', iface, steer_ips, function(ip) {
+		return { name: 'NordVPN IP ' + ip, src: det.lan_zone, dest: '*', dest_ip: ip, family: 'ipv4',
+			proto: 'all', target: 'MARK', set_xmark: mark };
+	}, 'dest_ip', 'firewall'))
+		cf = true;
 	let dom_sets = length(steer_doms) ? [ setname ] : [];
 	if (reconcile_rules(uci, 'ipset', 'domain_set', iface, dom_sets, function(n) {
 		return { name: n, family: 'ipv4', match: [ 'dest_ip' ] };
@@ -1111,7 +1131,7 @@ function enforce(uci, s, opts) {
 	if (reconcile_domain_dns(uci, iface, setname, steer_doms))
 		cd = true;
 
-	let marks = (mark && (length(steer_devs) || length(steer_doms))) ? [ mark ] : [];
+	let marks = (mark && (length(steer_devs) || length(steer_doms) || length(steer_ips))) ? [ mark ] : [];
 	if (reconcile_rules(uci, 'rule', 'device_mark', iface, steer_devs, function(mac) {
 		return { name: 'NordVPN device ' + mac, src: det.lan_zone, dest: '*', src_mac: mac, proto: 'all',
 			target: 'MARK', set_xmark: mark };
@@ -1123,7 +1143,7 @@ function enforce(uci, s, opts) {
 		uci.foreach('firewall', 'rule', function(sec) {
 			if (sec[MARK] != '1' || sec.nordvpn_iface != iface)
 				return;
-			if ((sec[ROLE] == 'device_mark' || sec[ROLE] == 'domain_mark') && sec.set_xmark != mark) {
+			if ((sec[ROLE] == 'device_mark' || sec[ROLE] == 'domain_mark' || sec[ROLE] == 'ip_mark') && sec.set_xmark != mark) {
 				uci.set('firewall', sec['.name'], 'set_xmark', mark);
 				cf = true;
 			}
@@ -1182,7 +1202,7 @@ function enforce(uci, s, opts) {
 		let r = sec[ROLE];
 		if ((r == 'bypass_mark' || r == 'bypass_domain_mark') && sec.nordvpn_iface == iface)
 			push(byp_secs, sec['.name']);
-		else if (length(byp_secs) && (r == 'device_mark' || r == 'domain_mark'))
+		else if (length(byp_secs) && (r == 'device_mark' || r == 'domain_mark' || r == 'ip_mark'))
 			late = true;
 	});
 	if (late) {
@@ -1300,7 +1320,7 @@ function enforce(uci, s, opts) {
 				// Steered devices: the zones of the networks they were last
 				// seen on, and the LAN zone for devices currently offline.
 				// Steered domains: any LAN client may resolve them.
-				if (length(steer_doms) && det.lan_zone && index(want_srcs, det.lan_zone) < 0)
+				if ((length(steer_doms) || length(steer_ips)) && det.lan_zone && index(want_srcs, det.lan_zone) < 0)
 					push(want_srcs, det.lan_zone);
 				if (length(steer_devs)) {
 					let seen = device_zones(uci, steer_devs);

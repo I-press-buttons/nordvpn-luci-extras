@@ -1341,6 +1341,17 @@ write_cache(cache, cpath);
 	global.MOCK_UCI.nordvpn.main.steer_domain = many;
 	eq('load_settings: domains capped', length(load_settings(cursor()).source_domains), _cmn.MAX_STEER_DOMAINS);
 
+	eq('ip: address ok', _cmn.validate_ipv4_net('203.0.113.7'), '203.0.113.7');
+	eq('ip: network ok', _cmn.validate_ipv4_net('203.0.113.0/24'), '203.0.113.0/24');
+	eq('ip: /0 refused', _cmn.validate_ipv4_net('0.0.0.0/0'), null);
+	eq('ip: /33 refused', _cmn.validate_ipv4_net('10.0.0.0/33'), null);
+	eq('ip: octet range refused', _cmn.validate_ipv4_net('300.1.1.1'), null);
+	eq('ip: junk refused', _cmn.validate_ipv4_net('1.2.3.4; reboot'), null);
+	eq('ip: domain refused', _cmn.validate_ipv4_net('example.com'), null);
+	global.MOCK_UCI = { nordvpn: { main: { '.type': 'instance', enabled: '1',
+		steer_ip: [ '203.0.113.0/24', '203.0.113.0/24', 'bad', '198.51.100.9' ] } } };
+	eq('load_settings: IPs validated + deduped', load_settings(cursor()).source_ips, [ '203.0.113.0/24', '198.51.100.9' ]);
+
 	let msteer = function(over) {
 		let base = { name: 'media', enabled: true, interface: 'nordvpn_rs', routing_table: '100',
 			auto_routing: false, killswitch: true, block_ipv6: true, use_vpn_dns: false,
@@ -1404,6 +1415,22 @@ write_cache(cache, cpath);
 	res = enforce_routing(uci, msteer({ source_devices: [ 'aa:bb:cc:dd:ee:01' ] }), yes);
 	ok('devices and domains share one lookup rule', length(count('network', 'dev_lookup')) == 1 &&
 		length(count('firewall', 'device_mark')) == 1 && length(count('firewall', 'domain_mark')) == 1);
+
+	res = enforce_routing(uci, msteer({ source_domains: [], source_ips: [ '203.0.113.0/24', '198.51.100.9' ] }), yes);
+	let ipm = count('firewall', 'ip_mark');
+	ok('IP steering: one MARK rule per destination', length(ipm) == 2 && ipm[0].target == 'MARK' &&
+		ipm[0].src == 'lan' && ipm[0].dest == '*' && ipm[0].family == 'ipv4' &&
+		ipm[0].dest_ip == '203.0.113.0/24' && ipm[0].set_xmark == '0x64000000/0xff000000');
+	ok('IP steering: shares the lookup rule and forwarding', length(count('network', 'dev_lookup')) == 1 &&
+		length(filter(count('firewall', 'forwarding'), (f) => f.src == 'lan' && f.dest == 'nordvpn_rs')) == 1);
+	eq('IPs alone make the instance steered', detect_routing(uci, msteer({ source_domains: [], source_ips: [ '198.51.100.9' ] }), false).mode, 'steered');
+	res = enforce_routing(uci, msteer({ source_domains: [], source_ips: [ '203.0.113.0/24', '198.51.100.9' ] }), yes);
+	ok('IP steering is idempotent', !res.changed_network && !res.changed_firewall);
+	res = enforce_routing(uci, msteer({ source_domains: [], source_ips: [ '198.51.100.9' ] }), yes);
+	eq('IP steering: removed entry drops its rule', map(count('firewall', 'ip_mark'), (r) => r.dest_ip), [ '198.51.100.9' ]);
+	res = enforce_routing(uci, msteer({ source_domains: [], source_ips: [] }), yes);
+	eq('IP steering: none left, no rules', [ length(count('firewall', 'ip_mark')), length(count('network', 'dev_lookup')) ], [ 0, 0 ]);
+	res = enforce_routing(uci, msteer({}), yes);
 
 	res = enforce_routing(uci, msteer({ routing_table: '101' }), yes);
 	ok('a table change moves the domain mark', count('firewall', 'domain_mark')[0].set_xmark == '0x65000000/0xff000000');

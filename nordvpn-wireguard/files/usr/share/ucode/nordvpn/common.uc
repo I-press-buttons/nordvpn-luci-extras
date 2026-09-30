@@ -233,6 +233,24 @@ function validate_ipv4(a) {
 	return a;
 }
 
+// A destination to steer: an IPv4 address or 'a.b.c.d/len' network. A bare
+// address is kept as is; a prefix must be 0-32 with no leading zeros, and 0
+// (the whole internet) is refused, since that is "Route all LAN traffic".
+function validate_ipv4_net(a) {
+	if (type(a) != 'string')
+		return null;
+	a = trim(a);
+	let m = match(a, /^([0-9.]+)(\/([0-9]{1,2}))?$/);
+	if (!m || !validate_ipv4(m[1]))
+		return null;
+	if (m[3] == null)
+		return a;
+	let len = int(m[3]);
+	if (len < 1 || len > 32 || (length(m[3]) > 1 && substr(m[3], 0, 1) == '0'))
+		return null;
+	return a;
+}
+
 // Client MAC address: 'aa:bb:cc:dd:ee:ff', '-' separators, or 12 bare hex
 // digits. Normalized to lowercase colon form, the form stored in UCI.
 // A DNS domain to steer: lower-cased, a leading '*.'/'.' and a trailing '.'
@@ -420,6 +438,16 @@ function load_settings(uci, instance) {
 			push(steer_domains, d);
 	}
 
+	// `list steer_ip` — destination IPv4 addresses / networks steered through
+	// this instance (e.g. one service's address range). Deduped, capped.
+	let sip = uci.get('nordvpn', name, 'steer_ip');
+	let steer_ips = [];
+	for (let x in ((type(sip) == 'array') ? sip : (sip != null ? [ sip ] : []))) {
+		let n = validate_ipv4_net(x);
+		if (n && index(steer_ips, n) < 0 && length(steer_ips) < MAX_STEER_DOMAINS)
+			push(steer_ips, n);
+	}
+
 	// `list bypass_device` / `list bypass_domain` — exceptions: devices and
 	// domains that always take the normal connection, even while the kill
 	// switch blocks the rest. An entry that is both steered and excluded
@@ -491,6 +519,7 @@ function load_settings(uci, instance) {
 		source_networks: source_networks,
 		source_devices: source_devices,
 		source_domains: steer_domains,
+		source_ips: steer_ips,
 		bypass_devices: bypass_devices,
 		bypass_domains: bypass_domains,
 		locations: locations,
@@ -684,7 +713,7 @@ return {
 	full_match, bounded_int, validate_interface, validate_token, validate_wg_key, validate_hostname, validate_nordvpn_host,
 	validate_port, validate_hop_mode, validate_dns_mode, relay_kind, validate_selection, validate_server_group, validate_rotation_mode, validate_interval, validate_time,
 	validate_country_code, validate_location_code, validate_instance, validate_routing_table, validate_dir,
-	validate_mac, validate_domain, clean_label, validate_ipv4,
+	validate_mac, validate_domain, clean_label, validate_ipv4, validate_ipv4_net,
 	managed_interface, load_settings, list_instances, globals_section, cache_file_path, iso_ts, redact, log,
 	atomic_write, acquire_lock, release_lock, sh_quote, open_cmd, run
 };

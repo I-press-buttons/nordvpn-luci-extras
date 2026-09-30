@@ -110,6 +110,11 @@ that adds the extra features marked **(fork)** below.
 - **Steered domains (fork).** Send only traffic to chosen websites (and
   their subdomains) through the VPN, for example one streaming service,
   while everything else uses your normal connection.
+- **Steered IP addresses (fork).** Send only traffic to chosen IPv4
+  addresses or networks (for example `198.51.100.0/24`) through the VPN.
+  Unlike domains it needs no DNS cooperation and no dnsmasq-full, so it works
+  for any client and any resolver. This is the "by IP" mode of GL.iNet's
+  router VPN.
 - **Exceptions (fork).** Exclude devices (a TV, a console, a work laptop) or
   websites (a bank or a streaming service that blocks VPNs) from the VPN,
   with *Route all LAN traffic* or with steering. Excluded traffic always uses
@@ -376,6 +381,7 @@ config instance 'main'
 	list source_network 'media'      # or: steer only these networks
 	list source_device 'aa:bb:cc:dd:ee:ff'  # and/or individual devices, by MAC
 	list steer_domain 'example.com'  # and/or domains (+ subdomains); needs dnsmasq-full
+	list steer_ip '198.51.100.0/24'  # and/or destination IPv4 addresses / networks
 	list bypass_device 'aa:bb:cc:dd:ee:01'  # exceptions: always the normal connection
 	list bypass_domain 'bank.example.com'   #   (excluded domains need dnsmasq-full)
 	option killswitch '0'            # block steered traffic while VPN is down
