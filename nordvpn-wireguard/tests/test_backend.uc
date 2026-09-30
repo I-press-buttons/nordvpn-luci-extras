@@ -677,6 +677,22 @@ write_cache(cache, cpath);
 	res = enforce_routing(uci, mks({ auto_routing: true, killswitch: true }));
 	eq('routing: idempotent', res.changed_network || res.changed_firewall, false);
 
+	// IP masquerading follows the vpn_masq setting on the VPN zone.
+	let zmasq = function() {
+		let v = null;
+		uci.foreach('firewall', 'zone', function(sec) {
+			if (sec.name == 'nordvpn')
+				v = sec.masq;
+		});
+		return v;
+	};
+	eq('routing: zone masquerades by default', zmasq(), '1');
+	res = enforce_routing(uci, mks({ auto_routing: true, killswitch: true, vpn_masq: false }));
+	ok('routing: masq off changed firewall', res.changed_firewall);
+	eq('routing: zone masq off', zmasq(), '0');
+	res = enforce_routing(uci, mks({ auto_routing: true, killswitch: true }));
+	eq('routing: zone masq back on', zmasq(), '1');
+
 	// Turning a single toggle off removes exactly that object.
 	res = enforce_routing(uci, mks({ auto_routing: true, killswitch: false }));
 	ok('routing: kill switch removed', !detect_routing(uci, mks({ auto_routing: true }), false).killswitch);

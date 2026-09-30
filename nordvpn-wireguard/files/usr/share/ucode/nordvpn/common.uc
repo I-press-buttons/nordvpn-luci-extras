@@ -573,6 +573,10 @@ function load_settings(uci, instance) {
 		auto_routing: g('auto_routing', '0') == '1',
 		killswitch: g('killswitch', '0') == '1',
 		block_ipv6: g('block_ipv6', '1') == '1',
+		// IP masquerading (NAT) on the VPN firewall zone, like GL.iNet's
+		// "IP Masquerading" option. On by default; turning it off is only
+		// useful when the far end can route back to the LAN.
+		vpn_masq: g('vpn_masq', '1') == '1',
 		// DNS override mode. Prefer the enum; fall back to the legacy boolean
 		// (use_vpn_dns=1 meant the standard resolver) so upgraded configs keep
 		// working before the migration/save rewrites the key. use_vpn_dns stays

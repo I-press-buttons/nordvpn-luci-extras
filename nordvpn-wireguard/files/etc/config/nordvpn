@@ -81,6 +81,9 @@ config instance 'main'
 	# (kill switch) and block direct IPv6 so it cannot bypass the tunnel.
 	option killswitch '0'
 	option block_ipv6 '1'
+	# NAT (masquerading) on the VPN firewall zone. Keep on unless the far end
+	# can route replies back to your LAN.
+	option vpn_masq '1'
 	# DNS resolver while the tunnel is up: 'off' (system/WAN), 'standard'
 	# (NordVPN 103.86.96.100/99.100) or 'threat' (NordVPN Threat Protection
 	# 103.86.96.96/99.99, blocks ads and malware).
