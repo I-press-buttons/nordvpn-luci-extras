@@ -418,12 +418,16 @@ ubus call nordvpn refresh_status    # cache-refresh job progress
 ubus call nordvpn set_credentials '{"token":"<64-hex-token>"}'                        # replace the Default key
 ubus call nordvpn set_credentials '{"token":"<64-hex-token>","name":"Family plan"}'   # add a named entry
 ubus call nordvpn apply             # rebuild the peer and bring the tunnel up
-ubus call nordvpn rotate_now        # one-shot rotation
+ubus call nordvpn rotate_now        # one-shot rotation (waits for the result)
+ubus call nordvpn rotate_start      # the same in the background; poll apply_status
 ubus call nordvpn refresh_locations # start an async server-list refresh
 ```
 
-`status`, `apply`, `rotate_now` and `set_credentials` accept an `instance`
-argument (default `main`). `create_instance` and `delete_instance` manage
+`status`, `apply`, `rotate_now`, `rotate_start` and `set_credentials` accept
+an `instance` argument (default `main`). `apply_start` and `rotate_start`
+run the job in a detached worker, one job at a time, and `apply_status`
+reports its progress and result; the LuCI page uses these so that rpcd stays
+responsive while servers are verified. `create_instance` and `delete_instance` manage
 instances; a new instance uses the Default credentials unless
 `create_instance` gets a `credential` entry id. An instance's `credential`
 option in `/etc/config/nordvpn` picks its bank entry. `nordvpn-rotate <name>`
@@ -566,11 +570,14 @@ logread -e nordvpn
 ```
 
 One procd-supervised daemon (`nordvpn-service`) re-reads the config every
-30 s. It refreshes the server list every `cache_refresh_interval`, and also
-on its first tick if the cache is older than 24 h or was written by an older
-version. **Refresh server list** in the UI runs the same worker on demand.
-Cache writes are atomic and locked, and a failed refresh keeps the previous
-cache.
+30 s. It refreshes the server list every `cache_refresh_interval`, counted
+from the cache file's own write time, so a restart (every config save
+restarts it) does not download a list that is still fresh. It refreshes on
+its first tick if the cache is missing, older than 24 h or than the
+interval, or was written by an older version. A failed refresh is retried
+after 2 min, then 4, 8 and so on, up to the interval. **Refresh server list**
+in the UI runs the same worker on demand. Cache writes are atomic and
+locked, and a failed refresh keeps the previous cache.
 
 The last 50 events per instance are kept in `/tmp/nordvpn_events*.json` and
 are cleared on reboot.

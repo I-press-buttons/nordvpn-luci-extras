@@ -562,17 +562,52 @@ function table_in_use(uci, name, skip) {
 	return false;
 }
 
+// Short-lived results of detect()'s runtime probes. rpcd asks for every
+// instance on every status poll (every 5 s while the page is open), and the
+// WAN's MTU and IPv6 route are the same for all instances and rarely change,
+// so re-running `ubus call ... dump`, `ip link` and `ip -6 route` per instance
+// per poll only costs process starts. rpcd keeps this module loaded between
+// calls, so the memo carries over.
+const PROBE_MEMO_TTL = 15;
+let probe_memo = {};
+function memo(key, fn) {
+	let now = time();
+	let m = probe_memo[key];
+	if (m && now >= m.at && (now - m.at) < PROBE_MEMO_TTL)
+		return m.val;
+	let val = fn();
+	probe_memo[key] = { at: now, val: val };
+	return val;
+}
+
 // True when the WAN has a default IPv6 route (potential leak path).
 function wan_has_ipv6() {
-	let r = run([ 'ip', '-6', 'route', 'show', 'default' ]);
-	return r.code == 0 && length(trim(r.stdout || '')) > 0;
+	return memo('ipv6', function() {
+		let r = run([ 'ip', '-6', 'route', 'show', 'default' ]);
+		return r.code == 0 && length(trim(r.stdout || '')) > 0;
+	});
+}
+
+// MTU of a network device from sysfs (no process start), falling back to
+// `ip link` where sysfs is unavailable. null when unknown.
+function dev_mtu(dev) {
+	if (!_common.full_match(dev, /^[A-Za-z0-9._-]{1,15}$/) || dev == '.' || dev == '..')
+		return null;
+	let raw = readfile('/sys/class/net/' + dev + '/mtu');
+	if (raw != null && _common.full_match(trim(raw), /^[0-9]+$/))
+		return int(trim(raw));
+	let l = run([ 'ip', 'link', 'show', 'dev', dev ]);
+	if (l.code != 0)
+		return null;
+	let m = match(l.stdout || '', /mtu ([0-9]+)/);
+	return m ? int(m[1]) : null;
 }
 
 // L3-device MTU of the WAN uplink (the path WireGuard's UDP actually takes to
 // the endpoint — NOT the tunnel). Found via the WAN firewall zone's networks so
 // an active auto-routing default through the tunnel does not mislead us. Returns
 // the smallest MTU across WAN devices, or null when it cannot be determined.
-function wan_l3_mtu(uci) {
+function wan_l3_mtu_probe(uci) {
 	let wannets = {};
 	uci.foreach('firewall', 'zone', function(sec) {
 		if (sec[MARK] == '1')
@@ -600,17 +635,15 @@ function wan_l3_mtu(uci) {
 		// the smallest "WAN" device, dragging the next recommendation down 80.
 		if (ifc.proto == 'wireguard')
 			continue;
-		let l = run([ 'ip', 'link', 'show', 'dev', ifc.l3_device ]);
-		if (l.code != 0)
-			continue;
-		let m = match(l.stdout || '', /mtu ([0-9]+)/);
-		if (m) {
-			let v = int(m[1]);
-			if (best == null || v < best)
-				best = v;
-		}
+		let v = dev_mtu(ifc.l3_device);
+		if (v != null && (best == null || v < best))
+			best = v;
 	}
 	return best;
+}
+
+function wan_l3_mtu(uci) {
+	return memo('wan_mtu', function() { return wan_l3_mtu_probe(uci); });
 }
 
 // Recommended WireGuard interface MTU for a given WAN MTU: subtract 80 (60 bytes

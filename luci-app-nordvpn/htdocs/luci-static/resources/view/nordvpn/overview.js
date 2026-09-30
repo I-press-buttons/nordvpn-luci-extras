@@ -65,7 +65,10 @@ var callUciCommit = rpc.declare({
 var callApplyStart = rpc.declare({ object: 'nordvpn', method: 'apply_start', params: [ 'instance' ] });
 var callApplyStatus = rpc.declare({ object: 'nordvpn', method: 'apply_status' });
 var callRefreshLocations = rpc.declare({ object: 'nordvpn', method: 'refresh_locations' });
-var callRotateNow = rpc.declare({ object: 'nordvpn', method: 'rotate_now', params: [ 'instance' ] });
+// A manual rotation tries up to max_retries servers at verify_timeout each, so
+// it runs as a job exactly like an apply (see callApplyStart) and is watched
+// through apply_status. `rotate_now` stays in the backend for the CLI only.
+var callRotateStart = rpc.declare({ object: 'nordvpn', method: 'rotate_start', params: [ 'instance' ] });
 var callExternalIp = rpc.declare({ object: 'nordvpn', method: 'external_ip', params: [ 'instance' ] });
 var callClients = rpc.declare({ object: 'nordvpn', method: 'clients' });
 var callDisconnect = rpc.declare({ object: 'nordvpn', method: 'disconnect', params: [ 'instance' ] });
@@ -827,18 +830,39 @@ return view.extend({
 	// Never rejects on a backend-reported failure — only on a watcher that cannot
 	// reach the router at all.
 	applyAsync: function(instance) {
+		return this.runJob(callApplyStart, instance, 'apply');
+	},
+
+	// Runs one backend job (`kind` 'apply' or 'rotate') through `start` and
+	// resolves with its result. The backend runs one job at a time and reports
+	// it through apply_status, so only a record of this very job (kind and
+	// instance) is taken as its outcome.
+	runJob: function(start, instance, kind) {
 		var deadline = Date.now() + APPLY_TIMEOUT_MS;
+		var mine = function(st) {
+			return !!st && (st.kind || 'apply') === kind && st.instance === instance;
+		};
+		// A rotation may outlast an apply by far (max_retries candidates); the
+		// job record states its own ceiling.
+		var extend = function(st) {
+			if (st && typeof st.max_runtime === 'number')
+				deadline = Math.max(deadline, Date.now() + (st.max_runtime + 30) * 1000);
+		};
 		this.pauseStatusPoll();
-		return callApplyStart(instance).then(L.bind(function(res) {
-			if (!res || !res.error)
-				return this.waitForApply(deadline);
+		return start(instance).then(L.bind(function(res) {
+			if (!res || !res.error) {
+				extend(res && res.apply);
+				return this.waitForApply(deadline, mine);
+			}
 			// A refused start is usually "one is already running" — from the other
-			// button, another tab, or a rotation. Matching on the message would be
-			// brittle, so simply ask what the job queue is doing: if something is
-			// running, that is the apply the user wanted anyway.
+			// button or another tab. Matching on the message would be brittle, so
+			// simply ask what the job queue is doing: if this very job is running,
+			// that is the one the user wanted anyway.
 			return callApplyStatus().then(L.bind(function(st) {
-				return (st && st.state === 'running')
-					? this.waitForApply(deadline) : { error: res.error };
+				if (!(st && st.state === 'running' && mine(st)))
+					return { error: res.error };
+				extend(st);
+				return this.waitForApply(deadline, mine);
 			}, this), function() { return { error: res.error }; });
 		}, this)).then(L.bind(function(result) {
 			this.resumeStatusPoll();
@@ -854,22 +878,26 @@ return view.extend({
 	// Probes apply_status until the job leaves 'running'. Anything that is not a
 	// finished job is turned into an `error` result rather than an optimistic
 	// success: a banner claiming a tunnel that never came up is worse than an
-	// honest "no idea".
-	waitForApply: function(deadline) {
+	// honest "no idea". `mine` tells this job's record from another one's.
+	waitForApply: function(deadline, mine) {
+		var since = Date.now();
 		return new Promise(function(resolve, reject) {
 			var probe = function() {
 				callApplyStatus().then(function(st) {
 					var state = st && st.state;
+					if ((state === 'done' || state === 'failed') && !mine(st))
+						// Another job ran after ours, so our own result is gone.
+						return resolve({ error: _('another operation replaced this one; check the recent events') });
 					if (state === 'done' || state === 'failed')
 						return resolve((st && st.result) ||
-							{ error: _('the apply finished without reporting a result') });
+							{ error: _('the operation finished without reporting a result') });
 					if (state !== 'running')
 						// 'idle' after a successful start means the job record is
 						// gone — an rpcd restart, or the backend died mid-apply.
-						return resolve({ error: _('the apply stopped reporting progress') });
+						return resolve({ error: _('the operation stopped reporting progress') });
 					if (Date.now() >= deadline)
-						return resolve({ error: _('the apply is still running after %d seconds — check the system log')
-							.format(Math.round(APPLY_TIMEOUT_MS / 1000)) });
+						return resolve({ error: _('the operation is still running after %d seconds — check the system log')
+							.format(Math.round((Date.now() - since) / 1000)) });
 					window.setTimeout(probe, APPLY_POLL_MS);
 				}, function(e) {
 					// One lost probe is not a failed apply: rpcd may just be busy
@@ -922,7 +950,7 @@ return view.extend({
 
 	rotateNow: function() {
 		var n = this.notice(_('Rotating to another server…'), 'info');
-		return callRotateNow(this.instance).then(L.bind(function(res) {
+		return this.runJob(callRotateStart, this.instance, 'rotate').then(L.bind(function(res) {
 			this.dismiss(n);
 			if (res && res.ok)
 				this.notice(_('Rotated to %s').format(res.server), 'info', 4000);

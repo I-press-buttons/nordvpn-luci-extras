@@ -2,17 +2,23 @@
 // SPDX-License-Identifier: MIT
 // One-shot NordVPN rotation worker. Invoked by the nordvpn procd service and
 // safe to run manually. Reads the schedule/selection from /etc/config/nordvpn.
+// With --job (spawned detached by the rpcd `rotate_start` method) the outcome
+// is also recorded in the job-status file the LuCI page polls.
 
 'use strict';
 
-const rotate = require('nordvpn.rotate').rotate;
+const _rotate = require('nordvpn.rotate');
 const _common = require('nordvpn.common');
 const log = _common.log,
       validate_instance = _common.validate_instance;
 
-// Optional argument: the instance to rotate (default 'main').
-let instance = (length(ARGV) > 0 ? validate_instance(ARGV[0]) : null) || 'main';
-let res = rotate(null, instance, 'manual');
+// Optional arguments: --job, then the instance to rotate (default 'main').
+let args = [ ...ARGV ];
+let job = length(args) > 0 && args[0] == '--job';
+if (job)
+	shift(args);
+let instance = (length(args) > 0 ? validate_instance(args[0]) : null) || 'main';
+let res = job ? _rotate.run_job(instance) : _rotate.rotate(null, instance, 'manual');
 
 if (res.ok) {
 	printf('nordvpn-rotate: connected to %s\n', res.server);

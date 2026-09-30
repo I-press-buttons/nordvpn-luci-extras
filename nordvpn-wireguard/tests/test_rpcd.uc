@@ -27,7 +27,7 @@ let obj = loadfile(RPCD)();
 let m = obj ? obj.nordvpn : null;
 ok('rpcd object present', m != null);
 ok('read methods present', type(m.status.call) == 'function' && type(m.locations.call) == 'function' && type(m.refresh_status.call) == 'function' && type(m.instances.call) == 'function' && type(m.apply_status.call) == 'function');
-ok('write methods present', type(m.set_credentials.call) == 'function' && type(m.apply.call) == 'function' && type(m.apply_start.call) == 'function' && type(m.rotate_now.call) == 'function' && type(m.refresh_locations.call) == 'function' && type(m.disconnect.call) == 'function' && type(m.clear_credentials.call) == 'function');
+ok('write methods present', type(m.set_credentials.call) == 'function' && type(m.apply.call) == 'function' && type(m.apply_start.call) == 'function' && type(m.rotate_now.call) == 'function' && type(m.rotate_start.call) == 'function' && type(m.refresh_locations.call) == 'function' && type(m.disconnect.call) == 'function' && type(m.clear_credentials.call) == 'function');
 
 // Build a cache on disk.
 let cache = normalize(json(readfile(fixture)));
@@ -57,6 +57,21 @@ ok('servers union carries grouping fields', srv_union.relays[0].country_code != 
 let srv_dedup = m.servers.call({ args: { locations: [ 'nl', 'nl-amsterdam' ], hop_mode: 'multihop' } });
 eq('servers union dedups city inside country', length(srv_dedup.relays), 1);
 eq('servers union empty set yields nothing', length(m.servers.call({ args: { locations: [], hop_mode: 'single' } }).relays), 0);
+
+// The tree is memoized per cache file: a repeat call answers the same, and a
+// rewritten cache (a refresh) is picked up.
+eq('locations memo answers the same', m.locations.call(), loc);
+{
+	let fewer = normalize(filter(json(readfile(fixture)), function(sv) {
+		return sv.locations && sv.locations[0] && sv.locations[0].country &&
+			sv.locations[0].country.code == 'EE';
+	}));
+	write_cache(fewer, cdir + '/nordvpn_servers_cache.json');
+	eq('locations follow a rewritten cache', length(m.locations.call().countries), 1);
+	write_cache(cache, cdir + '/nordvpn_servers_cache.json');
+	eq('locations follow it back', length(m.locations.call().countries), 3);
+}
+eq('rotate_start rejects unknown instance', m.rotate_start.call({ args: { instance: 'nope' } }).error, 'no such instance');
 
 // refresh_status idle when no job file
 eq('refresh_status idle', m.refresh_status.call().state, 'idle');

@@ -231,6 +231,54 @@ const DEAD_PID = 1073741824;
 	unlink(APPLY_STATUS_FILE);
 }
 
+// 7. Jobs of other kinds share the machinery. A rotation states its own
+//    runtime ceiling (it may try max_retries servers), and a start never hands
+//    back another instance's or kind's job as if it were the caller's.
+{
+	let now = 1000000;
+	let rec = { kind: 'rotate', instance: 'main', state: 'running', started_at_epoch: now,
+		max_runtime: 2060 };
+	ok('a rotation inside its own ceiling is running',
+		_apply.apply_running(rec, now + APPLY_MAX_RUNTIME + 600) == true);
+	ok('a rotation past its own ceiling is not running',
+		_apply.apply_running(rec, now + 2061) == false);
+	ok('an implausible ceiling falls back to the apply one',
+		_apply.apply_running({ ...rec, max_runtime: 999999 }, now + APPLY_MAX_RUNTIME + 1) == false);
+
+	now = time();
+	_apply.write_apply_status({ kind: 'rotate', instance: 'main', state: 'running', pid: DEAD_PID,
+		started_at: _common.iso_ts(now), started_at_epoch: now });
+	eq('a dead rotation worker is named as such', _apply.apply_status_report().error,
+		'the rotation worker stopped unexpectedly');
+
+	_apply.write_apply_status({ kind: 'rotate', instance: 'main', state: 'running', pid: live_pid,
+		started_at: _common.iso_ts(now), started_at_epoch: now });
+	let other = _apply.start_apply('main');
+	ok('an apply is refused while a rotation runs', other.busy == true && other.already_running == null &&
+		index(other.error, 'a rotation of instance main') == 0);
+	eq('the same rotation is handed back', _apply.start_job('main', 'rotate').already_running, true);
+	_apply.write_apply_status({ instance: 'other', state: 'running', pid: live_pid,
+		started_at: _common.iso_ts(now), started_at_epoch: now });
+	ok('another instance\'s apply is not handed back', _apply.start_apply('main').busy == true);
+	eq('an unknown job kind is refused', _apply.start_job('main', 'nope').error, 'unknown job');
+	unlink(APPLY_STATUS_FILE);
+
+	// The worker body records a rotation like an apply, with its kind; a
+	// rotation skipped for a pinned server is a finished no-op, not a failure.
+	global.MOCK_UCI = { nordvpn: { main: { '.type': 'instance', interface: 'nordvpn',
+		fixed_server: 'de1.nordvpn.com' } }, network: {} };
+	global.MOCK_UBUS = {};
+	let res = require('nordvpn.rotate').run_job('main');
+	eq('the rotation job returns the rotation result', res.skipped, true);
+	let st = _apply.read_apply_status();
+	eq('the rotation job is recorded with its kind', [ st.kind, st.instance ], [ 'rotate', 'main' ]);
+	eq('a skipped rotation is a finished job', st.state, 'done');
+	eq('the rotation job states its ceiling', st.max_runtime, 300);
+	ok('the rotation job released the lock', stat(APPLY_LOCK_FILE) == null);
+	unlink(APPLY_STATUS_FILE);
+	unlink('/tmp/nordvpn_events.json');
+}
+
 // netifd hints for a tunnel that never came up
 {
 	// The exact reply from a router whose netifd never loaded the handler.
