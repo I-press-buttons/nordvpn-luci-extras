@@ -86,9 +86,10 @@ function find_peer(uci, iface) {
 }
 
 // Build the runtime status object for one instance ('main' by default).
-// `next_run` is filled in by the caller/scheduler.
-function status(uci, instance) {
-	let s = load_settings(uci, instance);
+// `next_run` is filled in by the caller/scheduler. `settings` may pass the
+// instance's already-loaded settings.
+function status(uci, instance, settings) {
+	let s = settings || load_settings(uci, instance);
 	let iface = s.interface;
 
 	let has_key = validate_wg_key(uci.get('network', iface, 'private_key')) != null;

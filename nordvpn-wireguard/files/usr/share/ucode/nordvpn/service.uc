@@ -10,11 +10,38 @@ const WATCHDOG_GRACE = _common.WATCHDOG_GRACE,
       WATCHDOG_COOLDOWN_MAX = _common.WATCHDOG_COOLDOWN_MAX,
       PROBE_FAIL_THRESHOLD = _common.PROBE_FAIL_THRESHOLD;
 
-// Refresh when the interval elapsed, or on first tick if the cache is stale.
-function should_refresh(settings, last_cache, now, cache_stale) {
-	if (last_cache == 0 && cache_stale)
+// First retry after a failed server-list refresh (seconds); doubles per
+// consecutive failure, never beyond the regular refresh interval.
+const REFRESH_RETRY_BASE = 120;
+
+// Refresh when the interval since the last refresh elapsed. `last_cache` 0
+// means there is no usable cache (missing, stale, or written by an older
+// version): refresh now. After `fails` consecutive failed attempts the next
+// one comes sooner, backing off from REFRESH_RETRY_BASE: a router that booted
+// before its WAN was up must not go without a server list for hours.
+function should_refresh(settings, last_cache, now, fails) {
+	if (!last_cache)
 		return true;
-	return (now - last_cache) >= settings.cache_refresh_interval;
+	let wait = settings.cache_refresh_interval;
+	if (type(fails) == 'int' && fails > 0) {
+		let shift = (fails > 10) ? 9 : fails - 1;
+		let backoff = REFRESH_RETRY_BASE * (1 << shift);
+		if (backoff < wait)
+			wait = backoff;
+	}
+	return (now - last_cache) >= wait;
+}
+
+// The refresh clock after a daemon (re)start, from the cache on disk: its own
+// write time when it is usable, so a restart — procd restarts the daemon on
+// every config save — neither refetches a fresh list nor postpones a due
+// refresh. 0 (refresh now) for a stale or missing cache. A write time in the
+// future (the clock is behind, e.g. before NTP on a router without an RTC)
+// counts as written now.
+function refresh_seed(cached_at, stale, now) {
+	if (stale || type(cached_at) != 'int' || cached_at <= 0)
+		return 0;
+	return (cached_at > now) ? now : cached_at;
 }
 
 // `hm` is the current local time as "HH:MM". Rotation only runs when enabled,
@@ -192,7 +219,7 @@ function watchdog_result_update(result, fails) {
 }
 
 return {
-	should_refresh, should_rotate, next_rotation, should_recover,
+	REFRESH_RETRY_BASE, should_refresh, refresh_seed, should_rotate, next_rotation, should_recover,
 	watchdog_update, watchdog_result_update,
 	should_probe, effective_state, probe_update, probe_clear, egress_report
 };
