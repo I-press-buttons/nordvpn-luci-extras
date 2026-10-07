@@ -138,7 +138,7 @@ that adds the extra features marked **(fork)** below.
 ### Several tunnels at once
 
 - **Multiple instances.** Run tunnels side by side, for example the main
-  LAN through Germany and a media network through Serbia. Each has its own
+  LAN through New York and a media network through Los Angeles. Each has its own
   locations, schedule and routing. All tunnels share the *Default*
   credentials, so you paste a token once; add more named credentials to the
   bank if some tunnels should use another account. Earlier versions gave
