@@ -668,8 +668,8 @@ Releases come from two places:
 ## Credits and license
 
 Originally created by **Andrey Aleksandrov** ([@Aladex](https://github.com/Aladex))
-as [nordvpn-luci](https://github.com/Aladex/nordvpn-luci). This fork adds
-load-aware selection, the P2P server filter, domain steering, exceptions, the
+as [nordvpn-luci](https://github.com/Aladex/nordvpn-luci). This fork, by
+**Chris Morris**, adds load-aware selection, the P2P server filter, domain steering, exceptions, the
 protection check and the Status page card on top.
 
 [MIT](LICENSE). Do whatever you want with it, just keep the copyright notice.
