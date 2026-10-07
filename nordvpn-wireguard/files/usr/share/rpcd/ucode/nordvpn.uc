@@ -48,6 +48,12 @@ const read_cache = _cache.read_cache,
 
 const methods = {};
 
+// What started an apply, from the call's `source` argument (null when absent;
+// the backend records that as 'external').
+function req_source(request) {
+	return (request && request.args) ? request.args.source : null;
+}
+
 // Resolve and validate the requested instance name ('main' by default).
 // Returns the name, or null when the section does not exist.
 function req_instance(uci, request) {
@@ -257,14 +263,16 @@ methods.set_credentials = {
 	}
 };
 
+// `source` labels the history entry (see APPLY_SOURCES); a caller that does
+// not pass one is recorded as 'external'.
 methods.apply = {
-	args: { instance: '' },
+	args: { instance: '', source: '' },
 	call: function(request) {
 		let uci = cursor();
 		let name = req_instance(uci, request);
 		if (!name)
 			return { error: 'no such instance' };
-		return apply(uci, name);
+		return apply(uci, name, req_source(request));
 	}
 };
 
@@ -275,13 +283,13 @@ methods.apply = {
 // reverted underneath the user. Same shape as refresh_locations/
 // refresh_status: start, then poll.
 methods.apply_start = {
-	args: { instance: '' },
+	args: { instance: '', source: '' },
 	call: function(request) {
 		let uci = cursor();
 		let name = req_instance(uci, request);
 		if (!name)
 			return { error: 'no such instance' };
-		return _apply.start_apply(name);
+		return _apply.start_apply(name, req_source(request));
 	}
 };
 
