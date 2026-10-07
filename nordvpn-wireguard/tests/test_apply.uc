@@ -15,6 +15,7 @@ import { readfile, unlink, stat } from 'fs';
 import { cursor } from 'uci';
 const _common = require('nordvpn.common');
 const _apply = require('nordvpn.apply');
+const _history = require('nordvpn.history');
 const APPLY_STATUS_FILE = _common.APPLY_STATUS_FILE,
       APPLY_LOCK_FILE = _common.APPLY_LOCK_FILE,
       APPLY_MAX_RUNTIME = _common.APPLY_MAX_RUNTIME;
@@ -191,6 +192,17 @@ const DEAD_PID = 1073741824;
 	eq('the worker defaults to main', _apply.run_apply('no way').error,
 		'no credentials configured');
 	eq('the defaulted record names main', _apply.read_apply_status().instance, 'main');
+	unlink(APPLY_STATUS_FILE);
+
+	// The history entry says what started the apply; the CLI default (no
+	// source) reads as external.
+	_history.clear_events('main');
+	_apply.run_apply('main', 'save');
+	_apply.run_apply('main');
+	let evs = _history.read_events('main');
+	eq('the history records the apply source', evs[1].reason, 'save');
+	eq('an apply without a source is external', evs[0].reason, 'external');
+	_history.clear_events('main');
 	unlink(APPLY_STATUS_FILE);
 }
 
