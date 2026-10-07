@@ -110,17 +110,25 @@ that adds the extra features marked **(fork)** below.
 - **Steered domains (fork).** Send only traffic to chosen websites (and
   their subdomains) through the VPN, for example one streaming service,
   while everything else uses your normal connection.
+- **Steered addresses (fork).** Like GL.iNet's *domain or IP* policy: send
+  traffic to chosen IPv4 addresses or networks (for example `198.51.100.0/24`)
+  through the VPN. Unlike domains, this needs neither dnsmasq-full nor clients
+  that use the router's DNS. Excluded addresses work the same way.
 - **Exceptions (fork).** Exclude devices (a TV, a console, a work laptop) or
   websites (a bank or a streaming service that blocks VPNs) from the VPN,
   with *Route all LAN traffic* or with steering. Excluded traffic always uses
   your normal connection, even while the kill switch blocks the rest.
 - **Kill switch and IPv6 leak block.** When the tunnel is down, steered
   traffic is blocked rather than leaking out through the WAN.
+- **IP masquerading (fork).** Like GL.iNet's option of the same name, NAT on
+  the VPN zone is on by default and can be switched off per tunnel.
 - **NordVPN DNS.** Optionally use NordVPN's resolvers, or Threat Protection,
   which blocks ads and malware at the DNS level. The router's own lookups to
   them go through the tunnel in steered mode too. With *Route all LAN
   traffic*, no lookup falls back to your provider's resolver, and excluded
   devices keep your provider's DNS. See [Preventing leaks](#preventing-leaks).
+  Or choose **custom DNS servers (fork)**, such as Quad9 or your own Pi-hole; they
+  are reached through the tunnel and get the same DNS lock and kill switch.
 - **Leaves your own setup alone.** If you already route traffic by hand, the
   app detects it and doesn't touch it. Everything it creates is tagged and
   removed cleanly.
@@ -394,9 +402,12 @@ config instance 'main'
 	list steer_domain 'example.com'  # and/or domains (+ subdomains); needs dnsmasq-full
 	list bypass_device 'aa:bb:cc:dd:ee:01'  # exceptions: always the normal connection
 	list bypass_domain 'bank.example.com'   #   (excluded domains need dnsmasq-full)
+	list steer_ip '198.51.100.0/24'  # destination IPv4 address/network to steer
+	list bypass_ip '203.0.113.7'     # destination IPv4 address/network to exclude
 	option killswitch '0'            # block steered traffic while VPN is down
 	option block_ipv6 '1'            # block direct IPv6 (leak prevention)
-	option vpn_dns 'off'             # off | standard | threat (NordVPN resolvers)
+	option vpn_dns 'off'             # off | standard | threat | custom
+	list custom_dns '9.9.9.9'        # with vpn_dns 'custom': up to 4 IPv4 resolvers
 	option cache_dir ''              # empty = /tmp, shared by all instances; /etc, /usr, /root etc. are refused
 	option cache_refresh_interval '21600'   # seconds, background refresh
 ```
@@ -435,12 +446,17 @@ ubus call nordvpn set_credentials '{"token":"<64-hex-token>"}'                  
 ubus call nordvpn set_credentials '{"token":"<64-hex-token>","name":"Family plan"}'   # add a named entry
 ubus call nordvpn apply             # rebuild the peer and bring the tunnel up
 ubus call nordvpn apply_routing     # re-apply routing/exceptions without reconnecting
-ubus call nordvpn rotate_now        # one-shot rotation
+ubus call nordvpn rotate_now        # one-shot rotation (waits for the result)
+ubus call nordvpn rotate_start      # the same in the background; poll apply_status
 ubus call nordvpn refresh_locations # start an async server-list refresh
 ```
 
-`status`, `apply`, `apply_routing`, `rotate_now` and `set_credentials` accept an `instance`
-argument (default `main`). `create_instance` and `delete_instance` manage
+`status`, `apply`, `apply_routing`, `rotate_now`, `rotate_start` and
+`set_credentials` accept an `instance` argument (default `main`).
+`apply_start` and `rotate_start` run the job in a detached worker, one job at
+a time, and `apply_status` reports its progress and result; the LuCI page
+uses these so that rpcd stays responsive while servers are verified.
+`create_instance` and `delete_instance` manage
 instances; a new instance uses the Default credentials unless
 `create_instance` gets a `credential` entry id. An instance's `credential`
 option in `/etc/config/nordvpn` picks its bank entry. `nordvpn-rotate <name>`
@@ -583,11 +599,14 @@ logread -e nordvpn
 ```
 
 One procd-supervised daemon (`nordvpn-service`) re-reads the config every
-30 s. It refreshes the server list every `cache_refresh_interval`, and also
-on its first tick if the cache is older than 24 h or was written by an older
-version. **Refresh server list** in the UI runs the same worker on demand.
-Cache writes are atomic and locked, and a failed refresh keeps the previous
-cache.
+30 s. It refreshes the server list every `cache_refresh_interval`, counted
+from the cache file's own write time, so a restart (every config save
+restarts it) does not download a list that is still fresh. It refreshes on
+its first tick if the cache is missing, older than 24 h or than the
+interval, or was written by an older version. A failed refresh is retried
+after 2 min, then 4, 8 and so on, up to the interval. **Refresh server list**
+in the UI runs the same worker on demand. Cache writes are atomic and
+locked, and a failed refresh keeps the previous cache.
 
 The last 50 events per instance are kept in `/tmp/nordvpn_events*.json` and
 are cleared on reboot.

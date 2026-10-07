@@ -24,6 +24,14 @@ const VPN_DNS = {
 	standard: '103.86.96.100 103.86.99.100',
 	threat:   '103.86.96.96 103.86.99.99'
 };
+// Resolvers for a DNS mode: NordVPN's for 'standard'/'threat', the user's own
+// list (`custom_dns`, already validated) for 'custom'. Empty when the mode
+// has none, which callers treat as "no DNS override".
+function dns_servers(s, mode) {
+	if (mode == 'custom')
+		return s.custom_dns || [];
+	return VPN_DNS[mode] ? split(VPN_DNS[mode], ' ') : [];
+}
 const RT_TABLES = '/etc/iproute2/rt_tables';
 
 // ── Small uci helpers ────────────────────────────────────────────────
@@ -562,17 +570,52 @@ function table_in_use(uci, name, skip) {
 	return false;
 }
 
+// Short-lived results of detect()'s runtime probes. rpcd asks for every
+// instance on every status poll (every 5 s while the page is open), and the
+// WAN's MTU and IPv6 route are the same for all instances and rarely change,
+// so re-running `ubus call ... dump`, `ip link` and `ip -6 route` per instance
+// per poll only costs process starts. rpcd keeps this module loaded between
+// calls, so the memo carries over.
+const PROBE_MEMO_TTL = 15;
+let probe_memo = {};
+function memo(key, fn) {
+	let now = time();
+	let m = probe_memo[key];
+	if (m && now >= m.at && (now - m.at) < PROBE_MEMO_TTL)
+		return m.val;
+	let val = fn();
+	probe_memo[key] = { at: now, val: val };
+	return val;
+}
+
 // True when the WAN has a default IPv6 route (potential leak path).
 function wan_has_ipv6() {
-	let r = run([ 'ip', '-6', 'route', 'show', 'default' ]);
-	return r.code == 0 && length(trim(r.stdout || '')) > 0;
+	return memo('ipv6', function() {
+		let r = run([ 'ip', '-6', 'route', 'show', 'default' ]);
+		return r.code == 0 && length(trim(r.stdout || '')) > 0;
+	});
+}
+
+// MTU of a network device from sysfs (no process start), falling back to
+// `ip link` where sysfs is unavailable. null when unknown.
+function dev_mtu(dev) {
+	if (!_common.full_match(dev, /^[A-Za-z0-9._-]{1,15}$/) || dev == '.' || dev == '..')
+		return null;
+	let raw = readfile('/sys/class/net/' + dev + '/mtu');
+	if (raw != null && _common.full_match(trim(raw), /^[0-9]+$/))
+		return int(trim(raw));
+	let l = run([ 'ip', 'link', 'show', 'dev', dev ]);
+	if (l.code != 0)
+		return null;
+	let m = match(l.stdout || '', /mtu ([0-9]+)/);
+	return m ? int(m[1]) : null;
 }
 
 // L3-device MTU of the WAN uplink (the path WireGuard's UDP actually takes to
 // the endpoint — NOT the tunnel). Found via the WAN firewall zone's networks so
 // an active auto-routing default through the tunnel does not mislead us. Returns
 // the smallest MTU across WAN devices, or null when it cannot be determined.
-function wan_l3_mtu(uci) {
+function wan_l3_mtu_probe(uci) {
 	let wannets = {};
 	uci.foreach('firewall', 'zone', function(sec) {
 		if (sec[MARK] == '1')
@@ -600,17 +643,15 @@ function wan_l3_mtu(uci) {
 		// the smallest "WAN" device, dragging the next recommendation down 80.
 		if (ifc.proto == 'wireguard')
 			continue;
-		let l = run([ 'ip', 'link', 'show', 'dev', ifc.l3_device ]);
-		if (l.code != 0)
-			continue;
-		let m = match(l.stdout || '', /mtu ([0-9]+)/);
-		if (m) {
-			let v = int(m[1]);
-			if (best == null || v < best)
-				best = v;
-		}
+		let v = dev_mtu(ifc.l3_device);
+		if (v != null && (best == null || v < best))
+			best = v;
 	}
 	return best;
+}
+
+function wan_l3_mtu(uci) {
+	return memo('wan_mtu', function() { return wan_l3_mtu_probe(uci); });
 }
 
 // Recommended WireGuard interface MTU for a given WAN MTU: subtract 80 (60 bytes
@@ -880,7 +921,7 @@ function detect(uci, s, runtime) {
 	let zone = find_zone_of(uci, iface);
 	let peer = find_peer(uci, iface);
 	let steering = length(s.source_networks || []) > 0 || length(s.source_devices || []) > 0 ||
-		length(s.source_domains || []) > 0;
+		length(s.source_domains || []) > 0 || length(s.source_ips || []) > 0;
 	// "Route all LAN traffic" already owned by an earlier instance: this one
 	// falls back to its steering (or none) and reports who holds it.
 	let owner = s.auto_routing ? all_lan_owner(uci, s.name) : null;
@@ -888,7 +929,8 @@ function detect(uci, s, runtime) {
 	// Exceptions only mean something while traffic is routed at all; with
 	// "Route all LAN traffic" they move it onto the steered machinery.
 	let exceptions = (auto || steering) &&
-		(length(s.bypass_devices || []) > 0 || length(s.bypass_domains || []) > 0);
+		(length(s.bypass_devices || []) > 0 || length(s.bypass_domains || []) > 0 ||
+			length(s.bypass_ips || []) > 0);
 	// With steering active, extra user routes INSIDE the instance's table are
 	// legitimate companions (e.g. a media→LAN route); only routes referencing
 	// the interface itself signal a hand-built scheme. Without steering, a
@@ -911,6 +953,8 @@ function detect(uci, s, runtime) {
 		source_networks: s.source_networks || [],
 		source_devices: s.source_devices || [],
 		source_domains: s.source_domains || [],
+		source_ips: s.source_ips || [],
+		bypass_ips: s.bypass_ips || [],
 		exceptions: exceptions,
 		// 'unsupported' when steered or excluded domains are configured but
 		// dnsmasq cannot fill nft sets (needs dnsmasq-full); null when not
@@ -1111,7 +1155,27 @@ function enforce(uci, s, opts) {
 	if (reconcile_domain_dns(uci, iface, setname, steer_doms))
 		cd = true;
 
-	let marks = (mark && (length(steer_devs) || length(steer_doms))) ? [ mark ] : [];
+	// 1b-ip. Destination steering: same mark, matched on the destination
+	//        address or network instead of a dnsmasq-filled set, so it needs
+	//        neither dnsmasq-full nor clients that use the router's DNS.
+	let steer_ips = [];
+	if (steer && !all_lan && length(s.source_ips || []) > 0) {
+		if (!mark)
+			mark = device_mark(rt_table_id(table));
+		if (!det.lan_zone)
+			push(notes, 'address steering: could not determine the LAN zone');
+		else if (!mark)
+			push(notes, 'address steering needs a routing table with an id of 1-255; ' + table + ' has none');
+		else
+			steer_ips = s.source_ips;
+	}
+	if (reconcile_rules(uci, 'rule', 'ip_mark', iface, steer_ips, function(c) {
+		return { name: 'NordVPN address ' + c, src: det.lan_zone, dest: '*', dest_ip: c, family: 'ipv4',
+			proto: 'all', target: 'MARK', set_xmark: mark };
+	}, 'dest_ip', 'firewall'))
+		cf = true;
+
+	let marks = (mark && (length(steer_devs) || length(steer_doms) || length(steer_ips))) ? [ mark ] : [];
 	if (reconcile_rules(uci, 'rule', 'device_mark', iface, steer_devs, function(mac) {
 		return { name: 'NordVPN device ' + mac, src: det.lan_zone, dest: '*', src_mac: mac, proto: 'all',
 			target: 'MARK', set_xmark: mark };
@@ -1123,7 +1187,7 @@ function enforce(uci, s, opts) {
 		uci.foreach('firewall', 'rule', function(sec) {
 			if (sec[MARK] != '1' || sec.nordvpn_iface != iface)
 				return;
-			if ((sec[ROLE] == 'device_mark' || sec[ROLE] == 'domain_mark') && sec.set_xmark != mark) {
+			if ((sec[ROLE] == 'device_mark' || sec[ROLE] == 'domain_mark' || sec[ROLE] == 'ip_mark') && sec.set_xmark != mark) {
 				uci.set('firewall', sec['.name'], 'set_xmark', mark);
 				cf = true;
 			}
@@ -1149,7 +1213,7 @@ function enforce(uci, s, opts) {
 	//        ahead of every steering lookup (19000, 20000) and prohibit
 	//        (21000) rule: excluded traffic skips the tunnel and the kill
 	//        switch, and keeps its IPv6.
-	let byp_devs = [], byp_doms = [];
+	let byp_devs = [], byp_doms = [], byp_ips = [];
 	let bmark = device_mark(BYPASS_TABLE_ID);
 	if (steer && det.exceptions) {
 		if (rt_table_id(table) == BYPASS_TABLE_ID)
@@ -1159,6 +1223,12 @@ function enforce(uci, s, opts) {
 			if (length(byp_devs) && !det.lan_zone) {
 				push(notes, 'excluded devices: could not determine the LAN zone');
 				byp_devs = [];
+			}
+			if (length(s.bypass_ips || []) > 0) {
+				if (det.lan_zone)
+					byp_ips = s.bypass_ips;
+				else
+					push(notes, 'excluded addresses: could not determine the LAN zone');
 			}
 			if (length(s.bypass_domains || []) > 0) {
 				let supported = (opts && opts.nftset != null) ? !!opts.nftset : nftset_supported();
@@ -1180,9 +1250,9 @@ function enforce(uci, s, opts) {
 		if (sec[MARK] != '1')
 			return;
 		let r = sec[ROLE];
-		if ((r == 'bypass_mark' || r == 'bypass_domain_mark') && sec.nordvpn_iface == iface)
+		if ((r == 'bypass_mark' || r == 'bypass_domain_mark' || r == 'bypass_ip_mark') && sec.nordvpn_iface == iface)
 			push(byp_secs, sec['.name']);
-		else if (length(byp_secs) && (r == 'device_mark' || r == 'domain_mark'))
+		else if (length(byp_secs) && (r == 'device_mark' || r == 'domain_mark' || r == 'ip_mark'))
 			late = true;
 	});
 	if (late) {
@@ -1208,7 +1278,12 @@ function enforce(uci, s, opts) {
 			target: 'MARK', set_xmark: bmark };
 	}, 'src_mac', 'firewall'))
 		cf = true;
-	let bmarks = (length(byp_devs) || length(byp_doms)) ? [ bmark ] : [];
+	if (reconcile_rules(uci, 'rule', 'bypass_ip_mark', iface, byp_ips, function(c) {
+		return { name: 'NordVPN exception ' + c, src: det.lan_zone, dest: '*', dest_ip: c, family: 'ipv4',
+			proto: 'all', target: 'MARK', set_xmark: bmark };
+	}, 'dest_ip', 'firewall'))
+		cf = true;
+	let bmarks = (length(byp_devs) || length(byp_doms) || length(byp_ips)) ? [ bmark ] : [];
 	if (reconcile_rules(uci, 'rule', 'bypass_lookup', iface, bmarks, function(m) {
 		return { mark: m, lookup: 'main', priority: '18000' };
 	}, 'mark'))
@@ -1272,7 +1347,7 @@ function enforce(uci, s, opts) {
 				uci.set('firewall', z, 'input', 'REJECT');
 				uci.set('firewall', z, 'output', 'ACCEPT');
 				uci.set('firewall', z, 'forward', 'REJECT');
-				uci.set('firewall', z, 'masq', '1');
+				uci.set('firewall', z, 'masq', s.vpn_masq === false ? '0' : '1');
 				uci.set('firewall', z, 'mtu_fix', '1');
 				uci.set('firewall', z, 'network', [ iface ]);
 				uci.set('firewall', z, MARK, '1');
@@ -1280,6 +1355,15 @@ function enforce(uci, s, opts) {
 				uci.set('firewall', z, 'nordvpn_iface', iface);
 				cf = true;
 				det.zone = iface;
+			}
+		}
+		// Keep the masquerading flag of our own zone in step with the setting.
+		let ownz = find_managed(uci, 'zone', 'zone', iface);
+		if (ownz) {
+			let want_masq = (s.vpn_masq === false) ? '0' : '1';
+			if ((uci.get('firewall', ownz, 'masq') || '0') != want_masq) {
+				uci.set('firewall', ownz, 'masq', want_masq);
+				cf = true;
 			}
 		}
 		if (det.zone) {
@@ -1418,11 +1502,15 @@ function enforce(uci, s, opts) {
 	// stamp records the mode, so switching resolvers (standard <-> threat)
 	// re-applies instead of being skipped as "already set".
 	let mode = (managed && s.vpn_dns && s.vpn_dns != 'off') ? s.vpn_dns : null;
+	let vdns = mode ? dns_servers(s, mode) : [];
+	if (!length(vdns))
+		mode = null;
 	let stamped = uci.get('network', iface, MARK + '_dns');
-	if (mode && VPN_DNS[mode]) {
-		if (stamped != mode) {
-			uci.set('network', iface, 'dns', split(VPN_DNS[mode], ' '));
-			uci.set('network', iface, MARK + '_dns', mode);
+	let want_stamp = (mode == 'custom') ? ('custom:' + join(',', vdns)) : mode;
+	if (mode) {
+		if (stamped != want_stamp) {
+			uci.set('network', iface, 'dns', vdns);
+			uci.set('network', iface, MARK + '_dns', want_stamp);
 			cn = true;
 		}
 	} else if (stamped != null && stamped != '') {
@@ -1439,8 +1527,8 @@ function enforce(uci, s, opts) {
 	//     rule is needed. Keyed by resolver AND table, so a table change
 	//     replaces the rules instead of leaving a stale lookup.
 	let dns_keys = [];
-	if (steer && mode && VPN_DNS[mode])
-		for (let ip in split(VPN_DNS[mode], ' '))
+	if (steer && mode)
+		for (let ip in vdns)
 			push(dns_keys, ip + '/32 ' + table);
 	if (reconcile_rules(uci, 'rule', 'dns_lookup', iface, dns_keys, function(k) {
 		let p = split(k, ' ');
@@ -1458,17 +1546,17 @@ function enforce(uci, s, opts) {
 	let wan_dns = function() {
 		if (wans == null) {
 			wans = (opts && opts.wan_dns != null) ? opts.wan_dns : wan_resolvers(uci, det.wan_zone);
-			wans = filter(wans, (ip) => index(split(VPN_DNS[mode], ' '), ip) < 0);
+			wans = filter(wans, (ip) => index(vdns, ip) < 0);
 		}
 		return wans;
 	};
 	let lock = null;
-	if ((auto || !!all_lan) && mode && VPN_DNS[mode]) {
+	if ((auto || !!all_lan) && mode) {
 		wan_dns();
 		if (!length(wans))
 			push(notes, 'could not find the WAN DNS servers; DNS not locked to the VPN');
 		else {
-			lock = split(VPN_DNS[mode], ' ');
+			lock = [ ...vdns ];
 			for (let ip in wans)
 				push(lock, '/nordvpn.com/' + ip);
 		}
@@ -1485,7 +1573,7 @@ function enforce(uci, s, opts) {
 	// the WAN's share that table, so there is no rule to tell them apart.
 	let dns_ks = [];
 	if (lock && steer)
-		for (let ip in split(VPN_DNS[mode], ' '))
+		for (let ip in vdns)
 			push(dns_ks, ip + '/32');
 	if (reconcile_rules(uci, 'rule', 'dns_ks', iface, dns_ks, function(ip) {
 		return { dest: ip, action: 'prohibit', priority: '19501' };
@@ -1500,7 +1588,7 @@ function enforce(uci, s, opts) {
 	//     exception mark then routes it out of the WAN. IPv4 only: a device
 	//     asking the router over IPv6 still gets the NordVPN resolvers.
 	let byp_dns = [];
-	if (length(byp_devs) && mode && VPN_DNS[mode]) {
+	if (length(byp_devs) && mode) {
 		byp_dns = filter(wan_dns(), (ip) => _common.validate_ipv4(ip) != null);
 		if (!length(byp_dns))
 			push(notes, 'excluded devices: no IPv4 WAN DNS server found; they keep using the router\'s DNS');

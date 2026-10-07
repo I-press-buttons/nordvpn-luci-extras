@@ -9,7 +9,7 @@
 
 'use strict';
 
-import { open, stat, unlink, rename, popen } from 'fs';
+import { open, stat, unlink, rename, popen, readfile } from 'fs';
 
 // ── Constants ────────────────────────────────────────────────────────
 
@@ -52,6 +52,9 @@ const MAX_VERIFY_TIMEOUT = 30;
 // candidates at MAX_VERIFY_TIMEOUT each, with slack for the routing reload.
 // Past it a 'running' apply record is an abandoned one.
 const APPLY_MAX_RUNTIME = 300;
+// Upper bound for any job ceiling derived from the settings (a rotation with
+// max_retries 50 at verify_timeout 30 is the slowest job there is).
+const JOB_MAX_RUNTIME_CAP = 3600;
 
 // Watchdog (auto-reconnect) tuning: how long an instance must stay unhealthy
 // before recovering, and the min/max pause between recovery attempts
@@ -161,9 +164,10 @@ function validate_hop_mode(m) {
 
 // DNS override mode while connected: 'off' (system/WAN resolver), 'standard'
 // (NordVPN's plain resolver) or 'threat' (NordVPN Threat Protection, blocks
-// ads and malware). null for anything else so the caller can fall back.
+// ads and malware) or 'custom' (the user's own resolvers, `custom_dns`). null
+// for anything else so the caller can fall back.
 function validate_dns_mode(m) {
-	return (m == 'off' || m == 'standard' || m == 'threat') ? m : null;
+	return (m == 'off' || m == 'standard' || m == 'threat' || m == 'custom') ? m : null;
 }
 
 // Classify a relay from the normalized cache: 'multihop' (Double VPN),
@@ -231,6 +235,21 @@ function validate_ipv4(a) {
 		if (int(o) > 255)
 			return null;
 	return a;
+}
+
+// A destination network to steer or exclude: an IPv4 address or 'a.b.c.d/len'
+// with len 1-32 (a /0 would capture everything and is refused). Returned in
+// the same spelling, a bare address staying bare, else null.
+function validate_cidr4(c) {
+	if (type(c) != 'string')
+		return null;
+	c = trim(c);
+	let m = match(c, /^([0-9.]+)(\/([0-9]{1,2}))?$/);
+	if (!m || !validate_ipv4(m[1]))
+		return null;
+	if (m[3] != null && (int(m[3]) < 1 || int(m[3]) > 32))
+		return null;
+	return c;
 }
 
 // Client MAC address: 'aa:bb:cc:dd:ee:ff', '-' separators, or 12 bare hex
@@ -420,6 +439,16 @@ function load_settings(uci, instance) {
 			push(steer_domains, d);
 	}
 
+	// `list steer_ip` — destination IPv4 addresses/networks steered through
+	// this instance (marked by an fw4 rule, no dnsmasq needed).
+	let sip = uci.get('nordvpn', name, 'steer_ip');
+	let steer_ips = [];
+	for (let x in ((type(sip) == 'array') ? sip : (sip != null ? [ sip ] : []))) {
+		let c = validate_cidr4(x);
+		if (c && index(steer_ips, c) < 0 && length(steer_ips) < MAX_STEER_DOMAINS)
+			push(steer_ips, c);
+	}
+
 	// `list bypass_device` / `list bypass_domain` — exceptions: devices and
 	// domains that always take the normal connection, even while the kill
 	// switch blocks the rest. An entry that is both steered and excluded
@@ -438,6 +467,14 @@ function load_settings(uci, instance) {
 		if (d && index(bypass_domains, d) < 0 && length(bypass_domains) < MAX_STEER_DOMAINS)
 			push(bypass_domains, d);
 	}
+	let bip = uci.get('nordvpn', name, 'bypass_ip');
+	let bypass_ips = [];
+	for (let x in ((type(bip) == 'array') ? bip : (bip != null ? [ bip ] : []))) {
+		let c = validate_cidr4(x);
+		if (c && index(bypass_ips, c) < 0 && length(bypass_ips) < MAX_STEER_DOMAINS)
+			push(bypass_ips, c);
+	}
+	steer_ips = filter(steer_ips, (c) => index(bypass_ips, c) < 0);
 	source_devices = filter(source_devices, (m) => index(bypass_devices, m) < 0);
 	steer_domains = filter(steer_domains, (d) => index(bypass_domains, d) < 0);
 
@@ -483,7 +520,7 @@ function load_settings(uci, instance) {
 	// interface's name. Never written to the config, so removing the
 	// exceptions restores plain automatic routing through the main table.
 	if (routing_table == '' && g('auto_routing', '0') == '1' &&
-	    (length(bypass_devices) > 0 || length(bypass_domains) > 0))
+	    (length(bypass_devices) > 0 || length(bypass_domains) > 0 || length(bypass_ips) > 0))
 		routing_table = iface;
 
 	return {
@@ -491,8 +528,10 @@ function load_settings(uci, instance) {
 		source_networks: source_networks,
 		source_devices: source_devices,
 		source_domains: steer_domains,
+		source_ips: steer_ips,
 		bypass_devices: bypass_devices,
 		bypass_domains: bypass_domains,
+		bypass_ips: bypass_ips,
 		locations: locations,
 		enabled: g('enabled', '0') == '1',
 		interface: iface,
@@ -534,6 +573,10 @@ function load_settings(uci, instance) {
 		auto_routing: g('auto_routing', '0') == '1',
 		killswitch: g('killswitch', '0') == '1',
 		block_ipv6: g('block_ipv6', '1') == '1',
+		// IP masquerading (NAT) on the VPN firewall zone, like GL.iNet's
+		// "IP Masquerading" option. On by default; turning it off is only
+		// useful when the far end can route back to the LAN.
+		vpn_masq: g('vpn_masq', '1') == '1',
 		// DNS override mode. Prefer the enum; fall back to the legacy boolean
 		// (use_vpn_dns=1 meant the standard resolver) so upgraded configs keep
 		// working before the migration/save rewrites the key. use_vpn_dns stays
@@ -546,6 +589,18 @@ function load_settings(uci, instance) {
 		})(),
 		use_vpn_dns: validate_dns_mode(g('vpn_dns', '')) ?
 			(g('vpn_dns', '') != 'off') : (g('use_vpn_dns', '0') == '1'),
+		// `list custom_dns`: IPv4 resolvers used when vpn_dns is 'custom'
+		// (at most 4, deduplicated, invalid entries dropped).
+		custom_dns: (function() {
+			let out = [];
+			let cd = uci.get('nordvpn', name, 'custom_dns');
+			for (let x in (type(cd) == 'array') ? cd : (type(cd) == 'string' ? [ cd ] : [])) {
+				x = trim('' + x);
+				if (validate_ipv4(x) && index(out, x) < 0 && length(out) < 4)
+					push(out, x);
+			}
+			return out;
+		})(),
 		cache_dir: gs('cache_dir', ''),
 		cache_refresh_interval: (function() {
 			let v = bounded_int(gs('cache_refresh_interval', '21600'), MIN_CACHE_REFRESH, MAX_CACHE_REFRESH);
@@ -615,24 +670,65 @@ function atomic_write(path, data) {
 	return true;
 }
 
+// Own pid — the first field of /proc/self/stat — or null when /proc is
+// unavailable. Read every time rather than cached: a uloop.task child is a
+// fork and must not report its parent's pid.
+function self_pid() {
+	let raw = readfile('/proc/self/stat');
+	if (!raw)
+		return null;
+	let first = split(trim(raw), ' ')[0];
+	return full_match(first, /^[0-9]+$/) ? int(first) : null;
+}
+
+// Is the lock file at `path` abandoned? Either older than `max_age` seconds,
+// or naming a holder process that no longer exists: a worker killed mid-job
+// (the OOM killer on a small router, a reboot of the daemon) releases
+// nothing, and waiting out the whole age would stall every rotation, refresh
+// or state write behind it for minutes. The pid is only trusted when /proc
+// can confirm it; the age check stays as the fallback (and covers a pid that
+// was reused by an unrelated process).
+function lock_stale(path, max_age) {
+	let st = stat(path);
+	if (!st)
+		return false;
+	if (st.mtime && (time() - st.mtime) > max_age)
+		return true;
+	let m = match(readfile(path) || '', /^[0-9]+ ([0-9]+)/);
+	if (!m || int(m[1]) <= 0 || !stat('/proc/self'))
+		return false;
+	return stat('/proc/' + m[1]) == null;
+}
+
 // Best-effort exclusive lock via an O_EXCL lock file. Returns a token to pass
-// to release_lock(), or null when another holder is active. Stale locks older
-// than `max_age` seconds are reclaimed.
+// to release_lock(), or null when another holder is active. Stale locks (see
+// lock_stale()) are reclaimed. The file records "<time> <pid>".
 function acquire_lock(path, max_age) {
 	max_age = max_age || 600;
 	let fh = open(path, 'wx');
-	if (!fh) {
-		let st = stat(path);
-		if (st && st.mtime && (time() - st.mtime) > max_age) {
-			unlink(path);
-			fh = open(path, 'wx');
-		}
+	if (!fh && lock_stale(path, max_age)) {
+		unlink(path);
+		fh = open(path, 'wx');
 	}
 	if (!fh)
 		return null;
-	fh.write(sprintf('%d\n', time()));
+	fh.write(sprintf('%d %d\n', time(), self_pid() || 0));
 	fh.close();
 	return path;
+}
+
+// How long one rotation of an instance with settings `s` may plausibly take:
+// every candidate rewrites the peer, restarts the interface and waits up to
+// verify_timeout for a handshake, then the WAN default route is re-checked.
+// Used as the rotation lock's age and the UI job's ceiling, so a slow but
+// healthy rotation is never mistaken for an abandoned one.
+function rotation_max_runtime(s) {
+	let tries = (s && type(s.max_retries) == 'int' && s.max_retries > 0) ? s.max_retries : 10;
+	let wait = (s && type(s.verify_timeout) == 'int' && s.verify_timeout > 0) ? s.verify_timeout : 8;
+	let t = tries * (wait + 10) + 60;
+	if (t < APPLY_MAX_RUNTIME)
+		t = APPLY_MAX_RUNTIME;
+	return (t > JOB_MAX_RUNTIME_CAP) ? JOB_MAX_RUNTIME_CAP : t;
 }
 
 function release_lock(token) {
@@ -675,7 +771,7 @@ return {
 	VERSION, API_BASE, CREDS_URL, SERVERS_URL, IP_INSIGHTS_URL,
 	DEFAULT_INTERFACE, DEFAULT_PORT, DEFAULT_KEEPALIVE, FIXED_ADDRESS,
 	CACHE_FILENAME, DEFAULT_CACHE_DIR, FETCH_STATUS_FILE, CACHE_LOCK_FILE,
-	APPLY_STATUS_FILE, APPLY_LOCK_FILE, APPLY_MAX_RUNTIME,
+	APPLY_STATUS_FILE, APPLY_LOCK_FILE, APPLY_MAX_RUNTIME, JOB_MAX_RUNTIME_CAP,
 	CACHE_MAX_AGE, CACHE_SCHEMA_VERSION, PAGE_SIZE, MAX_PAGES,
 	MIN_ROTATION_INTERVAL, MAX_ROTATION_INTERVAL, MIN_CACHE_REFRESH, MAX_CACHE_REFRESH,
 	MIN_VERIFY_TIMEOUT, MAX_VERIFY_TIMEOUT,
@@ -684,7 +780,8 @@ return {
 	full_match, bounded_int, validate_interface, validate_token, validate_wg_key, validate_hostname, validate_nordvpn_host,
 	validate_port, validate_hop_mode, validate_dns_mode, relay_kind, validate_selection, validate_server_group, validate_rotation_mode, validate_interval, validate_time,
 	validate_country_code, validate_location_code, validate_instance, validate_routing_table, validate_dir,
-	validate_mac, validate_domain, clean_label, validate_ipv4,
+	validate_mac, validate_domain, validate_cidr4, clean_label, validate_ipv4,
 	managed_interface, load_settings, list_instances, globals_section, cache_file_path, iso_ts, redact, log,
-	atomic_write, acquire_lock, release_lock, sh_quote, open_cmd, run
+	atomic_write, self_pid, lock_stale, acquire_lock, release_lock, rotation_max_runtime,
+	sh_quote, open_cmd, run
 };

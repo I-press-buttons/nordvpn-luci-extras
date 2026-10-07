@@ -68,7 +68,10 @@ var callApplyStatus = rpc.declare({ object: 'nordvpn', method: 'apply_status' })
 // the tunnel. Quick (no handshake wait), so it is a plain call.
 var callApplyRouting = rpc.declare({ object: 'nordvpn', method: 'apply_routing', params: [ 'instance' ] });
 var callRefreshLocations = rpc.declare({ object: 'nordvpn', method: 'refresh_locations' });
-var callRotateNow = rpc.declare({ object: 'nordvpn', method: 'rotate_now', params: [ 'instance' ] });
+// A manual rotation tries up to max_retries servers at verify_timeout each, so
+// it runs as a job exactly like an apply (see callApplyStart) and is watched
+// through apply_status. `rotate_now` stays in the backend for the CLI only.
+var callRotateStart = rpc.declare({ object: 'nordvpn', method: 'rotate_start', params: [ 'instance' ] });
 var callExternalIp = rpc.declare({ object: 'nordvpn', method: 'external_ip', params: [ 'instance' ] });
 var callClients = rpc.declare({ object: 'nordvpn', method: 'clients' });
 var callDisconnect = rpc.declare({ object: 'nordvpn', method: 'disconnect', params: [ 'instance' ] });
@@ -100,7 +103,8 @@ var STATUS_POLL_S = 5;
 // other change (server, location, hop mode, table, MTU, …) reconnects.
 var NO_RECONNECT_OPTS = [
 	'source_device', 'bypass_device', 'source_network', 'steer_domain', 'bypass_domain',
-	'auto_routing', 'killswitch', 'block_ipv6', 'vpn_dns', 'use_vpn_dns',
+	'steer_ip', 'bypass_ip',
+	'auto_routing', 'killswitch', 'block_ipv6', 'vpn_masq', 'vpn_dns', 'use_vpn_dns', 'custom_dns',
 	'rotation_enabled', 'rotation_mode', 'rotation_interval', 'rotation_time',
 	'watchdog', 'egress_probe', 'probe_target', 'verify_timeout', 'max_retries'
 ];
@@ -694,8 +698,10 @@ return view.extend({
 		    (rt.mode !== 'auto' && rt.mode !== 'steered'))
 			return null;
 		var mode = uci.get('nordvpn', this.instance, 'vpn_dns');
-		if (mode !== 'off' && mode !== 'standard' && mode !== 'threat')
+		if (mode !== 'off' && mode !== 'standard' && mode !== 'threat' && mode !== 'custom')
 			mode = (uci.get('nordvpn', this.instance, 'use_vpn_dns') === '1') ? 'standard' : 'off';
+		if (mode === 'custom')
+			return E('div', { class: 'nv-status-details' }, _('DNS: your custom servers, through the tunnel'));
 		if (mode === 'off')
 			return E('div', { class: 'nv-status-details', style: 'color:var(--warning-color,#b8860b)' },
 				_('DNS: the router\'s upstream resolver (usually your ISP), which can see every site looked up. Choose NordVPN DNS under Traffic routing to change that.'));
@@ -856,18 +862,39 @@ return view.extend({
 	// reach the router at all. `source` labels the history entry: 'reconnect',
 	// 'enable' or 'save'.
 	applyAsync: function(instance, source) {
+		return this.runJob(function(inst) { return callApplyStart(inst, source); }, instance, 'apply');
+	},
+
+	// Runs one backend job (`kind` 'apply' or 'rotate') through `start` and
+	// resolves with its result. The backend runs one job at a time and reports
+	// it through apply_status, so only a record of this very job (kind and
+	// instance) is taken as its outcome.
+	runJob: function(start, instance, kind) {
 		var deadline = Date.now() + APPLY_TIMEOUT_MS;
+		var mine = function(st) {
+			return !!st && (st.kind || 'apply') === kind && st.instance === instance;
+		};
+		// A rotation may outlast an apply by far (max_retries candidates); the
+		// job record states its own ceiling.
+		var extend = function(st) {
+			if (st && typeof st.max_runtime === 'number')
+				deadline = Math.max(deadline, Date.now() + (st.max_runtime + 30) * 1000);
+		};
 		this.pauseStatusPoll();
-		return callApplyStart(instance, source).then(L.bind(function(res) {
-			if (!res || !res.error)
-				return this.waitForApply(deadline);
+		return start(instance).then(L.bind(function(res) {
+			if (!res || !res.error) {
+				extend(res && res.apply);
+				return this.waitForApply(deadline, mine);
+			}
 			// A refused start is usually "one is already running" — from the other
-			// button, another tab, or a rotation. Matching on the message would be
-			// brittle, so simply ask what the job queue is doing: if something is
-			// running, that is the apply the user wanted anyway.
+			// button or another tab. Matching on the message would be brittle, so
+			// simply ask what the job queue is doing: if this very job is running,
+			// that is the one the user wanted anyway.
 			return callApplyStatus().then(L.bind(function(st) {
-				return (st && st.state === 'running')
-					? this.waitForApply(deadline) : { error: res.error };
+				if (!(st && st.state === 'running' && mine(st)))
+					return { error: res.error };
+				extend(st);
+				return this.waitForApply(deadline, mine);
 			}, this), function() { return { error: res.error }; });
 		}, this)).then(L.bind(function(result) {
 			this.resumeStatusPoll();
@@ -883,22 +910,26 @@ return view.extend({
 	// Probes apply_status until the job leaves 'running'. Anything that is not a
 	// finished job is turned into an `error` result rather than an optimistic
 	// success: a banner claiming a tunnel that never came up is worse than an
-	// honest "no idea".
-	waitForApply: function(deadline) {
+	// honest "no idea". `mine` tells this job's record from another one's.
+	waitForApply: function(deadline, mine) {
+		var since = Date.now();
 		return new Promise(function(resolve, reject) {
 			var probe = function() {
 				callApplyStatus().then(function(st) {
 					var state = st && st.state;
+					if ((state === 'done' || state === 'failed') && !mine(st))
+						// Another job ran after ours, so our own result is gone.
+						return resolve({ error: _('another operation replaced this one; check the recent events') });
 					if (state === 'done' || state === 'failed')
 						return resolve((st && st.result) ||
-							{ error: _('the apply finished without reporting a result') });
+							{ error: _('the operation finished without reporting a result') });
 					if (state !== 'running')
 						// 'idle' after a successful start means the job record is
 						// gone — an rpcd restart, or the backend died mid-apply.
-						return resolve({ error: _('the apply stopped reporting progress') });
+						return resolve({ error: _('the operation stopped reporting progress') });
 					if (Date.now() >= deadline)
-						return resolve({ error: _('the apply is still running after %d seconds — check the system log')
-							.format(Math.round(APPLY_TIMEOUT_MS / 1000)) });
+						return resolve({ error: _('the operation is still running after %d seconds — check the system log')
+							.format(Math.round((Date.now() - since) / 1000)) });
 					window.setTimeout(probe, APPLY_POLL_MS);
 				}, function(e) {
 					// One lost probe is not a failed apply: rpcd may just be busy
@@ -951,7 +982,7 @@ return view.extend({
 
 	rotateNow: function() {
 		var n = this.notice(_('Rotating to another server…'), 'info');
-		return callRotateNow(this.instance).then(L.bind(function(res) {
+		return this.runJob(callRotateStart, this.instance, 'rotate').then(L.bind(function(res) {
 			this.dismiss(n);
 			if (res && res.ok)
 				this.notice(_('Rotated to %s').format(res.server), 'info', 4000);
@@ -1246,16 +1277,27 @@ return view.extend({
 			this.ksBox.checked = (g('killswitch', '0') === '1');
 			this.v6Box = E('input', { type: 'checkbox', change: L.bind(this.onRoutingToggle, this) });
 			this.v6Box.checked = (g('block_ipv6', '1') === '1');
+			this.masqBox = E('input', { type: 'checkbox', change: L.bind(this.markDirty, this) });
+			this.masqBox.checked = (g('vpn_masq', '1') === '1');
 			// DNS mode: prefer the enum, fall back to the legacy boolean.
 			var dnsMode = g('vpn_dns', '');
-			if (dnsMode !== 'off' && dnsMode !== 'standard' && dnsMode !== 'threat')
+			if (dnsMode !== 'off' && dnsMode !== 'standard' && dnsMode !== 'threat' && dnsMode !== 'custom')
 				dnsMode = (g('use_vpn_dns', '0') === '1') ? 'standard' : 'off';
-			this.dnsSel = E('select', { class: 'cbi-input-select', change: L.bind(this.markDirty, this) }, [
+			this.dnsSel = E('select', { class: 'cbi-input-select', change: L.bind(function() {
+				this.dnsCustom.classList.toggle('hidden', this.dnsSel.value !== 'custom');
+				this.markDirty();
+			}, this) }, [
 				E('option', { value: 'off' }, _('Off — use system DNS')),
 				E('option', { value: 'standard' }, _('NordVPN — standard')),
-				E('option', { value: 'threat' }, _('NordVPN Threat Protection — blocks ads & malware'))
+				E('option', { value: 'threat' }, _('NordVPN Threat Protection — blocks ads & malware')),
+				E('option', { value: 'custom' }, _('Custom — your own DNS servers'))
 			]);
 			this.dnsSel.value = dnsMode;
+			var customDns = L.toArray(uci.get('nordvpn', this.instance, 'custom_dns'));
+			this.dnsCustom = E('input', { type: 'text', class: 'cbi-input-text', style: 'margin-top:.4em',
+				placeholder: '9.9.9.9 149.112.112.112', value: customDns.join(' '),
+				input: L.bind(this.markDirty, this) });
+			this.dnsCustom.classList.toggle('hidden', dnsMode !== 'custom');
 			this.v6Warn = E('div', { class: 'cbi-value-description nv-inline-note hidden' },
 				_('⚠ IPv6 stays outside the tunnel and can leak your address.'));
 
@@ -1308,9 +1350,13 @@ return view.extend({
 				E('label', { class: 'nv-check' }, [ this.v6Box, _('Block direct IPv6 to prevent leaks') ]),
 				this.v6Warn
 			]);
-			this.dnsRow = this.row(_('DNS'), [ this.dnsSel ],
-				_('Which resolver to use while connected. Threat Protection blocks ads and malware at the DNS level; both NordVPN options only work through the tunnel. With "Route all LAN traffic", the router then forwards every lookup only to NordVPN (so none leak to your provider\'s resolver), and lookups fail while the tunnel is down.'));
+			this.masqRow = this.row(_('IP masquerading'), [
+				E('label', { class: 'nv-check' }, [ this.masqBox, _('Hide LAN addresses behind the tunnel address (NAT)') ])
+			], _('Leave this on unless the VPN provider can route replies back to your LAN. Turning it off usually breaks internet access through NordVPN.'));
+			this.dnsRow = this.row(_('DNS'), [ this.dnsSel, this.dnsCustom ],
+				_('Which resolver to use while connected. Custom takes up to 4 IPv4 addresses separated by spaces, for example Quad9 or your own Pi-hole; they are reached through the tunnel. Threat Protection blocks ads and malware at the DNS level; both NordVPN options only work through the tunnel. With "Route all LAN traffic", the router then forwards every lookup only to NordVPN (so none leak to your provider\'s resolver), and lookups fail while the tunnel is down.'));
 			body.appendChild(this.ksRow);
+			body.appendChild(this.masqRow);
 			body.appendChild(this.v6Row);
 			body.appendChild(this.dnsRow);
 			this.onRoutingToggle(true);
@@ -1333,26 +1379,48 @@ return view.extend({
 		return /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$/.test(d) ? d : null;
 	},
 
-	// Split an editor's text into { valid (deduped), invalid } entries.
+	// Mirror of the backend's validate_cidr4(): 'a.b.c.d' or 'a.b.c.d/1-32'.
+	normIp: function(s) {
+		var m = String(s || '').trim().match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})(?:\/(\d{1,2}))?$/);
+		if (!m || m.slice(1, 5).some(function(o) { return +o > 255; }))
+			return null;
+		if (m[5] != null && (+m[5] < 1 || +m[5] > 32))
+			return null;
+		return m[0];
+	},
+
+	// Split an editor's text into { valid (domains), ips (addresses and
+	// networks), invalid } entries; each list is deduped and capped at 64.
 	parseDomains: function(ed) {
-		var valid = [], invalid = [];
+		var valid = [], ips = [], invalid = [];
 		var raw = (ed && ed.area) ? (ed.area.value || '').split(/[\s,]+/).filter(Boolean) : [];
 		raw.forEach(L.bind(function(x) {
-			var d = this.normDomain(x);
-			if (!d)
+			var ip = this.normIp(x), d = ip ? null : this.normDomain(x);
+			if (!ip && !d)
 				invalid.push(x);
-			else if (valid.indexOf(d) < 0)
+			else if (ip && ips.indexOf(ip) < 0)
+				ips.push(ip);
+			else if (d && valid.indexOf(d) < 0)
 				valid.push(d);
 		}, this));
-		return { valid: valid.slice(0, 64), invalid: invalid, capped: valid.length > 64 };
+		return { valid: valid.slice(0, 64), ips: ips.slice(0, 64), invalid: invalid,
+			capped: valid.length > 64 || ips.length > 64 };
 	},
 
 	steeredDomains: function() {
 		return this.parseDomains((this.domEds || {}).steer).valid;
 	},
 
+	steeredIps: function() {
+		return this.parseDomains((this.domEds || {}).steer).ips;
+	},
+
 	excludedDomains: function() {
 		return this.parseDomains((this.domEds || {}).bypass).valid;
+	},
+
+	excludedIps: function() {
+		return this.parseDomains((this.domEds || {}).bypass).ips;
 	},
 
 	updateDomainNote: function(ed) {
@@ -1361,9 +1429,9 @@ return view.extend({
 		var p = this.parseDomains(ed);
 		var msgs = [];
 		if (p.invalid.length)
-			msgs.push(_('Ignored (not a domain name): %s').format(p.invalid.join(' ')));
+			msgs.push(_('Ignored (not a domain name or IPv4 address): %s').format(p.invalid.join(' ')));
 		if (p.capped)
-			msgs.push(_('Only the first 64 domains are used.'));
+			msgs.push(_('Only the first 64 domains and 64 addresses are used.'));
 		// Array-wrapped: a bare string goes to innerHTML, and the ignored
 		// entries are raw editor/UCI text (see the E() note at the top).
 		dom.content(ed.note, [ msgs.join(' ') ]);
@@ -1374,21 +1442,22 @@ return view.extend({
 	// (bypass_domain, always the normal connection).
 	buildDomainEditor: function(rt, kind) {
 		var ed = { kind: kind };
-		var cur = L.toArray(uci.get('nordvpn', this.instance, (kind === 'bypass') ? 'bypass_domain' : 'steer_domain'));
+		var cur = L.toArray(uci.get('nordvpn', this.instance, (kind === 'bypass') ? 'bypass_domain' : 'steer_domain'))
+			.concat(L.toArray(uci.get('nordvpn', this.instance, (kind === 'bypass') ? 'bypass_ip' : 'steer_ip')));
 		ed.area = E('textarea', { class: 'cbi-input-textarea', rows: 3, style: 'width:100%;max-width:420px',
-			placeholder: (kind === 'bypass') ? 'bank.example.com' : 'example.com\nvideo.example.org',
+			placeholder: (kind === 'bypass') ? 'bank.example.com\n203.0.113.0/24' : 'example.com\nvideo.example.org\n198.51.100.0/24',
 			input: L.bind(function() { this.updateDomainNote(ed); this.onRoutingToggle(); }, this) }, cur.join('\n'));
 		ed.note = E('div', { class: 'cbi-value-description nv-inline-note hidden' });
 		this.domEds[kind] = ed;
-		var unsupported = (rt.domain_steering === 'unsupported' && cur.length)
+		var unsupported = (rt.domain_steering === 'unsupported' && cur.some(function(x) { return !this.normIp(x); }, this))
 			? E('div', { class: 'cbi-value-description nv-inline-note' },
 				_('⚠ The installed dnsmasq cannot fill nftables sets, so these domains are ignored. Install dnsmasq-full (replacing dnsmasq) and save again.'))
 			: '';
 		if (kind === 'bypass')
-			return this.row(_('Excluded domains'), [ ed.area, ed.note, unsupported ],
-				_('Traffic to these domains (and their subdomains) always uses your normal connection, for example a bank or a streaming site that blocks VPNs. One per line. Works for clients that use this router for DNS; IPv4 only; needs dnsmasq-full.'));
-		return this.row(_('Steered domains'), [ ed.area, ed.note, unsupported ],
-			_('Route only traffic to these domains (and their subdomains) through this instance, one per line. Works for clients that use this router for DNS; apps with their own encrypted DNS bypass it. IPv4 only; needs dnsmasq-full.'));
+			return this.row(_('Excluded domains and addresses'), [ ed.area, ed.note, unsupported ],
+				_('Traffic to these domains (and their subdomains) or IPv4 addresses and networks (for example 203.0.113.0/24) always uses your normal connection, for example a bank or a streaming site that blocks VPNs. One per line. Domains work for clients that use this router for DNS and need dnsmasq-full; addresses need neither.'));
+		return this.row(_('Steered domains and addresses'), [ ed.area, ed.note, unsupported ],
+			_('Route only traffic to these domains (and their subdomains) or IPv4 addresses and networks (for example 198.51.100.0/24) through this instance, one per line. Domains work for clients that use this router for DNS (apps with their own encrypted DNS bypass it) and need dnsmasq-full; addresses need neither. IPv4 only.'));
 	},
 
 	/* ---- per-device steering picker ------------------------------------ */
@@ -1691,7 +1760,7 @@ return view.extend({
 			this.markDirty();
 		var auto = this.autoRouting && this.autoRouting.checked;
 		var on = auto || this.steeredNetworks().length > 0 || this.steeredDevices().length > 0 ||
-			this.steeredDomains().length > 0;
+			this.steeredDomains().length > 0 || this.steeredIps().length > 0;
 		if (this.steerRow) this.steerRow.classList.toggle('hidden', !!auto);
 		if (this.devRow) this.devRow.classList.toggle('hidden', !!auto);
 		if (this.domRow) this.domRow.classList.toggle('hidden', !!auto);
@@ -2681,7 +2750,19 @@ return view.extend({
 			uci.set('nordvpn', inst, 'auto_routing', autoOn ? '1' : '0');
 			uci.set('nordvpn', inst, 'killswitch', (this.ksBox && this.ksBox.checked) ? '1' : '0');
 			uci.set('nordvpn', inst, 'block_ipv6', (this.v6Box && this.v6Box.checked) ? '1' : '0');
-			uci.set('nordvpn', inst, 'vpn_dns', (this.dnsSel && this.dnsSel.value) || 'off');
+			uci.set('nordvpn', inst, 'vpn_masq', (this.masqBox && this.masqBox.checked) ? '1' : '0');
+			var dnsVal = (this.dnsSel && this.dnsSel.value) || 'off';
+			var customList = (dnsVal === 'custom' && this.dnsCustom)
+				? this.dnsCustom.value.split(/[\s,]+/).filter(function(x) {
+					return /^(\d{1,3}\.){3}\d{1,3}$/.test(x) && x.split('.').every(function(o) { return +o <= 255; });
+				}).slice(0, 4) : [];
+			if (dnsVal === 'custom' && !customList.length)
+				dnsVal = 'off';
+			uci.set('nordvpn', inst, 'vpn_dns', dnsVal);
+			if (customList.length)
+				uci.set('nordvpn', inst, 'custom_dns', customList);
+			else
+				uci.unset('nordvpn', inst, 'custom_dns');
 			// Drop the legacy boolean so it cannot contradict the enum.
 			uci.unset('nordvpn', inst, 'use_vpn_dns');
 			if (devices.length)
@@ -2692,6 +2773,16 @@ return view.extend({
 				uci.set('nordvpn', inst, 'source_network', steered);
 			else
 				uci.unset('nordvpn', inst, 'source_network');
+			var ips = autoOn ? [] : this.steeredIps();
+			if (ips.length)
+				uci.set('nordvpn', inst, 'steer_ip', ips);
+			else if (this.domEds.steer)
+				uci.unset('nordvpn', inst, 'steer_ip');
+			var bypIps = this.excludedIps();
+			if (bypIps.length)
+				uci.set('nordvpn', inst, 'bypass_ip', bypIps);
+			else if (this.domEds.bypass)
+				uci.unset('nordvpn', inst, 'bypass_ip');
 			var domains = autoOn ? [] : this.steeredDomains();
 			if (domains.length)
 				uci.set('nordvpn', inst, 'steer_domain', domains);
@@ -2710,7 +2801,7 @@ return view.extend({
 				uci.set('nordvpn', inst, 'bypass_domain', bypDoms);
 			else if (this.domEds.bypass)
 				uci.unset('nordvpn', inst, 'bypass_domain');
-			if (steered.length || devices.length || domains.length) {
+			if (steered.length || devices.length || domains.length || ips.length) {
 				// Steering needs a routing table; default to the interface name.
 				var rtb = this.refs.routing_table ? (this.refs.routing_table.value || '').trim()
 					: (uci.get('nordvpn', inst, 'routing_table') || '');

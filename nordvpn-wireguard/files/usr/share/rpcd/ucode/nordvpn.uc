@@ -7,6 +7,7 @@
 'use strict';
 
 import { cursor } from 'uci';
+import { stat } from 'fs';
 const _common = require('nordvpn.common');
 const validate_token = _common.validate_token,
       validate_instance = _common.validate_instance,
@@ -27,8 +28,7 @@ const apply = _apply.apply,
       delete_instance = _apply.delete_instance;
 const _rotate = require('nordvpn.rotate');
 const rotate = _rotate.rotate,
-      read_state = _rotate.read_state,
-      last_attempt_ts = _rotate.last_attempt_ts;
+      read_state = _rotate.read_state;
 const _service = require('nordvpn.service');
 const next_rotation = _service.next_rotation,
       effective_state = _service.effective_state,
@@ -40,8 +40,8 @@ const detect_routing = require('nordvpn.routing').detect;
 const _creds = require('nordvpn.credentials');
 const _cache = require('nordvpn.cache');
 const read_cache = _cache.read_cache,
-      read_fetch_status = _cache.read_fetch_status,
-      cache_is_stale = _cache.cache_is_stale,
+      fetch_status_report = _cache.fetch_status_report,
+      is_stale = _cache.is_stale,
       locations_tree = _cache.locations_tree,
       city_relays = _cache.city_relays,
       pool_relays = _cache.pool_relays;
@@ -64,17 +64,20 @@ function req_instance(uci, request) {
 	return name;
 }
 
+// The page polls this for every instance every few seconds, so the settings
+// and the per-instance state file are each read once per instance.
 function build_status(uci, name) {
-	let st = status(uci, name);
+	let s = load_settings(uci, name);
+	let st = status(uci, name, s);
 	let state = read_state(name);
 	if (state && state.last_success)
 		st.rotation.last_success = state.last_success;
-	let s = load_settings(uci, name);
 	// Fold in the daemon's egress probe: a handshake-healthy tunnel that
 	// forwards nothing reads as 'no_egress', exactly as the watchdog sees it.
 	st.state = effective_state(s, st.state, state, st.gateway);
 	st.egress = egress_report(s, state, st.gateway);
-	st.rotation.next_run = next_rotation(s, last_attempt_ts(name), time());
+	let last = (state && type(state.last_attempt) == 'int') ? state.last_attempt : 0;
+	st.rotation.next_run = next_rotation(s, last, time());
 	st.routing = detect_routing(uci, s, true);
 	return st;
 }
@@ -111,10 +114,11 @@ methods.overview = {
 		let uci = cursor();
 		let out = [];
 		for (let name in list_instances(uci)) {
-			let st = status(uci, name);
+			let s = load_settings(uci, name);
+			let st = status(uci, name, s);
 			push(out, {
 				instance: st.instance,
-				state: effective_state(load_settings(uci, name), st.state, read_state(name), st.gateway),
+				state: effective_state(s, st.state, read_state(name), st.gateway),
 				enabled: st.enabled,
 				configured: st.configured,
 				location: st.location,
@@ -128,20 +132,49 @@ methods.overview = {
 	}
 };
 
+// The location tree of the cache file last read, keyed by that file's
+// identity. Building it means parsing the multi-megabyte server list, and the
+// NordVPN page and the Status → Overview card ask for it on every page load;
+// the file itself only changes on a refresh (hours apart, written by rename,
+// so with a new inode). rpcd keeps this script loaded between calls, so the
+// memo — a few hundred KB — lives until the cache is rewritten.
+let locations_memo = null;
+
+function cache_key(path) {
+	let st = stat(path);
+	return st ? sprintf('%s:%d:%d:%d:%d', path, st.inode, st.size, st.mtime, st.ctime) : null;
+}
+
 methods.locations = {
 	call: function() {
-		let s = load_settings(cursor());
-		let path = cache_file_path(s);
-		let cache = read_cache(path);
-		if (!cache)
+		let path = cache_file_path(load_settings(cursor()));
+		let key = cache_key(path);
+		if (!key)
 			return { available: false, state: 'missing' };
+		let m = locations_memo;
+		if (!m || m.key != key) {
+			let cache = read_cache(path);
+			if (!cache)
+				return { available: false, state: 'missing' };
+			m = {
+				key: key,
+				countries: locations_tree(cache),
+				stats: cache.stats,
+				cache_info: cache.cache_info,
+				cached_at: cache.cached_at,
+				groups: cache.groups,
+				schema_version: cache.schema_version
+			};
+			locations_memo = m;
+		}
 		return {
 			available: true,
-			state: cache_is_stale(path) ? 'stale' : 'ready',
-			countries: locations_tree(cache),
-			stats: cache.stats,
-			cache_info: cache.cache_info,
-			cached_at: cache.cached_at
+			// Age-dependent, so judged per call rather than memoized.
+			state: is_stale(m) ? 'stale' : 'ready',
+			countries: m.countries,
+			stats: m.stats,
+			cache_info: m.cache_info,
+			cached_at: m.cached_at
 		};
 	}
 };
@@ -197,9 +230,10 @@ methods.clients = {
 	}
 };
 
+// A refresh whose worker died reads as an error, not as forever 'running'.
 methods.refresh_status = {
 	call: function() {
-		return read_fetch_status() || { state: 'idle' };
+		return fetch_status_report() || { state: 'idle' };
 	}
 };
 
@@ -317,7 +351,7 @@ methods.apply_status = {
 
 methods.refresh_locations = {
 	call: function() {
-		let running = read_fetch_status();
+		let running = fetch_status_report();
 		if (running && running.state == 'running')
 			return { job: running.started_at, already_running: true };
 		// Detached one-shot worker; fixed command, no user input, no shell injection.
@@ -398,6 +432,9 @@ methods.delete_instance = {
 	}
 };
 
+// Synchronous rotation, for scripts and the CLI. It holds rpcd for the whole
+// rotation — up to max_retries candidates at verify_timeout each — so the UI
+// uses rotate_start instead.
 methods.rotate_now = {
 	args: { instance: '' },
 	call: function(request) {
@@ -406,6 +443,20 @@ methods.rotate_now = {
 		if (!name)
 			return { error: 'no such instance' };
 		return rotate(uci, name, 'manual');
+	}
+};
+
+// Asynchronous rotation for the UI, for the reason apply_start exists: the
+// rotation runs in a detached worker and its outcome is polled through
+// apply_status (the job record carries kind 'rotate').
+methods.rotate_start = {
+	args: { instance: '' },
+	call: function(request) {
+		let uci = cursor();
+		let name = req_instance(uci, request);
+		if (!name)
+			return { error: 'no such instance' };
+		return _apply.start_job(name, 'rotate');
 	}
 };
 
