@@ -383,21 +383,32 @@ function apply_inner(uci, instance) {
 		error: hint || 'could not reach any server for the current selection; restored the previous connection' };
 }
 
+// What started an apply, recorded as the history entry's `reason`: the UI's
+// Reconnect and Enable buttons, a Save that needs a reconnect, or anything
+// else (a script, the CLI, a bare ubus call), which counts as 'external'.
+const APPLY_SOURCES = [ 'reconnect', 'enable', 'save', 'external' ];
+
+function apply_source(source) {
+	return (index(APPLY_SOURCES, source) >= 0) ? source : 'external';
+}
+
 // History entry for an apply outcome. Pure/testable.
-function apply_event(res) {
+function apply_event(res, source) {
+	let reason = apply_source(source);
 	if (res && res.state == 'success')
-		return { type: 'connect', fields: { server: res.gateway } };
+		return { type: 'connect', fields: { server: res.gateway, reason } };
 	return { type: 'connect_failed', fields: {
 		server: res ? res.gateway : null,
+		reason,
 		error: (res && res.error) ? res.error : 'unknown error',
 		detail: (res && res.restored) ? 'restored the previous server' : null
 	} };
 }
 
-function apply(uci, instance) {
+function apply(uci, instance, source) {
 	let res = apply_inner(uci, instance);
 	restore_wan_default();
-	let ev = apply_event(res);
+	let ev = apply_event(res, source);
 	record_event(instance, ev.type, ev.fields);
 	return res;
 }
@@ -628,16 +639,17 @@ function run_job(instance, kind, work) {
 }
 
 // Apply one instance as a job (the nordvpn-apply worker).
-function run_apply(instance) {
-	return run_job(instance, 'apply', function(name) { return apply(cursor(), name); });
+function run_apply(instance, source) {
+	return run_job(instance, 'apply', function(name) { return apply(cursor(), name, source); });
 }
 
 // Spawn the detached worker for one job and pre-record the 'running' state, so
 // a poll landing between the spawn and the worker's own first write reads
 // 'running' rather than the previous run's result. `echo $!` hands back the
 // worker's pid, which makes a worker that dies on the spot recoverable on the
-// next poll instead of only after the runtime ceiling.
-function start_job(instance, kind) {
+// next poll instead of only after the runtime ceiling. `arg` is an optional
+// extra worker argument (the apply source), taken only from a fixed list.
+function start_job(instance, kind, arg) {
 	let name = validate_instance(instance);
 	if (!name)
 		return { error: 'invalid instance name' };
@@ -655,9 +667,10 @@ function start_job(instance, kind) {
 			(st.kind == 'rotate') ? 'a rotation' : 'an apply', st.instance) };
 	}
 
-	// `name` is restricted to [A-Za-z0-9_], so it cannot break out of the
-	// sh -c string; quoting it here would only fight the outer sh_quote().
-	let r = run([ 'sh', '-c', JOB_WORKERS[kind] + name +
+	// `name` is restricted to [A-Za-z0-9_] and `arg` to a fixed list, so
+	// neither can break out of the sh -c string; quoting them here would only
+	// fight the outer sh_quote().
+	let r = run([ 'sh', '-c', JOB_WORKERS[kind] + name + (arg ? ' ' + arg : '') +
 		' >/dev/null 2>&1 & echo $!' ]);
 	if (r.code != 0)
 		return { error: 'could not start the ' + kind + ' worker' };
@@ -676,8 +689,8 @@ function start_job(instance, kind) {
 }
 
 // start_job() for an apply.
-function start_apply(instance) {
-	return start_job(instance, 'apply');
+function start_apply(instance, source) {
+	return start_job(instance, 'apply', apply_source(source));
 }
 
 // Disable the instance: tunnel down and kept down (auto '0'), scheduled
@@ -829,5 +842,5 @@ function delete_instance(uci, name) {
 	return { ok: true, deleted: name, interface: iface };
 }
 
-return { set_credentials, clear_credentials, current_peer, restore_peer, write_relay, bring_up, verify_handshake, netifd_hint, tunnel_hint, connect_one, apply_event, apply, apply_routing, disconnect, create_instance, delete_instance, restore_wan_default,
+return { set_credentials, clear_credentials, current_peer, restore_peer, write_relay, bring_up, verify_handshake, netifd_hint, tunnel_hint, connect_one, APPLY_SOURCES, apply_source, apply_event, apply, apply_routing, disconnect, create_instance, delete_instance, restore_wan_default,
 	write_apply_status, read_apply_status, apply_running, apply_status_report, run_job, run_apply, start_job, start_apply };

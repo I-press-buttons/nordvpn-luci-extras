@@ -1680,7 +1680,11 @@ write_cache(cache, cpath);
 	eq('rot event: skip', _rotate.rotation_event({ skipped: true, reason: 'fixed server configured' }, 'manual').type, 'rotate_skipped');
 	let rf = _rotate.rotation_event({ error: 'no working server found', restored: true }, 'schedule');
 	eq('rot event: failure keeps the restore note', [ rf.type, rf.fields.detail ], [ 'rotate_failed', 'restored the previous server' ]);
-	eq('apply event: success', _apply_m.apply_event({ state: 'success', gateway: 'g' }), { type: 'connect', fields: { server: 'g' } });
+	eq('apply event: success', _apply_m.apply_event({ state: 'success', gateway: 'g' }, 'reconnect'),
+		{ type: 'connect', fields: { server: 'g', reason: 'reconnect' } });
+	eq('apply event: the source is kept', _apply_m.apply_event({ state: 'success', gateway: 'g' }, 'save').fields.reason, 'save');
+	eq('apply event: no source is external', _apply_m.apply_event({ state: 'success', gateway: 'g' }).fields.reason, 'external');
+	eq('apply event: an unknown source is external', _apply_m.apply_event({ state: 'failure', error: 'e' }, 'cron; rm -rf').fields.reason, 'external');
 	eq('apply event: failure', _apply_m.apply_event({ state: 'failure', error: 'boom' }).fields.error, 'boom');
 	eq('apply event: partial failure is a failure', _apply_m.apply_event({ state: 'partial_failure', gateway: 'g', error: 'e' }).type, 'connect_failed');
 }

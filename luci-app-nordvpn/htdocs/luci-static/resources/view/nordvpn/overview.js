@@ -62,7 +62,7 @@ var callUciCommit = rpc.declare({
 // whole time, so every other LuCI page on the router stalls behind it. The page
 // therefore starts the job and watches it; the synchronous `apply` stays in the
 // backend for the CLI only.
-var callApplyStart = rpc.declare({ object: 'nordvpn', method: 'apply_start', params: [ 'instance' ] });
+var callApplyStart = rpc.declare({ object: 'nordvpn', method: 'apply_start', params: [ 'instance', 'source' ] });
 var callApplyStatus = rpc.declare({ object: 'nordvpn', method: 'apply_status' });
 // Routing-only apply: reconciles the steering/exception rules without touching
 // the tunnel. Quick (no handshake wait), so it is a plain call.
@@ -546,14 +546,14 @@ return view.extend({
 		if (s.enabled === false) {
 			btns.push(E('button', {
 				class: 'cbi-button cbi-button-apply',
-				click: L.bind(this.reconnect, this)
+				click: L.bind(this.reconnect, this, 'enable')
 			}, _('Enable')));
 			return btns;
 		}
 
 		btns.push(E('button', {
 			class: 'cbi-button cbi-button-apply',
-			click: L.bind(this.reconnect, this)
+			click: L.bind(this.reconnect, this, 'reconnect')
 		}, _('Reconnect')));
 
 		if (!s.fixed) {
@@ -772,12 +772,23 @@ return view.extend({
 			watchdog: _('watchdog'),
 			manual: _('manual')
 		}[ev.reason] || ev.reason || '';
+		// What started an apply; entries recorded before this was tracked
+		// carry none and keep their plain wording.
+		var via = {
+			reconnect: _('reconnect'),
+			enable: _('enabled'),
+			save: _('settings saved'),
+			external: _('external')
+		}[ev.reason] || ev.reason || '';
 		var detail = [ ev.error, ev.detail ].filter(Boolean).join(' — ');
 		switch (ev.type) {
 		case 'connect':
-			return { text: _('Connected to %s').format(server), color: ok };
+			return { text: via
+				? _('Connected to %s (%s)').format(server, via)
+				: _('Connected to %s').format(server), color: ok };
 		case 'connect_failed':
-			return { text: _('Connect failed'), detail: detail, color: bad };
+			return { text: via ? _('Connect failed (%s)').format(via) : _('Connect failed'),
+				detail: detail, color: bad };
 		case 'rotate':
 			return { text: ev.from
 				? _('Rotated (%s): %s → %s').format(why, ev.from, server)
@@ -848,9 +859,10 @@ return view.extend({
 	// Starts an apply and resolves with the very object the old synchronous
 	// `apply` returned, so every call site keeps its result handling unchanged.
 	// Never rejects on a backend-reported failure — only on a watcher that cannot
-	// reach the router at all.
-	applyAsync: function(instance) {
-		return this.runJob(callApplyStart, instance, 'apply');
+	// reach the router at all. `source` labels the history entry: 'reconnect',
+	// 'enable' or 'save'.
+	applyAsync: function(instance, source) {
+		return this.runJob(function(inst) { return callApplyStart(inst, source); }, instance, 'apply');
 	},
 
 	// Runs one backend job (`kind` 'apply' or 'rotate') through `start` and
@@ -934,9 +946,9 @@ return view.extend({
 		});
 	},
 
-	reconnect: function() {
+	reconnect: function(source) {
 		var n = this.notice(_('Reconnecting…'), 'info');
-		return this.applyAsync(this.instance).then(L.bind(function(res) {
+		return this.applyAsync(this.instance, source).then(L.bind(function(res) {
 			this.dismiss(n);
 			if (res && res.error)
 				this.notice(_('Reconnect failed: %s').format(res.error), 'error');
@@ -2868,7 +2880,7 @@ return view.extend({
 		if (!routingOnly) {
 			this.dismiss(p);
 			p = this.notice(_('Applying and reconnecting…'), 'info');
-			return this.applyAsync(this.instance).then(L.bind(function(res) {
+			return this.applyAsync(this.instance, 'save').then(L.bind(function(res) {
 				this.dismiss(p);
 				return res;
 			}, this), L.bind(function(e) {
