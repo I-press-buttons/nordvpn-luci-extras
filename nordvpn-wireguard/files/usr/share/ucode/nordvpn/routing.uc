@@ -494,6 +494,21 @@ function bypass_set_name(iface) {
 // the steering marks, so one rule sends it to the main table.
 const BYPASS_TABLE_ID = 254;
 
+// Logical network of the loopback device ('loopback' on every stock config).
+// Policy rules meant for the router's own traffic match `in` it: the kernel
+// routes locally generated packets as if they came in on lo, so forwarded
+// traffic of clients that are not on the VPN never matches them.
+function loopback_network(uci) {
+	let found = null;
+	uci.foreach('network', 'interface', function(sec) {
+		if (sec.device == 'lo' || sec.ifname == 'lo') {
+			found = sec['.name'];
+			return false;
+		}
+	});
+	return found || 'loopback';
+}
+
 // Logical networks of the (unmanaged) firewall zone named `zone`.
 function zone_networks(uci, zone) {
 	let nets = [];
@@ -759,6 +774,24 @@ function reconcile_domain_dns(uci, iface, setname, domains, role) {
 		}
 	}
 	return changed;
+}
+
+// The domains of the stamped dnsmasq 'ipset' section of an instance and role,
+// as configured right now ([] when there is none).
+function set_domains(uci, iface, role) {
+	let have = find_managed_rules(uci, 'ipset', role, iface, 'nordvpn_set', 'dhcp');
+	return length(have) ? as_list(uci.get('dhcp', have[0].section, 'domain')) : [];
+}
+
+// True when every domain of `before` is still in `after`: the addresses
+// dnsmasq already put into the set still belong in it.
+function no_domain_removed(before, after) {
+	if (!length(before) || !length(after))
+		return false;
+	for (let d in before)
+		if (index(after, d) < 0)
+			return false;
+	return true;
 }
 
 // Resolvers the WAN networks hand out (netifd's dns-server, plus any static
@@ -1152,6 +1185,14 @@ function enforce(uci, s, opts) {
 			proto: 'all', target: 'MARK', set_xmark: mark };
 	}, 'ipset', 'firewall'))
 		cf = true;
+	// A firewall reload empties the dnsmasq-filled sets, and connections to
+	// those addresses would switch path mid-flow until a client looks the
+	// name up again. Sets whose domains were all kept are restored after the
+	// reload (see nordvpn.apply.commit_routing); a set that lost a domain is
+	// left to refill, so the removed domain's addresses leave it.
+	let keep_sets = [];
+	if (no_domain_removed(set_domains(uci, iface, 'domain_dns'), steer_doms))
+		push(keep_sets, setname);
 	if (reconcile_domain_dns(uci, iface, setname, steer_doms))
 		cd = true;
 
@@ -1271,6 +1312,8 @@ function enforce(uci, s, opts) {
 			proto: 'all', target: 'MARK', set_xmark: bmark };
 	}, 'ipset', 'firewall'))
 		cf = true;
+	if (no_domain_removed(set_domains(uci, iface, 'bypass_dns'), byp_doms))
+		push(keep_sets, bset);
 	if (reconcile_domain_dns(uci, iface, bset, byp_doms, 'bypass_dns'))
 		cd = true;
 	if (reconcile_rules(uci, 'rule', 'bypass_mark', iface, byp_devs, function(mac) {
@@ -1500,14 +1543,21 @@ function enforce(uci, s, opts) {
 
 	// 5. DNS override on the interface (stamped, netifd-managed lifecycle). The
 	// stamp records the mode, so switching resolvers (standard <-> threat)
-	// re-applies instead of being skipped as "already set".
+	// re-applies instead of being skipped as "already set". netifd hands the
+	// interface's DNS servers to dnsmasq, the resolver of EVERY client, so
+	// this is only done when the instance routes all LAN traffic; a steered
+	// instance would otherwise send the lookups of clients that are not on
+	// the VPN to its resolvers too (and filter them, with Threat Protection).
+	// Steered clients get the resolvers by redirect instead (5e).
 	let mode = (managed && s.vpn_dns && s.vpn_dns != 'off') ? s.vpn_dns : null;
 	let vdns = mode ? dns_servers(s, mode) : [];
 	if (!length(vdns))
 		mode = null;
+	let router_dns = mode && (auto || !!all_lan);
+	let lo_net = loopback_network(uci);
 	let stamped = uci.get('network', iface, MARK + '_dns');
 	let want_stamp = (mode == 'custom') ? ('custom:' + join(',', vdns)) : mode;
-	if (mode) {
+	if (router_dns) {
 		if (stamped != want_stamp) {
 			uci.set('network', iface, 'dns', vdns);
 			uci.set('network', iface, MARK + '_dns', want_stamp);
@@ -1519,20 +1569,23 @@ function enforce(uci, s, opts) {
 		cn = true;
 	}
 
-	// 5b. Steered mode keeps the tunnel's routes in the instance table, so the
-	//     router's own queries to those resolvers (dnsmasq forwards every
-	//     client's lookups to them) would follow the main table out of the WAN,
-	//     readable by the ISP. Send them into the instance table. netifd drops
-	//     the interface's DNS servers while the tunnel is down, so no prohibit
-	//     rule is needed. Keyed by resolver AND table, so a table change
-	//     replaces the rules instead of leaving a stale lookup.
+	// 5b. With a routing table the tunnel's routes live in the instance table,
+	//     so the router's own queries to those resolvers (dnsmasq forwards
+	//     every client's lookups to them) would follow the main table out of
+	//     the WAN, readable by the ISP. Send them into the instance table.
+	//     netifd drops the interface's DNS servers while the tunnel is down,
+	//     so no prohibit rule is needed. Only the router's own packets match
+	//     (`in` loopback): a client off the VPN that uses the same public
+	//     resolver itself (custom DNS like 1.1.1.1 or 9.9.9.9) must not be
+	//     pulled into the tunnel. Keyed by resolver AND table, so a table
+	//     change replaces the rules instead of leaving a stale lookup.
 	let dns_keys = [];
-	if (steer && mode)
+	if (all_lan && router_dns)
 		for (let ip in vdns)
 			push(dns_keys, ip + '/32 ' + table);
 	if (reconcile_rules(uci, 'rule', 'dns_lookup', iface, dns_keys, function(k) {
 		let p = split(k, ' ');
-		return { dest: p[0], lookup: p[1], priority: '19500', nordvpn_key: k };
+		return { 'in': lo_net, dest: p[0], lookup: p[1], priority: '19500', nordvpn_key: k };
 	}, 'nordvpn_key'))
 		cn = true;
 
@@ -1576,9 +1629,17 @@ function enforce(uci, s, opts) {
 		for (let ip in vdns)
 			push(dns_ks, ip + '/32');
 	if (reconcile_rules(uci, 'rule', 'dns_ks', iface, dns_ks, function(ip) {
-		return { dest: ip, action: 'prohibit', priority: '19501' };
+		return { 'in': lo_net, dest: ip, action: 'prohibit', priority: '19501' };
 	}, 'dest'))
 		cn = true;
+	// Rules from before they were limited to the router's own traffic.
+	uci.foreach('network', 'rule', function(sec) {
+		if (sec[MARK] == '1' && sec.nordvpn_iface == iface &&
+		    (sec[ROLE] == 'dns_lookup' || sec[ROLE] == 'dns_ks') && sec['in'] != lo_net) {
+			uci.set('network', sec['.name'], 'in', lo_net);
+			cn = true;
+		}
+	});
 
 	// 5d. Excluded devices keep the WAN's DNS while the others use NordVPN's.
 	//     dnsmasq cannot pick an upstream per client, so their lookups never
@@ -1588,7 +1649,7 @@ function enforce(uci, s, opts) {
 	//     exception mark then routes it out of the WAN. IPv4 only: a device
 	//     asking the router over IPv6 still gets the NordVPN resolvers.
 	let byp_dns = [];
-	if (length(byp_devs) && mode) {
+	if (length(byp_devs) && router_dns) {
 		byp_dns = filter(wan_dns(), (ip) => _common.validate_ipv4(ip) != null);
 		if (!length(byp_dns))
 			push(notes, 'excluded devices: no IPv4 WAN DNS server found; they keep using the router\'s DNS');
@@ -1625,8 +1686,44 @@ function enforce(uci, s, opts) {
 		});
 	}
 
+	// 5e. Steered mode leaves the router's resolver alone (see 5): it serves
+	//     every client. Instead, the plain DNS of steered devices and of
+	//     clients on steered networks, to the router or anywhere else, is
+	//     DNATed to the instance's first resolver, and their steering routes
+	//     it through the tunnel (or blocks it with the kill switch). Excluded
+	//     devices on a steered network keep the router's DNS. Each rule's key
+	//     carries everything it is built from, so a change replaces it. IPv4
+	//     only, like the exceptions' DNS: lookups to the router over IPv6
+	//     still go to its own resolver.
+	let sdns = {};
+	if (steer && !all_lan && mode && det.zone) {
+		let negs = map(byp_devs, (m) => '!' + m);
+		for (let mac in steer_devs)
+			sdns[join(' ', [ 'dev', mac, det.lan_zone, vdns[0] ])] = {
+				name: 'NordVPN DNS ' + mac, src: det.lan_zone, src_mac: mac };
+		for (let net in s.source_networks) {
+			let z = find_zone_of(uci, net);
+			if (!z || z.managed)
+				continue;
+			for (let l in locals) {
+				if (l.iface != net)
+					continue;
+				let r = { name: 'NordVPN DNS ' + net, src: z.name, src_ip: l.target };
+				if (length(negs))
+					r.src_mac = negs;
+				sdns[join(' ', [ 'net', net, l.target, z.name, vdns[0], ...byp_devs ])] = r;
+			}
+		}
+	}
+	if (reconcile_rules(uci, 'redirect', 'steer_dns_redirect', iface, keys(sdns), function(k) {
+		return { ...sdns[k], proto: 'tcp udp', src_dport: '53', dest: det.zone, dest_ip: vdns[0],
+			dest_port: '53', family: 'ipv4', reflection: '0', target: 'DNAT', nordvpn_key: k };
+	}, 'nordvpn_key', 'firewall'))
+		cf = true;
+
 	return { changed_network: cn, changed_firewall: cf, changed_dhcp: cd,
-		domains_active: length(steer_doms) > 0 || length(byp_doms) > 0, dns_locked: lock != null, notes: notes };
+		domains_active: length(steer_doms) > 0 || length(byp_doms) > 0, keep_sets: keep_sets,
+		dns_locked: lock != null, notes: notes };
 }
 
 return { detect, enforce, find_wan_zone, find_lan_zone, count_user_routes, recommend_mtu,

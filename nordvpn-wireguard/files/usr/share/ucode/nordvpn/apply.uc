@@ -93,11 +93,22 @@ function restore_peer(uci, iface, saved) {
 		uci.set('network', peer, 'nordvpn_gateway', saved.gateway);
 }
 
+// Exclusion key for the currently connected server. The stamped nordvpn_gateway
+// is the intended key; fall back to endpoint_host so a peer written without the
+// stamp (hand-made, or a restored null-gateway snapshot) is still recognized.
+// Pure/testable.
+function current_key(saved) {
+	return saved ? (saved.gateway || saved.endpoint_host || null) : null;
+}
+
 // Write the interface + peer for the chosen relay (no commit). The relay comes
 // from the cache file, so its endpoint and key are re-validated here before
 // they reach /etc/config/network; the endpoint must be a NordVPN host. Returns
-// false (nothing written) if invalid.
-function write_relay(uci, iface, relay, s) {
+// false (nothing written) if invalid. `opts.keep_iface` leaves the routing
+// table and MTU as they are: a rotation only changes the server, and must not
+// apply table or MTU edits that were saved but never applied — a table that
+// enforce() has not set up yet would leave the LAN's traffic unrouted.
+function write_relay(uci, iface, relay, s, opts) {
 	if (!relay || !validate_nordvpn_host(relay.hostname) || !validate_wg_key(relay.public_key) ||
 	    (relay.port != null && !validate_port(relay.port)))
 		return false;
@@ -107,19 +118,21 @@ function write_relay(uci, iface, relay, s) {
 	uci.set('network', iface, 'auto', '1');
 	uci.set('network', iface, 'addresses', [ FIXED_ADDRESS ]);
 
-	if (s.routing_table && s.routing_table != '') {
-		uci.set('network', iface, 'ip4table', s.routing_table);
-		uci.set('network', iface, 'ip6table', s.routing_table);
-	} else {
-		uci.delete('network', iface, 'ip4table');
-		uci.delete('network', iface, 'ip6table');
-	}
+	if (!(opts && opts.keep_iface)) {
+		if (s.routing_table && s.routing_table != '') {
+			uci.set('network', iface, 'ip4table', s.routing_table);
+			uci.set('network', iface, 'ip6table', s.routing_table);
+		} else {
+			uci.delete('network', iface, 'ip4table');
+			uci.delete('network', iface, 'ip6table');
+		}
 
-	// Optional MTU override; empty falls back to netifd's WireGuard default.
-	if (s.mtu)
-		uci.set('network', iface, 'mtu', '' + s.mtu);
-	else
-		uci.delete('network', iface, 'mtu');
+		// Optional MTU override; empty falls back to netifd's WireGuard default.
+		if (s.mtu)
+			uci.set('network', iface, 'mtu', '' + s.mtu);
+		else
+			uci.delete('network', iface, 'mtu');
+	}
 
 	uci.set('network', iface, 'nordvpn_location', relay.location);
 	// Stamp the ACTUAL server's country/city: with a location set the
@@ -222,17 +235,57 @@ function tunnel_hint(iface) {
 	}
 }
 
+// The IPv4 elements in `nft list set` output (plain output: no dependency on
+// nft's JSON support), all these sets hold. Pure/testable.
+function parse_nft_elements(text) {
+	let m = match(text || '', /elements = \{([^}]*)\}/s);
+	let ips = [];
+	for (let t in (m ? split(m[1], /[ ,\t\n]+/) : []))
+		if (_common.validate_ipv4(t) && index(ips, t) < 0)
+			push(ips, t);
+	return ips;
+}
+
+// Elements of the fw4 nft sets `names`, as { name: [ IPv4 ] }. Empty
+// off-device.
+function nft_set_elements(names) {
+	let out = {};
+	for (let name in names) {
+		if (!_common.full_match(name, /^nv_[A-Za-z0-9_]+_(dom|byp)$/))
+			continue;
+		let r = run([ 'nft', 'list', 'set', 'inet', 'fw4', name ], true);
+		let ips = (r.code == 0) ? parse_nft_elements(r.stdout) : [];
+		if (length(ips))
+			out[name] = ips;
+	}
+	return out;
+}
+
+// Put elements saved by nft_set_elements() back after a firewall reload.
+function nft_restore_elements(saved) {
+	for (let name, ips in saved)
+		for (let i = 0; i < length(ips); i += 256)
+			run([ 'nft', 'add', 'element', 'inet', 'fw4', name,
+				'{ ' + join(', ', slice(ips, i, i + 256)) + ' }' ], true);
+}
+
 // Commit and reload whatever an enforce_routing() pass changed. The firewall
-// goes first so the domain nft set exists before dnsmasq is restarted to fill
-// it; a firewall reload also empties that set, so dnsmasq is restarted then
-// too (flushing its cache makes clients' next lookups repopulate the set).
-// Steering/prohibit rules are plain netifd config; a reload makes netifd apply
-// the delta (unchanged interfaces are left alone). True when anything was
-// committed.
+// goes first so the domain nft set exists before dnsmasq is told to fill it;
+// a firewall reload also empties that set, so dnsmasq is reloaded then too.
+// dnsmasq's reload regenerates its config and restarts it only when that
+// changed; otherwise it just gets a SIGHUP, which flushes its cache so the
+// clients' next lookups repopulate the set. A restart would interrupt DNS and
+// DHCP for every client, VPN or not. Steering/prohibit rules are plain netifd
+// config; a reload makes netifd apply the delta (unchanged interfaces are left
+// alone). True when anything was committed.
 function commit_routing(uci, routing) {
 	if (routing.changed_firewall) {
+		// Addresses dnsmasq resolved for steered and excluded domains survive
+		// the reload, so their connections keep their path (see enforce()).
+		let saved = nft_set_elements(routing.keep_sets || []);
 		uci.commit('firewall');
 		run([ '/etc/init.d/firewall', 'reload' ]);
+		nft_restore_elements(saved);
 	}
 	if (routing.changed_network) {
 		uci.commit('network');
@@ -241,16 +294,73 @@ function commit_routing(uci, routing) {
 	if (routing.changed_dhcp)
 		uci.commit('dhcp');
 	if (routing.changed_dhcp || (routing.changed_firewall && routing.domains_active))
-		run([ '/etc/init.d/dnsmasq', 'restart' ]);
+		run([ '/etc/init.d/dnsmasq', 'reload' ]);
 	return !!(routing.changed_firewall || routing.changed_network || routing.changed_dhcp);
 }
 
-function connect_one(uci, iface, relay, s) {
-	if (!write_relay(uci, iface, relay, s))
+function connect_one(uci, iface, relay, s, opts) {
+	if (!write_relay(uci, iface, relay, s, opts))
 		return false;
 	uci.commit('network');
 	return bring_up(iface);
 }
+
+// What the running tunnel is built from: the interface and peer options
+// netifd and wireguard use (stamps such as the location are left out). Equal
+// fingerprints before and after writing a relay mean the tunnel would come
+// back exactly as it is, so restarting it would only drop connections.
+const IFACE_KEYS = [ 'proto', 'private_key', 'addresses', 'ip4table', 'ip6table', 'mtu' ];
+const PEER_KEYS = [ 'public_key', 'endpoint_host', 'endpoint_port', 'persistent_keepalive',
+	'allowed_ips', 'route_allowed_ips' ];
+
+function tunnel_fingerprint(uci, iface) {
+	let peer = find_peer(uci, iface);
+	let fp = {};
+	for (let k in IFACE_KEYS)
+		fp['i.' + k] = uci.get('network', iface, k);
+	for (let k in PEER_KEYS)
+		fp['p.' + k] = peer ? uci.get('network', peer, k) : null;
+	return sprintf('%J', fp);
+}
+
+// Can a managed tunnel put routes into the main table? A peer with
+// route_allowed_ips and no ip4table adds 0.0.0.0/0 there, and netifd adds
+// routes with NLM_F_REPLACE, so it replaces the WAN's default route (same
+// metric 0) while netifd still lists the WAN's as installed. That is how the
+// WAN default goes missing; with every tunnel in its own table it cannot.
+function wan_default_at_risk(uci) {
+	for (let n in _common.list_instances(uci)) {
+		let iface = validate_interface(load_settings(uci, n).interface);
+		if (!iface || !managed_interface(uci, iface))
+			continue;
+		let peer = find_peer(uci, iface);
+		if (!peer || uci.get('network', peer, 'route_allowed_ips') != '1')
+			continue;
+		let t = uci.get('network', iface, 'ip4table') || '';
+		if (t == '' || t == 'main' || t == '254')
+			return true;
+	}
+	return false;
+}
+
+// Take the instance's tunnel lock (see nordvpn.common.tunnel_lock_path),
+// waiting up to `wait` seconds for a rotation that holds it to finish. The
+// lock ages out after the longest a rotation of the instance may take.
+function acquire_tunnel_lock(instance, s, wait) {
+	let path = _common.tunnel_lock_path(instance);
+	let max = _common.rotation_max_runtime(s);
+	let lock = _common.acquire_lock(path, max);
+	for (let i = 0; !lock && i < wait; i++) {
+		sleep(1000);
+		lock = _common.acquire_lock(path, max);
+	}
+	return lock;
+}
+
+// How long an apply waits for a running rotation of the same instance. Well
+// inside APPLY_MAX_RUNTIME: four candidates at MAX_VERIFY_TIMEOUT plus this
+// still fit.
+const TUNNEL_LOCK_WAIT = 60;
 
 // A global netifd reload has been observed (OpenWrt 24.10) to remove the
 // kernel's main IPv4 default route while netifd still reports it as
@@ -293,17 +403,60 @@ function restore_wan_default() {
 	return true;
 }
 
+// The candidate list with the server `keep` moved to the front, when it is
+// in the list at all; the rest keep their order. Pure/testable.
+function prefer_current(list, keep) {
+	if (!keep || type(list) != 'array')
+		return list;
+	let cur = filter(list, (r) => r.hostname == keep);
+	return length(cur) ? [ cur[0], ...filter(list, (r) => r.hostname != keep) ] : list;
+}
+
+// restore_wan_default() without blocking the caller: rpcd serves one call at
+// a time and the probe sleeps for six seconds, so the synchronous paths
+// (routing-only apply, disable, delete) hand it to a detached worker.
+function restore_wan_default_async() {
+	run([ 'sh', '-c', '/usr/bin/nordvpn-apply --restore-wan >/dev/null 2>&1 &' ]);
+}
+
+// The success result for `relay`, when the tunnel can stay exactly as it is:
+// it is the server already connected, writing it changed nothing the tunnel
+// is built from (`before` is tunnel_fingerprint() from the start of the
+// apply), and its handshake is fresh. The stamps write_relay() refreshed are
+// committed; there is no ifup, so no connection through the tunnel drops.
+// null when the tunnel has to be (re)started.
+function keep_running(uci, iface, relay, s, before) {
+	if (!write_relay(uci, iface, relay, s))
+		return null;
+	if (tunnel_fingerprint(uci, iface) != before)
+		return null;
+	let age = handshake_age(iface);
+	if (age == null || age >= 180)
+		return null;
+	uci.commit('network');
+	return {
+		state: 'success', interface: iface, gateway: relay.hostname,
+		endpoint: relay.hostname + ':' + (relay.port || DEFAULT_PORT),
+		restarted: false
+	};
+}
+
 // Apply the persisted configuration. A fixed server is applied once; an
 // automatic selection tries several candidates until one completes a handshake
 // (NordVPN publishes dead endpoints), rolling back to the previous working peer
-// if none do. Bounded so the rpc call stays within timeout.
-function apply_inner(uci, instance) {
+// if none do. Bounded so the rpc call stays within timeout. Unless `source` is
+// 'reconnect' (the user asked for a fresh connection), the server the tunnel
+// is on is tried first while it still matches the selection, so saving
+// anything but the location keeps the exit IP and the connections on it.
+function apply_inner(uci, instance, source) {
 	let s = load_settings(uci, instance);
 	let iface = validate_interface(s.interface);
 	if (!iface)
 		return { state: 'failure', error: 'invalid interface name' };
 	if (!managed_interface(uci, iface))
 		return { state: 'failure', error: 'interface ' + iface + ' is not managed by nordvpn' };
+	// What the running tunnel is built from, before anything below changes it.
+	let before = tunnel_fingerprint(uci, iface);
 	// The instance's credentials may have changed in the bank or been switched
 	// to another entry since the last apply: bring the interface key in line.
 	_creds.migrate(uci);
@@ -337,11 +490,17 @@ function apply_inner(uci, instance) {
 
 	srand(time());
 	let saved = current_peer(uci, iface);
+	let keep = (source != 'reconnect') ? current_key(saved) : null;
 
 	if (s.fixed_server && s.fixed_server != '') {
 		let relay = by_hostname(cache, s.fixed_server);
 		if (!relay)
 			return { state: 'failure', error: 'configured server not found in cache' };
+		if (keep && relay.hostname == keep) {
+			let kept = keep_running(uci, iface, relay, s, before);
+			if (kept)
+				return kept;
+		}
 		let up = connect_one(uci, iface, relay, s);
 		let ok = up && verify_handshake(iface, s.verify_timeout);
 		return {
@@ -356,7 +515,12 @@ function apply_inner(uci, instance) {
 	let list = selection_candidates(cache, s);
 	if (length(list) == 0)
 		return { state: 'failure', error: 'no matching server found for the current selection' };
-	list = order_candidates(list, s.selection);
+	list = prefer_current(order_candidates(list, s.selection), keep);
+	if (keep && list[0].hostname == keep) {
+		let kept = keep_running(uci, iface, list[0], s, before);
+		if (kept)
+			return kept;
+	}
 
 	let tries = length(list);
 	if (tries > 4)
@@ -405,9 +569,27 @@ function apply_event(res, source) {
 	} };
 }
 
-function apply(uci, instance, source) {
-	let res = apply_inner(uci, instance);
-	restore_wan_default();
+// The tunnel lock keeps a scheduled or watchdog rotation from rewriting the
+// peer and restarting the tunnel halfway through this apply (or the other
+// way round); a rotation in progress is waited for, up to `lock_wait`
+// seconds (default TUNNEL_LOCK_WAIT).
+function apply(uci, instance, source, lock_wait) {
+	let at_risk = wan_default_at_risk(uci);
+	let res;
+	let lock = acquire_tunnel_lock(instance, load_settings(uci, instance),
+		(type(lock_wait) == 'int') ? lock_wait : TUNNEL_LOCK_WAIT);
+	if (!lock) {
+		res = { state: 'failure', error: 'a rotation of this instance is still running; try again when it finishes' };
+	} else {
+		try {
+			res = apply_inner(uci, instance, source);
+		} catch (e) {
+			res = { state: 'failure', error: 'apply error: ' + e };
+		}
+		_common.release_lock(lock);
+	}
+	if (at_risk || wan_default_at_risk(cursor()))
+		restore_wan_default();
 	let ev = apply_event(res, source);
 	record_event(instance, ev.type, ev.fields);
 	return res;
@@ -415,8 +597,9 @@ function apply(uci, instance, source) {
 
 // Why the running tunnel cannot take the saved settings without a reconnect,
 // or null when it can. Routing, firewall and DNS objects are reconciled on
-// their own, but the interface itself carries the routing table, MTU and
-// autostart that write_relay() stamps; a mismatch there needs a full apply.
+// their own, and so is the routing table (see apply_routing()), but the MTU
+// is part of WireGuard's own interface config: netifd restarts the tunnel
+// for it, so that needs a full apply, which verifies the handshake after.
 function reconnect_reason(uci, iface, s) {
 	if (!s.enabled)
 		return 'instance is disabled';
@@ -426,19 +609,37 @@ function reconnect_reason(uci, iface, s) {
 		return 'no server applied yet';
 	if (uci.get('network', iface, 'auto') == '0')
 		return 'interface is disabled';
-	if ((uci.get('network', iface, 'ip4table') || '') != (s.routing_table || ''))
-		return 'routing table changed';
 	if ((uci.get('network', iface, 'mtu') || '') != (s.mtu ? '' + s.mtu : ''))
 		return 'MTU changed';
 	return null;
 }
 
+// Point the interface at the instance's routing table (no commit). netifd
+// treats ip4table/ip6table as address-and-route settings, not as part of the
+// WireGuard config: on reload it moves the tunnel's addresses and routes into
+// the new table without restarting the tunnel. True on change.
+function set_iface_table(uci, iface, table) {
+	table = table || '';
+	if ((uci.get('network', iface, 'ip4table') || '') == table &&
+	    (uci.get('network', iface, 'ip6table') || '') == table)
+		return false;
+	if (table != '') {
+		uci.set('network', iface, 'ip4table', table);
+		uci.set('network', iface, 'ip6table', table);
+	} else {
+		uci.delete('network', iface, 'ip4table');
+		uci.delete('network', iface, 'ip6table');
+	}
+	return true;
+}
+
 // Apply routing-only changes (steered/excluded devices, networks, domains,
-// kill switch, IPv6 block, DNS) without touching the tunnel: no peer rewrite
-// and no ifup, so connections through the VPN survive. The steering rules and
-// MARK rules are plain netifd/fw4 config, and a netifd reload leaves the
-// unchanged interface alone. Returns { ok, routing_only: true } or
-// { needs_reconnect: true, reason } when only a full apply() can do it.
+// kill switch, IPv6 block, DNS, the routing table) without touching the
+// tunnel: no peer rewrite and no ifup, so connections through the VPN
+// survive. The steering rules and MARK rules are plain netifd/fw4 config, and
+// a netifd reload leaves the unchanged interface alone. Returns
+// { ok, routing_only: true } or { needs_reconnect: true, reason } when only a
+// full apply() can do it.
 function apply_routing(uci, instance) {
 	let s = load_settings(uci, instance);
 	let iface = validate_interface(s.interface);
@@ -450,6 +651,7 @@ function apply_routing(uci, instance) {
 	let reason = reconnect_reason(uci, iface, s);
 	if (reason)
 		return { needs_reconnect: true, reason: reason };
+	let at_risk = wan_default_at_risk(uci);
 
 	// Never interleave with a full apply or a rotation job: either is about to
 	// reconcile the same objects (from the settings it read when it started)
@@ -463,8 +665,13 @@ function apply_routing(uci, instance) {
 	let res;
 	try {
 		let routing = enforce_routing(uci, s);
-		if (commit_routing(uci, routing) && routing.changed_network)
-			restore_wan_default();
+		// After enforce(), which registered a new table in rt_tables: netifd
+		// resolves the name when it reloads.
+		if (set_iface_table(uci, iface, s.routing_table))
+			routing.changed_network = true;
+		if (commit_routing(uci, routing) && routing.changed_network &&
+		    (at_risk || wan_default_at_risk(cursor())))
+			restore_wan_default_async();
 		for (let note in routing.notes)
 			_common.log('routing: ' + note);
 		res = { ok: true, routing_only: true, interface: iface, notes: routing.notes };
@@ -509,7 +716,9 @@ function read_apply_status() {
 	if (!raw)
 		return null;
 	try {
-		return json(raw);
+		let st = json(raw);
+		// Anything but an object would make every status poll throw.
+		return (type(st) == 'object') ? st : null;
 	} catch (e) {
 		return null;
 	}
@@ -704,6 +913,7 @@ function disconnect(uci, instance) {
 		return { error: 'invalid interface name' };
 	if (!managed_interface(uci, iface))
 		return { error: 'interface ' + iface + ' is not managed by nordvpn' };
+	let at_risk = wan_default_at_risk(uci);
 	uci.set('nordvpn', s.name, 'enabled', '0');
 	uci.commit('nordvpn');
 
@@ -717,7 +927,8 @@ function disconnect(uci, instance) {
 		uci.commit('network');
 	}
 	run([ 'ifdown', iface ]);
-	restore_wan_default();
+	if (at_risk)
+		restore_wan_default_async();
 	record_event(instance, 'disabled');
 	return { ok: true, interface: iface };
 }
@@ -793,6 +1004,7 @@ function delete_instance(uci, name) {
 	if (!iface)
 		return { error: 'invalid interface name' };
 
+	let at_risk = wan_default_at_risk(uci);
 	// Remove stamped artifacts by enforcing the all-off state.
 	s.auto_routing = false;
 	s.killswitch = false;
@@ -830,17 +1042,19 @@ function delete_instance(uci, name) {
 			uci.delete('nordvpn', 'main', k);
 		}
 		uci.commit('nordvpn');
-		restore_wan_default();
+		if (at_risk)
+			restore_wan_default_async();
 		_history.clear_events(name);
 		return { ok: true, reset: name, interface: iface };
 	}
 
 	uci.delete('nordvpn', name);
 	uci.commit('nordvpn');
-	restore_wan_default();
+	if (at_risk)
+		restore_wan_default_async();
 	_history.clear_events(name);
 	return { ok: true, deleted: name, interface: iface };
 }
 
-return { set_credentials, clear_credentials, current_peer, restore_peer, write_relay, bring_up, verify_handshake, netifd_hint, tunnel_hint, connect_one, APPLY_SOURCES, apply_source, apply_event, apply, apply_routing, disconnect, create_instance, delete_instance, restore_wan_default,
+return { set_credentials, clear_credentials, current_key, current_peer, restore_peer, write_relay, bring_up, verify_handshake, netifd_hint, tunnel_hint, connect_one, tunnel_fingerprint, wan_default_at_risk, prefer_current, keep_running, parse_nft_elements, nft_set_elements, commit_routing, APPLY_SOURCES, apply_source, apply_event, apply, apply_routing, disconnect, create_instance, delete_instance, restore_wan_default, restore_wan_default_async,
 	write_apply_status, read_apply_status, apply_running, apply_status_report, run_job, run_apply, start_job, start_apply };

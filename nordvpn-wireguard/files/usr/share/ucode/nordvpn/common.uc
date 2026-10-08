@@ -515,12 +515,15 @@ function load_settings(uci, instance) {
 	let iface = validate_interface(g('interface', DEFAULT_INTERFACE)) || DEFAULT_INTERFACE;
 	// Invalid names fall back to the main table (see validate_routing_table).
 	let routing_table = validate_routing_table(g('routing_table', '')) || '';
-	// "Route all LAN traffic" with exceptions runs on the steered machinery,
-	// which needs a routing table: without a configured one, use the
-	// interface's name. Never written to the config, so removing the
-	// exceptions restores plain automatic routing through the main table.
-	if (routing_table == '' && g('auto_routing', '0') == '1' &&
-	    (length(bypass_devices) > 0 || length(bypass_domains) > 0 || length(bypass_ips) > 0))
+	// "Route all LAN traffic" always runs on the steered machinery, which
+	// needs a routing table: without a configured one, use the interface's
+	// name (never written to the config). In the main table the tunnel's
+	// 0.0.0.0/0 would replace the WAN's default route for the whole router:
+	// networks outside the LAN zone (a guest network) would be sent into a
+	// tunnel they have no forwarding to and lose internet access, and a dead
+	// tunnel would take everyone offline. With the table only the LAN zone's
+	// networks are routed into it.
+	if (routing_table == '' && g('auto_routing', '0') == '1')
 		routing_table = iface;
 
 	return {
@@ -736,6 +739,16 @@ function release_lock(token) {
 		unlink(token);
 }
 
+// Per-instance lock held by everything that rewrites an instance's peer and
+// restarts its tunnel: a rotation (scheduled, watchdog or manual) and a full
+// apply. Two of them at once would interleave peer writes and `ifup`s, and
+// a rotation could even bring back a tunnel an apply just replaced. 'main'
+// keeps the historical rotation lock name so an upgrade sees a held lock.
+function tunnel_lock_path(instance) {
+	let n = validate_instance(instance) || 'main';
+	return (n == 'main') ? '/tmp/nordvpn_rotate.lock' : '/tmp/nordvpn_rotate_' + n + '.lock';
+}
+
 // Single-quote a value for safe inclusion in a /bin/sh command line.
 function sh_quote(s) {
 	return "'" + replace('' + s, /'/g, "'\\''") + "'";
@@ -782,6 +795,6 @@ return {
 	validate_country_code, validate_location_code, validate_instance, validate_routing_table, validate_dir,
 	validate_mac, validate_domain, validate_cidr4, clean_label, validate_ipv4,
 	managed_interface, load_settings, list_instances, globals_section, cache_file_path, iso_ts, redact, log,
-	atomic_write, self_pid, lock_stale, acquire_lock, release_lock, rotation_max_runtime,
+	atomic_write, self_pid, lock_stale, acquire_lock, release_lock, tunnel_lock_path, rotation_max_runtime,
 	sh_quote, open_cmd, run
 };

@@ -130,6 +130,8 @@ jobs:
           for f in \
             nordvpn-wireguard/files/usr/share/rpcd/ucode/nordvpn.uc \
             nordvpn-wireguard/files/usr/bin/nordvpn-cache-update \
+            nordvpn-wireguard/files/usr/bin/nordvpn-cache-query \
+            nordvpn-wireguard/files/usr/bin/nordvpn-apply \
             nordvpn-wireguard/files/usr/bin/nordvpn-rotate; do
             echo "ucode -c $f"
             "$UC" -L "$MOCKS/*.uc" -L "$LIB/*.uc" -L "$B/*.so" -c "$f"
@@ -160,7 +162,8 @@ jobs:
           # the ephemeral workspace on GitHub-hosted runners.
           if [ -d /sdkcache ] && [ -w /sdkcache ]; then ROOT=/sdkcache; else ROOT="$GITHUB_WORKSPACE/.sdk"; mkdir -p "$ROOT"; fi
           BASE=https://downloads.openwrt.org/snapshots/targets/x86/64
-          SDK=$(curl -sSL "$BASE/sha256sums" | grep -o 'openwrt-sdk-[^ ]*x86-64[^ ]*\.tar\.zst' | head -1)
+          SUMS=$(curl -fsSL --http1.1 --retry 5 --retry-all-errors "$BASE/sha256sums")
+          SDK=$(printf '%s\n' "$SUMS" | grep -o 'openwrt-sdk-[^ ]*x86-64[^ ]*\.tar\.zst' | head -1)
           SDKDIR="$ROOT/${SDK%.tar.zst}"
           echo "SDK=$SDK" >> "$GITHUB_ENV"
           echo "SDKDIR=$SDKDIR" >> "$GITHUB_ENV"
@@ -168,9 +171,48 @@ jobs:
             echo "Reusing warm SDK: $SDKDIR"
           else
             echo "Fetching SDK: $SDK"
-            curl -fSL -o "$ROOT/sdk.tar.zst" "$BASE/$SDK"
-            tar -I zstd -xf "$ROOT/sdk.tar.zst" -C "$ROOT"
-            rm -f "$ROOT/sdk.tar.zst"
+            # The mirror cuts long transfers off mid-way (curl error 92 on
+            # HTTP/2, 18 on HTTP/1.1) every minute or two, at ~100 KB/s on a
+            # bad day, so a 284 MB download restarted from zero never gets
+            # through: resume over HTTP/1.1 for as long as attempts make
+            # progress (within a deadline), until the file matches the
+            # published checksum. A transfer that goes silent is cut after a
+            # minute instead of hanging until the job's timeout. The partial
+            # file is named after the SDK, so a leftover from an older
+            # snapshot (warm runner) is never resumed, and one of this
+            # snapshot is kept on failure for the next run to resume.
+            PART="$ROOT/$SDK.part"
+            find "$ROOT" -maxdepth 1 -name 'openwrt-sdk-*.part' ! -name "$SDK.part" -delete
+            SUM=$(printf '%s\n' "$SUMS" | grep -F "$SDK" | awk '{ print $1 }' | head -1 || true)
+            deadline=$(( $(date +%s) + 100 * 60 ))
+            ok=0; i=0; idle=0
+            while :; do
+              i=$((i + 1))
+              before=$(stat -c %s "$PART" 2>/dev/null || echo 0)
+              rc=0
+              curl -fsSL --http1.1 --connect-timeout 30 --speed-limit 1024 --speed-time 60 \
+                -C - -o "$PART" "$BASE/$SDK" || rc=$?
+              if [ -n "$SUM" ]; then
+                if printf '%s  %s\n' "$SUM" "$PART" | sha256sum -c --status -; then ok=1; break; fi
+                # Complete by curl's account yet wrong: the partial file it
+                # resumed was bad. Start over from the first byte.
+                if [ "$rc" = 0 ]; then : > "$PART"; fi
+              elif [ "$rc" = 0 ]; then
+                ok=1; break
+              fi
+              after=$(stat -c %s "$PART" 2>/dev/null || echo 0)
+              if [ "$after" -gt "$before" ]; then idle=0; else idle=$((idle + 1)); fi
+              echo "SDK download attempt $i: $after bytes so far (curl exit $rc)"
+              if [ "$idle" -ge 5 ] || [ "$(date +%s)" -ge "$deadline" ]; then break; fi
+              sleep 15
+            done
+            if [ "$ok" != 1 ]; then
+              echo "::error::could not download $SDK ($i attempts)"
+              exit 1
+            fi
+            echo "SDK downloaded in $i attempt(s)"
+            tar -I zstd -xf "$PART" -C "$ROOT"
+            rm -f "$PART"
           fi
 
       # GitHub-hosted runners have no warm disk, so the SDK state lives in

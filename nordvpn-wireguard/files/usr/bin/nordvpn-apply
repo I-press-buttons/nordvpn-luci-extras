@@ -12,6 +12,14 @@ const _common = require('nordvpn.common');
 const log = _common.log,
       validate_instance = _common.validate_instance;
 
+// `--restore-wan` only re-checks the WAN's default route (see
+// nordvpn.apply.restore_wan_default); rpcd hands that to this worker so a
+// routing-only apply does not hold up every other ubus call while it waits.
+if (length(ARGV) > 0 && ARGV[0] == '--restore-wan') {
+	_apply.restore_wan_default();
+	exit(0);
+}
+
 // Optional arguments: the instance to apply (default 'main') and what started
 // the apply, for the event history (default 'external', i.e. not the UI).
 let instance = (length(ARGV) > 0 ? validate_instance(ARGV[0]) : null) || 'main';

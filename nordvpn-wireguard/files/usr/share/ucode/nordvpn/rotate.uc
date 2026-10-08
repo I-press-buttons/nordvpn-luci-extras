@@ -23,15 +23,16 @@ const selection_candidates = _select.selection_candidates,
       order_candidates = _select.order_candidates;
 const _apply = require('nordvpn.apply');
 const bring_up = _apply.bring_up,
+      current_key = _apply.current_key,
       current_peer = _apply.current_peer,
       restore_peer = _apply.restore_peer,
       connect_one = _apply.connect_one,
       verify_handshake = _apply.verify_handshake,
       tunnel_hint = _apply.tunnel_hint,
+      wan_default_at_risk = _apply.wan_default_at_risk,
       restore_wan_default = _apply.restore_wan_default;
 const record_event = require('nordvpn.history').record_event;
 
-const ROTATE_LOCK = '/tmp/nordvpn_rotate.lock';
 const ROTATE_STATE = '/tmp/nordvpn_rotate_state.json';
 const ROTATE_STATE_LOCK = '/tmp/nordvpn_rotate_state.lock';
 
@@ -42,11 +43,6 @@ const validate_instance = _common.validate_instance;
 function state_path(instance) {
 	let n = validate_instance(instance) || 'main';
 	return (n == 'main') ? ROTATE_STATE : '/tmp/nordvpn_rotate_state_' + n + '.json';
-}
-
-function lock_path(instance) {
-	let n = validate_instance(instance) || 'main';
-	return (n == 'main') ? ROTATE_LOCK : '/tmp/nordvpn_rotate_' + n + '.lock';
 }
 
 function state_lock_path(instance) {
@@ -65,14 +61,6 @@ function shuffle(list) {
 		let t = a[i]; a[i] = a[j]; a[j] = t;
 	}
 	return a;
-}
-
-// Exclusion key for the currently connected server. The stamped nordvpn_gateway
-// is the intended key; fall back to endpoint_host so a peer written without the
-// stamp (hand-made, or a restored null-gateway snapshot) still cannot be
-// re-selected and reported as a rotation. Pure/testable.
-function current_key(saved) {
-	return saved ? (saved.gateway || saved.endpoint_host || null) : null;
 }
 
 // Ordered candidate list: matching relays, current gateway excluded, ordered
@@ -96,7 +84,9 @@ function read_state(instance) {
 	if (!f)
 		return null;
 	try {
-		return json(f);
+		let st = json(f);
+		// The daemon reads fields off this on every tick.
+		return (type(st) == 'object') ? st : null;
 	} catch (e) {
 		return null;
 	}
@@ -149,14 +139,25 @@ function mark_attempt(ts, instance) {
 	record({ last_attempt: ts }, instance);
 }
 
+// Is the instance still enabled? Read afresh: a disable (nordvpn.apply's
+// disconnect()) does not wait for a rotation in progress, and a rotation that
+// went on would bring the tunnel it just took down back up.
+function still_enabled(instance) {
+	return cursor().get('nordvpn', validate_instance(instance) || 'main', 'enabled') == '1';
+}
+
 function rotate_inner(uci, instance) {
 	let s = load_settings(uci, instance);
 	if (s.fixed_server && s.fixed_server != '')
 		return { skipped: true, reason: 'fixed server configured' };
+	if (!s.enabled)
+		return { skipped: true, reason: 'instance is disabled' };
 
 	let iface = s.interface;
 	if (!_common.managed_interface(uci, iface))
 		return { error: 'interface ' + iface + ' is not managed by nordvpn' };
+	if (!_common.validate_wg_key(uci.get('network', iface, 'private_key')))
+		return { skipped: true, reason: 'no credentials configured' };
 	let cache = read_cache(cache_file_path(s));
 	if (!cache)
 		return { error: 'server list not available; refresh the cache first' };
@@ -176,7 +177,11 @@ function rotate_inner(uci, instance) {
 		// where the exclusion key was unknown (unstamped peer).
 		if (current_gw && relay.hostname == current_gw)
 			continue;
-		if (!connect_one(uci, iface, relay, s))
+		if (!still_enabled(instance))
+			return { skipped: true, reason: 'instance was disabled' };
+		// Only the server changes: a routing table or MTU saved but not yet
+		// applied waits for the apply that also sets up its routing.
+		if (!connect_one(uci, iface, relay, s, { keep_iface: true }))
 			continue;
 		// Verify the tunnel by its WireGuard handshake, not by a ping routed
 		// through it: NordVPN publishes dead endpoints, and a routed ping can
@@ -191,6 +196,8 @@ function rotate_inner(uci, instance) {
 	// Every different candidate failed to handshake — keep a working tunnel by
 	// rolling back to the last working peer.
 	let hint = tunnel_hint(iface);
+	if (!still_enabled(instance))
+		return { skipped: true, reason: 'instance was disabled' };
 	if (saved) {
 		restore_peer(uci, iface, saved);
 		uci.commit('network');
@@ -214,17 +221,22 @@ function rotation_event(res, reason) {
 		detail: res.restored ? 'restored the previous server' : null } };
 }
 
-// Public entry point: serialize with any other rotation of the same instance
-// via a per-instance lock. `reason` only labels the history entry. The lock
-// ages out after the longest this instance's rotation can take, so a slow but
-// healthy one (many candidates, a long verify_timeout) is never run over.
+// Public entry point: serialize with any other rotation, and with a full
+// apply, of the same instance via the per-instance tunnel lock. `reason` only
+// labels the history entry. The lock ages out after the longest this
+// instance's rotation can take, so a slow but healthy one (many candidates, a
+// long verify_timeout) is never run over. The WAN default route is only
+// re-checked when a tunnel can route through the main table (see
+// nordvpn.apply.wan_default_at_risk); otherwise the check is six seconds of
+// sleeping for nothing.
 function rotate(uci, instance, reason) {
 	uci = uci || cursor();
-	let lock = acquire_lock(lock_path(instance),
+	let lock = acquire_lock(_common.tunnel_lock_path(instance),
 		_common.rotation_max_runtime(load_settings(uci, instance)));
 	if (!lock)
 		return { skipped: true, reason: 'rotation already running' };
 
+	let at_risk = wan_default_at_risk(uci);
 	let res;
 	try {
 		res = rotate_inner(uci, instance);
@@ -232,7 +244,8 @@ function rotate(uci, instance, reason) {
 		res = { error: 'rotation error: ' + e };
 	}
 	release_lock(lock);
-	restore_wan_default();
+	if (at_risk)
+		restore_wan_default();
 	let ev = rotation_event(res, reason || 'manual');
 	if (ev)
 		record_event(instance, ev.type, ev.fields);

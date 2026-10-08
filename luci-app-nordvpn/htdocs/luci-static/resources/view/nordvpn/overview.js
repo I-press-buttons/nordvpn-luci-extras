@@ -96,17 +96,21 @@ var APPLY_TIMEOUT_MS = 240000;
 // watcher has to take that poller off the queue and put it back.
 var STATUS_POLL_S = 5;
 // Instance options a running tunnel can take without a reconnect: what is
-// routed (devices, networks, domains, exceptions, kill switch, IPv6, DNS) is
-// plain firewall/rule config, and rotation, watchdog and the internet check
-// are read by the daemon on its next tick. A save that changes only these
-// adds or removes a device without dropping everyone else's connections. Any
-// other change (server, location, hop mode, table, MTU, …) reconnects.
+// routed (devices, networks, domains, exceptions, kill switch, IPv6, DNS, the
+// routing table) is plain firewall/rule config that the backend moves the
+// tunnel onto in place, and rotation, watchdog, server order, the internet
+// check and the cache location are read by the daemon or the next rotation.
+// A save that changes only these adds or removes a device without dropping
+// anyone's connections. The rest (server, location, hop mode, MTU,
+// credentials, interface) goes through a full apply, which still keeps the
+// connected server when it matches the new selection.
 var NO_RECONNECT_OPTS = [
 	'source_device', 'bypass_device', 'source_network', 'steer_domain', 'bypass_domain',
-	'steer_ip', 'bypass_ip',
+	'steer_ip', 'bypass_ip', 'routing_table',
 	'auto_routing', 'killswitch', 'block_ipv6', 'vpn_masq', 'vpn_dns', 'use_vpn_dns', 'custom_dns',
-	'rotation_enabled', 'rotation_mode', 'rotation_interval', 'rotation_time',
-	'watchdog', 'egress_probe', 'probe_target', 'verify_timeout', 'max_retries'
+	'rotation_enabled', 'rotation_mode', 'rotation_interval', 'rotation_time', 'selection',
+	'watchdog', 'egress_probe', 'probe_target', 'verify_timeout', 'max_retries',
+	'cache_dir', 'main.cache_dir', 'cache_refresh_interval'
 ];
 // Values equivalent to an unset option, for comparing the form with the config.
 var OPTION_DEFAULTS = { hop_mode: 'single', selection: 'balanced' };
@@ -1329,7 +1333,7 @@ return view.extend({
 			body.appendChild(this.row(_('Traffic routing'), [
 				E('label', { class: 'nv-check' }, [ this.autoRouting, _('Route all LAN traffic through the VPN') ]),
 				routeNote || ''
-			], _('Creates a firewall zone and a default route via the tunnel; disabling removes exactly what was created.')));
+			], _('Routes every network of the LAN zone through the tunnel, using the tunnel\'s own routing table; other networks (a guest network) and the router itself keep the normal connection. Disabling removes exactly what was created.')));
 			this.steerRow = this.row(_('Steered networks'), [ this.steerWrap ],
 				_('Or route only these networks through this instance — policy rules send their traffic into its routing table.'));
 			if (nets.length)
@@ -1354,7 +1358,7 @@ return view.extend({
 				E('label', { class: 'nv-check' }, [ this.masqBox, _('Hide LAN addresses behind the tunnel address (NAT)') ])
 			], _('Leave this on unless the VPN provider can route replies back to your LAN. Turning it off usually breaks internet access through NordVPN.'));
 			this.dnsRow = this.row(_('DNS'), [ this.dnsSel, this.dnsCustom ],
-				_('Which resolver to use while connected. Custom takes up to 4 IPv4 addresses separated by spaces, for example Quad9 or your own Pi-hole; they are reached through the tunnel. Threat Protection blocks ads and malware at the DNS level; both NordVPN options only work through the tunnel. With "Route all LAN traffic", the router then forwards every lookup only to NordVPN (so none leak to your provider\'s resolver), and lookups fail while the tunnel is down.'));
+				_('Which resolver to use while connected. Custom takes up to 4 IPv4 addresses separated by spaces, for example Quad9 or your own Pi-hole; they are reached through the tunnel. Threat Protection blocks ads and malware at the DNS level; both NordVPN options only work through the tunnel. With "Route all LAN traffic", the router then forwards every lookup only to NordVPN (so none leak to your provider\'s resolver), and lookups fail while the tunnel is down. When steering, only the steered devices and networks use it (their IPv4 DNS is redirected to it); every other client keeps the router\'s normal DNS.'));
 			body.appendChild(this.ksRow);
 			body.appendChild(this.masqRow);
 			body.appendChild(this.v6Row);
@@ -2304,7 +2308,7 @@ return view.extend({
 			this.row(_('Interface name'), [ this.input('interface', 'text', g('interface', 'nordvpn')) ],
 				_('Name of the managed WireGuard interface. ⚠ Changing it after setup recreates the tunnel under the new name and orphans the old interface’s firewall/routing objects.')),
 			this.row(_('Routing table'), [ this.input('routing_table', 'text', g('routing_table', ''), { placeholder: 'main' }) ],
-				_('Custom routing table (empty = the interface name when steering, otherwise the main table).')),
+				_('Custom routing table (empty = the interface name when steering or routing all LAN traffic, otherwise the main table). Changing it does not reconnect the tunnel.')),
 			this.row(_('MTU'), mtuCtl, mtuDesc),
 			this.row(_('Connection wait (seconds)'), [ this.input('verify_timeout', 'number', g('verify_timeout', '8'), { min: 2, max: 30, style: 'width:80px' }) ],
 				_('How long to wait for a WireGuard handshake before giving up on a server')),
@@ -2935,6 +2939,8 @@ return view.extend({
 					this.notice(_('Apply failed: %s').format(res.error), 'error');
 				else if (res && res.routing_only)
 					this.notice(_('Settings applied without reconnecting.'), 'info', 4000);
+				else if (res && res.state === 'success' && res.restarted === false)
+					this.notice(_('Settings applied; still connected to %s without reconnecting.').format(res.gateway || ''), 'info', 4000);
 				else if (res && res.state === 'success')
 					this.notice(_('Connected to %s').format(res.gateway || ''), 'info', 4000);
 				else if (res && res.state === 'partial_failure')

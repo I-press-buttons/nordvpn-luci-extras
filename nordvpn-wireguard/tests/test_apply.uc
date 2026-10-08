@@ -11,7 +11,7 @@
 
 'use strict';
 
-import { readfile, writefile, unlink, stat } from 'fs';
+import { readfile, writefile, unlink, stat, mkdir } from 'fs';
 import { cursor } from 'uci';
 const _common = require('nordvpn.common');
 const _apply = require('nordvpn.apply');
@@ -299,14 +299,46 @@ const DEAD_PID = 1073741824;
 	};
 	refused('a disabled instance needs a full apply',
 		() => global.MOCK_UCI.nordvpn.main.enabled = '0', 'instance is disabled');
-	refused('a changed routing table needs a full apply',
-		() => global.MOCK_UCI.nordvpn.main.routing_table = '101', 'routing table changed');
 	refused('a changed MTU needs a full apply',
 		() => global.MOCK_UCI.nordvpn.main.mtu = '1400', 'MTU changed');
 	refused('a downed interface needs a full apply',
 		() => global.MOCK_UCI.network.nv_media.auto = '0', 'interface is disabled');
 	refused('no peer yet needs a full apply',
 		() => delete global.MOCK_UCI.network.peer0, 'no server applied yet');
+
+	// A new routing table moves the tunnel's routes without a reconnect: the
+	// interface is pointed at it and netifd re-applies only its routes. The
+	// steering rules follow, and the peer is untouched.
+	seed();
+	global.MOCK_UCI.nordvpn.main.routing_table = '101';
+	res = _apply.apply_routing(cursor(), 'main');
+	ok('a changed routing table is applied in place', res.ok == true && res.routing_only == true);
+	eq('the interface moves to the new table',
+		[ global.MOCK_UCI.network.nv_media.ip4table, global.MOCK_UCI.network.nv_media.ip6table ], [ '101', '101' ]);
+	eq('the steering rule follows it', map(count('network', 'steer_lookup'), (r) => r.lookup), [ '101' ]);
+	eq('the peer stays as it is', global.MOCK_UCI.network.peer0.endpoint_host, 'de1.nordvpn.com');
+	eq('the interface is not re-stamped either', global.MOCK_UCI.network.nv_media.nordvpn_last_applied, 'then');
+
+	// "Route all LAN traffic" applied by an older version runs on the main
+	// table; the next save moves it into the implicit table in place.
+	seed();
+	global.MOCK_UCI.nordvpn.main = { '.type': 'instance', interface: 'nv_media', enabled: '1',
+		auto_routing: '1', killswitch: '1' };
+	delete global.MOCK_UCI.network.nv_media.ip4table;
+	delete global.MOCK_UCI.network.nv_media.ip6table;
+	global.MOCK_UCI.network.nv_media.nordvpn_managed_routing = '1';
+	global.MOCK_UCI.network.peer0.route_allowed_ips = '1';
+	global.MOCK_UCI.firewall.oldks = { '.type': 'rule', name: 'NordVPN kill switch', src: 'lan', dest: 'wan',
+		proto: 'all', target: 'REJECT', nordvpn_managed: '1', nordvpn_role: 'killswitch', nordvpn_iface: 'nv_media' };
+	ok('a main-table tunnel puts the WAN default at risk', _apply.wan_default_at_risk(cursor()) == true);
+	res = _apply.apply_routing(cursor(), 'main');
+	ok('all-LAN moves onto its table without a reconnect', res.ok == true && res.routing_only == true);
+	eq('the tunnel lives in the implicit table', global.MOCK_UCI.network.nv_media.ip4table, 'nv_media');
+	eq('the LAN is steered into it', map(count('network', 'steer_lookup'), (r) => [ r['in'], r.lookup ]),
+		[ [ 'lan', 'nv_media' ] ]);
+	eq('the kill switch becomes a prohibit rule', map(count('network', 'steer_ks'), (r) => r['in']), [ 'lan' ]);
+	eq('the LAN-to-WAN REJECT is gone', global.MOCK_UCI.firewall.oldks, null);
+	ok('then the WAN default is no longer at risk', _apply.wan_default_at_risk(cursor()) == false);
 
 	seed();
 	let token = _common.acquire_lock(APPLY_LOCK_FILE, APPLY_MAX_RUNTIME);
@@ -329,6 +361,115 @@ const DEAD_PID = 1073741824;
 	global.MOCK_UCI.network.nv_media.vpn_type = null;
 	global.MOCK_UCI.network.nv_media.proto = 'static';
 	ok('a foreign interface is refused', _apply.apply_routing(cursor(), 'main').error != null);
+}
+
+// 7b. Saving anything but the location keeps the connected server: a full
+//     apply tries it first and, when nothing the tunnel is built from
+//     changed and its handshake is fresh, does not restart it at all. Off
+//     the router `wg` is missing (a handshake reads as fresh, as in
+//     verify_handshake) and `ifup` fails, so a restart shows up as a failed
+//     connect. The tunnel lock keeps applies and rotations apart.
+{
+	let _cache = require('nordvpn.cache');
+	let cdir = '/tmp/nvtest_apply_' + time();
+	mkdir(cdir);
+	_cache.write_cache(_cache.normalize(json(readfile(fixture))), cdir + '/nordvpn_servers_cache.json');
+	let cache = _cache.read_cache(cdir + '/nordvpn_servers_cache.json');
+	let ee = require('nordvpn.select').by_hostname(cache, 'ee70.nordvpn.com');
+	let seed = function(over) {
+		global.MOCK_UCI = { nordvpn: {
+			main: { '.type': 'instance', interface: 'nordvpn', enabled: '1', locations: [ 'ee' ],
+				cache_dir: cdir, verify_timeout: '2', ...(over || {}) }
+		}, network: {
+			nordvpn: { '.type': 'interface', proto: 'wireguard', vpn_type: 'nordvpn', private_key: KEY,
+				auto: '1', addresses: [ _common.FIXED_ADDRESS ], nordvpn_last_applied: 'then' },
+			peer0: { '.type': 'wireguard_nordvpn', interface: 'nordvpn', public_key: ee.public_key,
+				endpoint_host: 'ee70.nordvpn.com', endpoint_port: '51820', persistent_keepalive: '25',
+				allowed_ips: [ '0.0.0.0/0', '::/0' ], nordvpn_gateway: 'ee70.nordvpn.com' }
+		}, firewall: {}, dhcp: {}, nordvpn_credentials: {
+			'default': { '.type': 'credential', private_key: KEY }, _state: { '.type': 'state', migrated: '1' }
+		} };
+	};
+	unlink(APPLY_LOCK_FILE);
+
+	eq('prefer_current: the connected server goes first',
+		map(_apply.prefer_current([ { hostname: 'a' }, { hostname: 'b' }, { hostname: 'c' } ], 'c'), (r) => r.hostname),
+		[ 'c', 'a', 'b' ]);
+	eq('prefer_current: no-op when it is not a candidate',
+		map(_apply.prefer_current([ { hostname: 'a' }, { hostname: 'b' } ], 'z'), (r) => r.hostname), [ 'a', 'b' ]);
+	eq('prefer_current: no-op without a current server',
+		map(_apply.prefer_current([ { hostname: 'a' } ], null), (r) => r.hostname), [ 'a' ]);
+
+	seed();
+	let res = _apply.apply(cursor(), 'main', 'save', 0);
+	eq('save: the connected server is kept without a restart', [ res.state, res.gateway, res.restarted ],
+		[ 'success', 'ee70.nordvpn.com', false ]);
+	eq('save: the peer is untouched', global.MOCK_UCI.network.peer0.endpoint_host, 'ee70.nordvpn.com');
+	ok('save: the stamps are refreshed', global.MOCK_UCI.network.nordvpn.nordvpn_last_applied != 'then');
+	eq('save: recorded as a connect', _history.read_events('main', 1)[0].type, 'connect');
+
+	seed({ locations: [ 'ee', 'us' ] });
+	res = _apply.apply(cursor(), 'main', 'save', 0);
+	eq('save: a wider location set keeps the server too', [ res.state, res.restarted ], [ 'success', false ]);
+
+	seed({ fixed_server: 'ee70.nordvpn.com' });
+	res = _apply.apply(cursor(), 'main', 'save', 0);
+	eq('save: a pinned server already connected is kept', [ res.state, res.restarted ], [ 'success', false ]);
+
+	seed();
+	res = _apply.apply(cursor(), 'main', 'reconnect', 0);
+	ok('reconnect: the tunnel is restarted (fresh pick)', res.restarted !== false && res.state != 'success');
+
+	seed({ mtu: '1400' });
+	res = _apply.apply(cursor(), 'main', 'save', 0);
+	ok('save: an MTU change restarts the tunnel', res.restarted !== false && res.state != 'success');
+	eq('save: ... and writes the MTU', global.MOCK_UCI.network.nordvpn.mtu, '1400');
+
+	seed({ locations: [ 'us' ] });
+	res = _apply.apply(cursor(), 'main', 'save', 0);
+	ok('save: a server outside the new locations is replaced', res.restarted !== false && res.state != 'success');
+
+	// A rotation holding the tunnel lock: the apply does not run alongside it.
+	seed();
+	writefile(_common.tunnel_lock_path('main'), sprintf('%d %d\n', time(), live_pid));
+	res = _apply.apply(cursor(), 'main', 'save', 0);
+	ok('a running rotation blocks the apply', res.state == 'failure' && index(res.error, 'rotation') >= 0);
+	eq('... which leaves the peer alone', global.MOCK_UCI.network.peer0.endpoint_host, 'ee70.nordvpn.com');
+	let _rotate = require('nordvpn.rotate');
+	eq('and an apply (or rotation) holding it blocks a rotation',
+		_rotate.rotate(cursor(), 'main', 'watchdog').reason, 'rotation already running');
+	unlink(_common.tunnel_lock_path('main'));
+	ok('apply releases the tunnel lock', (_apply.apply(cursor(), 'main', 'save', 0).state == 'success') &&
+		stat(_common.tunnel_lock_path('main')) == null);
+
+	// A rotation only changes the server: a table or MTU saved but not
+	// applied yet is left for the apply that also sets up its routing.
+	seed({ routing_table: '200', mtu: '1400' });
+	global.MOCK_UCI.network.nordvpn.ip4table = '100';
+	ok('write_relay keep_iface: written', _apply.write_relay(cursor(), 'nordvpn', ee,
+		_common.load_settings(cursor(), 'main'), { keep_iface: true }));
+	eq('write_relay keep_iface: table and MTU untouched',
+		[ global.MOCK_UCI.network.nordvpn.ip4table, global.MOCK_UCI.network.nordvpn.mtu ], [ '100', null ]);
+	_apply.write_relay(cursor(), 'nordvpn', ee, _common.load_settings(cursor(), 'main'));
+	eq('write_relay: a full apply writes them',
+		[ global.MOCK_UCI.network.nordvpn.ip4table, global.MOCK_UCI.network.nordvpn.mtu ], [ '200', '1400' ]);
+
+	seed({ locations: [ 'ee', 'us' ], routing_table: '200' });
+	global.MOCK_UCI.network.nordvpn.ip4table = '100';
+	_rotate.rotate(cursor(), 'main', 'manual');
+	eq('rotate: the interface keeps its applied table', global.MOCK_UCI.network.nordvpn.ip4table, '100');
+
+	seed({ locations: [ 'ee', 'us' ], enabled: '0' });
+	eq('rotate: a disabled instance is never brought back up',
+		_rotate.rotate(cursor(), 'main', 'manual').reason, 'instance is disabled');
+	seed({ locations: [ 'ee', 'us' ] });
+	delete global.MOCK_UCI.network.nordvpn.private_key;
+	eq('rotate: an instance without credentials is skipped',
+		_rotate.rotate(cursor(), 'main', 'manual').reason, 'no credentials configured');
+
+	_history.clear_events('main');
+	unlink(cdir + '/nordvpn_servers_cache.json');
+	system([ 'rmdir', cdir ]);
 }
 
 // 8. Jobs of other kinds share the machinery. A rotation states its own

@@ -1,0 +1,50 @@
+#!/usr/bin/ucode -S
+// SPDX-License-Identifier: MIT
+// Read-only queries on the server-list cache, for rpcd. Parsing the
+// multi-megabyte cache grows a process's heap by tens of megabytes that it
+// never hands back, and rpcd stays loaded for every LuCI page on the router,
+// so it runs this short-lived helper and only parses the small answer.
+//
+//   nordvpn-cache-query locations <cache file>
+//   nordvpn-cache-query servers <cache file> <request JSON>
+//
+// Prints one JSON document; {"missing":true} when there is no usable cache.
+
+'use strict';
+
+const _cache = require('nordvpn.cache');
+
+let mode = ARGV[0], path = ARGV[1];
+if ((mode != 'locations' && mode != 'servers') || type(path) != 'string' || substr(path, 0, 1) != '/') {
+	warn('usage: nordvpn-cache-query locations|servers <cache file> [request JSON]\n');
+	exit(2);
+}
+
+let cache = _cache.read_cache(path);
+if (!cache) {
+	print('{"missing":true}\n');
+	exit(0);
+}
+
+if (mode == 'locations') {
+	printf('%J\n', {
+		countries: _cache.locations_tree(cache),
+		stats: cache.stats,
+		cache_info: cache.cache_info,
+		cached_at: cache.cached_at,
+		groups: cache.groups,
+		schema_version: cache.schema_version
+	});
+	exit(0);
+}
+
+// The request was validated by rpcd; anything malformed selects nothing.
+let a = null;
+try {
+	a = json(ARGV[2] || '{}');
+} catch (e) {}
+if (type(a) != 'object')
+	a = {};
+printf('%J\n', { relays: (type(a.locations) == 'array' && length(a.locations) > 0)
+	? _cache.pool_relays(cache, a.locations, a.hop_mode, a.server_group)
+	: _cache.city_relays(cache, a.country, a.city, a.hop_mode) });

@@ -145,6 +145,34 @@ function cache_key(path) {
 	return st ? sprintf('%s:%d:%d:%d:%d', path, st.inode, st.size, st.mtime, st.ctime) : null;
 }
 
+// Answer a cache query in a short-lived helper process. A parsed server list
+// costs a process tens of megabytes of heap that it never hands back, and
+// rpcd serves every LuCI page on the router for as long as it runs; on a
+// small router that is what the OOM killer goes for. Off-device (tests) the
+// helper is missing and `fallback` computes the answer in place.
+const CACHE_QUERY = '/usr/bin/nordvpn-cache-query';
+
+function cache_query(argv, fallback) {
+	let r = _common.run([ CACHE_QUERY, ...argv ], true);
+	if (r.code == 127 || r.code == 126 || r.code == -1)
+		return fallback();
+	if (r.code != 0)
+		return null;
+	try {
+		let v = json(r.stdout);
+		return (type(v) == 'object' && !v.missing) ? v : null;
+	} catch (e) {
+		return null;
+	}
+}
+
+// Same as the helper's 'locations' answer (see nordvpn-cache-query).
+function locations_answer(path) {
+	let cache = read_cache(path);
+	return cache ? { countries: locations_tree(cache), stats: cache.stats, cache_info: cache.cache_info,
+		cached_at: cache.cached_at, groups: cache.groups, schema_version: cache.schema_version } : null;
+}
+
 methods.locations = {
 	call: function() {
 		let path = cache_file_path(load_settings(cursor()));
@@ -153,18 +181,10 @@ methods.locations = {
 			return { available: false, state: 'missing' };
 		let m = locations_memo;
 		if (!m || m.key != key) {
-			let cache = read_cache(path);
-			if (!cache)
+			m = cache_query([ 'locations', path ], () => locations_answer(path));
+			if (!m)
 				return { available: false, state: 'missing' };
-			m = {
-				key: key,
-				countries: locations_tree(cache),
-				stats: cache.stats,
-				cache_info: cache.cache_info,
-				cached_at: cache.cached_at,
-				groups: cache.groups,
-				schema_version: cache.schema_version
-			};
+			m.key = key;
 			locations_memo = m;
 		}
 		return {
@@ -179,16 +199,25 @@ methods.locations = {
 	}
 };
 
+// The last few `servers` answers, keyed by the cache file's identity and the
+// request: the page asks again whenever the form is rebuilt, and each answer
+// costs a full parse of the server list (in the helper process).
+let servers_memo = [];
+const SERVERS_MEMO_MAX = 8;
+
 methods.servers = {
 	args: { country: '', city: '', hop_mode: '', locations: [], server_group: '' },
 	call: function(request) {
 		let a = request.args || {};
-		let cache = read_cache(cache_file_path(load_settings(cursor())));
-		if (!cache)
+		let path = cache_file_path(load_settings(cursor()));
+		let ckey = cache_key(path);
+		if (!ckey)
 			return { relays: [] };
 		// A non-empty location set returns the union (with grouping fields for
 		// the UI); entries are validated, garbage is dropped. The legacy
 		// country/city call is unchanged.
+		let str = (v) => (type(v) == 'string') ? v : null;
+		let req;
 		if (type(a.locations) == 'array' && length(a.locations) > 0) {
 			let set = [];
 			for (let e in a.locations) {
@@ -201,9 +230,27 @@ methods.servers = {
 				if (loc && index(loc, '-') > 0)
 					push(set, loc);
 			}
-			return { relays: pool_relays(cache, set, a.hop_mode, a.server_group) };
+			req = { locations: set, hop_mode: str(a.hop_mode), server_group: str(a.server_group) };
+		} else {
+			req = { country: str(a.country), city: str(a.city), hop_mode: str(a.hop_mode) };
 		}
-		return { relays: city_relays(cache, a.country, a.city, a.hop_mode) };
+		let key = ckey + ' ' + sprintf('%J', req);
+		for (let m in servers_memo)
+			if (m.key == key)
+				return { relays: m.relays };
+		let res = cache_query([ 'servers', path, sprintf('%J', req) ], function() {
+			let cache = read_cache(path);
+			if (!cache)
+				return null;
+			return { relays: req.locations ? pool_relays(cache, req.locations, req.hop_mode, req.server_group)
+				: city_relays(cache, req.country, req.city, req.hop_mode) };
+		});
+		if (!res || type(res.relays) != 'array')
+			return { relays: [] };
+		unshift(servers_memo, { key: key, relays: res.relays });
+		if (length(servers_memo) > SERVERS_MEMO_MAX)
+			servers_memo = slice(servers_memo, 0, SERVERS_MEMO_MAX);
+		return { relays: res.relays };
 	}
 };
 
@@ -247,13 +294,13 @@ function insights(extra) {
 
 // Public IP, location and NordVPN's "protected" verdict as seen through the
 // instance's tunnel. Bound to the interface so it reflects the VPN exit even
-// with policy routing. With "Route all LAN traffic" and no routing table the
-// LAN uses the main table, the same one an unbound request from the router
-// takes, so ask again without binding: `lan_path.protected == false` means
-// LAN traffic leaves outside the VPN although the tunnel itself is up. With
-// a table (set, or implied by exceptions) the LAN is steered into it, which
-// the router's own traffic cannot reproduce, as for steered clients.
-// Read-only network probe.
+// with policy routing. With "Route all LAN traffic" still running on the main
+// table (a tunnel applied by an older version, until the next save moves it
+// into its own table) the LAN uses the same table an unbound request from the
+// router takes, so ask again without binding: `lan_path.protected == false`
+// means LAN traffic leaves outside the VPN although the tunnel itself is up.
+// With a table the LAN is steered into it, which the router's own traffic
+// cannot reproduce, as for steered clients. Read-only network probe.
 methods.external_ip = {
 	args: { instance: '' },
 	call: function(request) {
@@ -266,7 +313,8 @@ methods.external_ip = {
 		if (!res)
 			return { error: 'could not determine the external IP' };
 		res.interface = s.interface;
-		if (s.enabled && s.routing_table == '' && detect_routing(uci, s, false).mode == 'auto') {
+		if (s.enabled && (uci.get('network', s.interface, 'ip4table') || '') == '' &&
+		    detect_routing(uci, s, false).mode == 'auto') {
 			let lan = insights([]);
 			res.lan_path = lan ? { protected: lan.protected, ip: lan.ip, isp: lan.isp } : null;
 		}

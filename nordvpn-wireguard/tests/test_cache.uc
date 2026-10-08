@@ -89,4 +89,30 @@ check('fixture cache marks group support', out.groups, true);
 	check('pool ignores p2p for multihop', length(_c.pool_relays(g, [ 'de' ], 'multihop', 'p2p')), 1);
 }
 
+// Malformed entries in the API's list are skipped, not fatal: reading a field
+// of a non-object throws in ucode, which used to abort the whole refresh (and
+// keep the server list stale) over a single bad entry.
+{
+	let good = json(raw)[0];
+	let bad = [
+		null, 42, 'server', [],
+		{ hostname: 'zz1.nordvpn.com', locations: [ null ] },
+		{ hostname: 'zz2.nordvpn.com', locations: [ 'here' ] },
+		{ hostname: 'zz3.nordvpn.com', locations: [ { country: 'ZZ' } ] },
+		{ hostname: 'zz4.nordvpn.com', locations: [ { country: { code: 'zz', name: 'Z', city: 'Zed' } } ],
+			technologies: [ null, 'wireguard_udp', { identifier: 'wireguard_udp', metadata: [ null, 7 ] } ] },
+		good
+	];
+	let n;
+	try {
+		n = normalize(bad);
+	} catch (e) {
+		n = null;
+		printf('FAIL normalize threw: %s\n', e);
+		ok = false;
+	}
+	check('malformed entries are counted but skipped', n ? n.stats.servers_seen : null, length(bad));
+	check('the good entry survives them', n ? n.stats.gateways : null, 1);
+}
+
 exit(ok ? 0 : 1);
