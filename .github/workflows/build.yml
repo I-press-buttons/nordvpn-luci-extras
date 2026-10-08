@@ -162,7 +162,8 @@ jobs:
           # the ephemeral workspace on GitHub-hosted runners.
           if [ -d /sdkcache ] && [ -w /sdkcache ]; then ROOT=/sdkcache; else ROOT="$GITHUB_WORKSPACE/.sdk"; mkdir -p "$ROOT"; fi
           BASE=https://downloads.openwrt.org/snapshots/targets/x86/64
-          SDK=$(curl -sSL "$BASE/sha256sums" | grep -o 'openwrt-sdk-[^ ]*x86-64[^ ]*\.tar\.zst' | head -1)
+          SUMS=$(curl -fsSL --http1.1 --retry 5 --retry-all-errors "$BASE/sha256sums")
+          SDK=$(printf '%s\n' "$SUMS" | grep -o 'openwrt-sdk-[^ ]*x86-64[^ ]*\.tar\.zst' | head -1)
           SDKDIR="$ROOT/${SDK%.tar.zst}"
           echo "SDK=$SDK" >> "$GITHUB_ENV"
           echo "SDKDIR=$SDKDIR" >> "$GITHUB_ENV"
@@ -170,9 +171,36 @@ jobs:
             echo "Reusing warm SDK: $SDKDIR"
           else
             echo "Fetching SDK: $SDK"
-            curl -fSL -o "$ROOT/sdk.tar.zst" "$BASE/$SDK"
-            tar -I zstd -xf "$ROOT/sdk.tar.zst" -C "$ROOT"
-            rm -f "$ROOT/sdk.tar.zst"
+            # The mirror cuts long transfers off mid-way (curl error 92 on
+            # HTTP/2), and a 284 MB download restarted from zero rarely gets
+            # through: resume over HTTP/1.1 until the file matches the
+            # published checksum. The partial file is named after the SDK, so
+            # a leftover from an older snapshot (warm runner) is never resumed.
+            PART="$ROOT/$SDK.part"
+            find "$ROOT" -maxdepth 1 -name 'openwrt-sdk-*.part' ! -name "$SDK.part" -delete
+            SUM=$(printf '%s\n' "$SUMS" | grep -F "$SDK" | awk '{ print $1 }' | head -1 || true)
+            ok=0
+            for i in 1 2 3 4 5 6 7 8 9 10; do
+              rc=0
+              curl -fSL --http1.1 --connect-timeout 30 -C - -o "$PART" "$BASE/$SDK" || rc=$?
+              if [ -n "$SUM" ]; then
+                if printf '%s  %s\n' "$SUM" "$PART" | sha256sum -c --status -; then ok=1; break; fi
+                # Complete by curl's account yet wrong: the partial file it
+                # resumed was bad. Start over from the first byte.
+                if [ "$rc" = 0 ]; then : > "$PART"; fi
+              elif [ "$rc" = 0 ]; then
+                ok=1; break
+              fi
+              echo "SDK download incomplete (attempt $i, curl exit $rc); resuming in 15 s"
+              sleep 15
+            done
+            if [ "$ok" != 1 ]; then
+              rm -f "$PART"
+              echo "::error::could not download $SDK"
+              exit 1
+            fi
+            tar -I zstd -xf "$PART" -C "$ROOT"
+            rm -f "$PART"
           fi
 
       # GitHub-hosted runners have no warm disk, so the SDK state lives in
