@@ -172,17 +172,26 @@ jobs:
           else
             echo "Fetching SDK: $SDK"
             # The mirror cuts long transfers off mid-way (curl error 92 on
-            # HTTP/2), and a 284 MB download restarted from zero rarely gets
-            # through: resume over HTTP/1.1 until the file matches the
-            # published checksum. The partial file is named after the SDK, so
-            # a leftover from an older snapshot (warm runner) is never resumed.
+            # HTTP/2, 18 on HTTP/1.1) every minute or two, at ~100 KB/s on a
+            # bad day, so a 284 MB download restarted from zero never gets
+            # through: resume over HTTP/1.1 for as long as attempts make
+            # progress (within a deadline), until the file matches the
+            # published checksum. A transfer that goes silent is cut after a
+            # minute instead of hanging until the job's timeout. The partial
+            # file is named after the SDK, so a leftover from an older
+            # snapshot (warm runner) is never resumed, and one of this
+            # snapshot is kept on failure for the next run to resume.
             PART="$ROOT/$SDK.part"
             find "$ROOT" -maxdepth 1 -name 'openwrt-sdk-*.part' ! -name "$SDK.part" -delete
             SUM=$(printf '%s\n' "$SUMS" | grep -F "$SDK" | awk '{ print $1 }' | head -1 || true)
-            ok=0
-            for i in 1 2 3 4 5 6 7 8 9 10; do
+            deadline=$(( $(date +%s) + 100 * 60 ))
+            ok=0; i=0; idle=0
+            while :; do
+              i=$((i + 1))
+              before=$(stat -c %s "$PART" 2>/dev/null || echo 0)
               rc=0
-              curl -fSL --http1.1 --connect-timeout 30 -C - -o "$PART" "$BASE/$SDK" || rc=$?
+              curl -fsSL --http1.1 --connect-timeout 30 --speed-limit 1024 --speed-time 60 \
+                -C - -o "$PART" "$BASE/$SDK" || rc=$?
               if [ -n "$SUM" ]; then
                 if printf '%s  %s\n' "$SUM" "$PART" | sha256sum -c --status -; then ok=1; break; fi
                 # Complete by curl's account yet wrong: the partial file it
@@ -191,14 +200,17 @@ jobs:
               elif [ "$rc" = 0 ]; then
                 ok=1; break
               fi
-              echo "SDK download incomplete (attempt $i, curl exit $rc); resuming in 15 s"
+              after=$(stat -c %s "$PART" 2>/dev/null || echo 0)
+              if [ "$after" -gt "$before" ]; then idle=0; else idle=$((idle + 1)); fi
+              echo "SDK download attempt $i: $after bytes so far (curl exit $rc)"
+              if [ "$idle" -ge 5 ] || [ "$(date +%s)" -ge "$deadline" ]; then break; fi
               sleep 15
             done
             if [ "$ok" != 1 ]; then
-              rm -f "$PART"
-              echo "::error::could not download $SDK"
+              echo "::error::could not download $SDK ($i attempts)"
               exit 1
             fi
+            echo "SDK downloaded in $i attempt(s)"
             tar -I zstd -xf "$PART" -C "$ROOT"
             rm -f "$PART"
           fi
