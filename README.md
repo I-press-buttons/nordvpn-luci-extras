@@ -88,17 +88,21 @@ that adds the extra features marked **(fork)** below.
   through the tunnel, uptime, traffic and throughput, and the recent events
   (connects, rotations, recoveries) for each tunnel.
 - **Protection check (fork).** NordVPN itself confirms that it sees the tunnel
-  as protected, with the exit city and ISP. With *Route all LAN traffic* and
-  no routing table, it also checks the path your devices take, and warns if
-  their traffic is leaving through your ISP although the tunnel is up. A DNS line says whether
+  as protected, with the exit city and ISP. For a *Route all LAN traffic*
+  tunnel set up by an older version that still runs on the main table, it
+  also checks the path your devices take, and warns if their traffic is
+  leaving through your ISP although the tunnel is up. A DNS line says whether
   lookups go to NordVPN or to your ISP's resolver.
 - **Status page card (fork).** Every tunnel's state, location, server, uptime
   and traffic also appear on LuCI's main **Status → Overview** page.
 
 ### Choosing what goes through the VPN
 
-- **Whole LAN.** A firewall zone and default route through the tunnel. The
-  WAN default route is never modified.
+- **Whole LAN.** Every network of the LAN firewall zone goes through the
+  tunnel, using the tunnel's own routing table. Networks in other zones (a
+  guest network, for example) and the router itself keep your normal
+  connection, and the WAN default route is never modified, so a dead tunnel
+  never takes anyone else offline.
 - **Steered networks.** Only selected networks (for example a *media* or
   *guest* VLAN) use the tunnel. Local subnets stay reachable.
 
@@ -123,10 +127,12 @@ that adds the extra features marked **(fork)** below.
 - **IP masquerading (fork).** Like GL.iNet's option of the same name, NAT on
   the VPN zone is on by default and can be switched off per tunnel.
 - **NordVPN DNS.** Optionally use NordVPN's resolvers, or Threat Protection,
-  which blocks ads and malware at the DNS level. The router's own lookups to
-  them go through the tunnel in steered mode too. With *Route all LAN
-  traffic*, no lookup falls back to your provider's resolver, and excluded
-  devices keep your provider's DNS. See [Preventing leaks](#preventing-leaks).
+  which blocks ads and malware at the DNS level. With *Route all LAN
+  traffic*, the router's resolver uses them through the tunnel, no lookup
+  falls back to your provider's resolver, and excluded devices keep your
+  provider's DNS. When steering, only the steered devices and networks use
+  them (their DNS is redirected through the tunnel); every other client keeps
+  the router's normal DNS. See [Preventing leaks](#preventing-leaks).
   Or choose **custom DNS servers (fork)**, such as Quad9 or your own Pi-hole; they
   are reached through the tunnel and get the same DNS lock and kill switch.
 - **Leaves your own setup alone.** If you already route traffic by hand, the
@@ -244,10 +250,20 @@ apk del dnsmasq && apk add ./dnsmasq-full-*.apk
 6. Click **Save and apply**.
 
 Changing only what is routed (steered or excluded devices, networks and
-websites, the kill switch, IPv6 blocking, VPN DNS) or the rotation, watchdog
-and internet-check options updates the rules in place without reconnecting,
-so traffic already on the VPN is not interrupted. Server, location, hop mode,
-routing table, MTU and interface changes reconnect the tunnel.
+websites, the kill switch, IPv6 blocking, VPN DNS, the routing table) or the
+rotation, watchdog, server-order and internet-check options updates the rules
+in place without reconnecting, so traffic already on the VPN is not
+interrupted. Addresses already resolved for steered and excluded websites are
+kept across the update, so connections to them keep their path too.
+
+Location, hop mode, server, MTU, credential and interface changes go through
+a full apply. It keeps the server the tunnel is on whenever that server still
+matches the new selection: if nothing the tunnel itself is built from
+changed (adding a country to the locations, say), the tunnel is not even
+restarted. Only a server that no longer fits (or **Reconnect**, which picks
+afresh) moves the tunnel to another server. Rotation and the watchdog are
+the other things that change servers; an apply and a rotation of the same
+instance never run at the same time.
 
 The page shows *configured* and *connected* as separate states: it only
 reports *Connected* once a real WireGuard handshake has happened.
@@ -263,18 +279,19 @@ out **while the tunnel is down**. This section covers what the router does
 about each, what it cannot do, and how to check.
 
 The strongest setup is: *Route all LAN traffic* on one instance, **Kill
-switch** and **Block direct IPv6** on, a **NordVPN DNS** option chosen, and
-a **routing table** set for the instance (Advanced settings; it is set
-automatically once you add an exception).
+switch** and **Block direct IPv6** on, and a **NordVPN DNS** option chosen.
+*Route all LAN traffic* always uses a routing table of its own (named after
+the interface unless you set one under Advanced settings).
 
 ### What the router does
 
 | Leak | Protection | How |
 | --- | --- | --- |
-| Traffic while the tunnel is down | **Kill switch** | With a routing table: `prohibit` rules (priority 21000) behind the tunnel's lookup, so LAN traffic is dropped when the tunnel's table is empty. Without one: a firewall REJECT rule from the LAN zone to the WAN zone. Each instance owns its rule; changing another instance never removes it. |
-| IPv6 | **Block direct IPv6** | The same two mechanisms, for IPv6. Keep it on: the tunnel has no IPv6, so without it IPv6-capable sites are reached directly over your provider. |
+| Traffic while the tunnel is down | **Kill switch** | `prohibit` rules (priority 21000) behind the tunnel's lookup, for the routed networks and devices only, so their traffic is dropped when the tunnel's table is empty while everyone else keeps their connection. Each instance owns its rules; changing another instance never removes them. (A tunnel set up by an older version may still have a firewall REJECT rule from the LAN zone to the WAN zone until its next save.) |
+| IPv6 | **Block direct IPv6** | The same mechanism, for IPv6. Keep it on: the tunnel has no IPv6, so without it IPv6-capable sites are reached directly over your provider. |
 | DNS to your provider | **NordVPN DNS** + DNS lock | dnsmasq, the router's resolver, is locked to NordVPN's resolvers (`noresolv` plus its own `server` entries). Without the lock, dnsmasq also knows the WAN's resolvers and keeps probing all of them, so some lookups go there. Only the instance with *Route all LAN traffic* sets the lock. |
-| The router's lookups to NordVPN's resolvers | Policy rules | They are sent into the tunnel's table (priority 19500) and, with the lock on, blocked when the tunnel is down (19501) rather than going out of the WAN. |
+| The router's lookups to NordVPN's resolvers | Policy rules | They are sent into the tunnel's table (priority 19500) and, with the lock on, blocked when the tunnel is down (19501) rather than going out of the WAN. Both rules match only the router's own traffic (`in loopback`), so a device off the VPN that uses the same public resolver itself is neither pulled into the tunnel nor blocked. |
+| Steered devices' and networks' DNS | DNAT | With a NordVPN DNS option on a steered instance, their plain IPv4 DNS (to the router or anywhere else) is redirected to the chosen resolver, and their steering carries it through the tunnel. The router's resolver, which every other client uses, is left alone. |
 | DNS while the tunnel is down | DNS lock | Lookups fail instead of falling back to your provider. The one exception is `nordvpn.com` names, which go to the WAN's resolver, so the router can still find a server to reconnect to. This only shows that you use NordVPN, which your provider can see from the traffic anyway. |
 | Excluded devices using NordVPN's DNS | DHCP option + DNAT | Excluded devices are meant to look like normal traffic, including their DNS. DHCP hands them the WAN's IPv4 resolvers (option 6, one tag per device). A firewall DNAT sends any plain DNS they still send, such as manually set DNS or a lease that has not been renewed yet, to the WAN's resolver. |
 
@@ -299,17 +316,14 @@ Your own dnsmasq `server` entries and `noresolv` setting are kept.
   **iCloud Private Relay** sends Safari traffic through Apple's relays instead
   of the VPN; turn it off on devices that should use NordVPN.
 - **Steered instances.** The DNS lock is only set by the instance that routes
-  all LAN traffic. An instance that steers only some networks, devices or
-  domains cannot lock the router's resolver for everyone, so its devices'
-  lookups can still reach the WAN's resolver.
-- **The main-table variant while the tunnel is down.** Without a routing
-  table, the tunnel's default route and the WAN's live in the same table, so
-  the router's own queries to NordVPN's resolvers cannot be told apart and
-  may go out of the WAN until the tunnel is back. Set a routing table to
-  close this.
+  all LAN traffic. An instance that steers only some networks or devices
+  redirects their IPv4 DNS instead, but a steered device that asks the router
+  over IPv6 still gets the router's normal resolver. Steered websites and
+  addresses use the router's resolver too (it is what fills the website
+  sets).
 - **The router's own traffic.** Package updates, time sync, the NordVPN API
-  and the server-list download leave through the WAN when the instance uses
-  a routing table. That is by design; only your devices' traffic is routed.
+  and the server-list download leave through the WAN. That is by design;
+  only your devices' traffic is routed.
 - **The router's own lookups while the tunnel is down.** The router resolves
   names through dnsmasq too, so with the DNS lock on and a routing table set,
   it can only resolve `nordvpn.com` names until the tunnel is back:
@@ -444,7 +458,7 @@ ubus call nordvpn servers '{"locations":["de","nl-amsterdam"],"hop_mode":"single
 ubus call nordvpn refresh_status    # cache-refresh job progress
 ubus call nordvpn set_credentials '{"token":"<64-hex-token>"}'                        # replace the Default key
 ubus call nordvpn set_credentials '{"token":"<64-hex-token>","name":"Family plan"}'   # add a named entry
-ubus call nordvpn apply             # rebuild the peer and bring the tunnel up
+ubus call nordvpn apply             # apply the settings; keeps the server if it still fits
 ubus call nordvpn apply_routing     # re-apply routing/exceptions without reconnecting
 ubus call nordvpn rotate_now        # one-shot rotation (waits for the result)
 ubus call nordvpn rotate_start      # the same in the background; poll apply_status
@@ -514,7 +528,9 @@ handshake (`wg show latest-handshakes`) before accepting a server.
   `connecting`, `degraded` or `disconnected` for 60 s, the watchdog rotates
   to another verified server. Retries back off from 120 s, doubling up to
   900 s, and the backoff resets once the tunnel reconnects. It never runs
-  while a server is pinned, and it shares a lock with scheduled rotation.
+  while a server is pinned, and it shares a lock with scheduled rotation and
+  with a full apply of the same instance, so they never restart the tunnel
+  at the same time.
 - **Internet check** (`option egress_probe '1'`) pings the probe targets
   through the tunnel device every 30 s. It uses IPv4 literals, so no DNS is
   needed. After 3 failures in a row the state becomes `no_egress`, and the
@@ -533,11 +549,16 @@ On every apply the backend first works out which routing mode applies:
   if IPv6 could leak.
 - **Automatic** (*Route all LAN traffic*). The backend sets
   `route_allowed_ips` on the peer, creates a masquerading zone and a
-  LAN → VPN forwarding, and adds optional REJECT rules for the kill switch
-  and IPv6, plus the DNS override. If the instance has a routing table, the
-  tunnel's default route lives in that table instead of the main one. The
-  backend then steers every network of the LAN zone into it, as described
-  under *Steered*, with the same result. Only one enabled instance can route
+  LAN → VPN forwarding, and adds the DNS override. The tunnel's default route
+  lives in the instance's routing table (the one set under Advanced
+  settings, otherwise one named after the interface that is not written to
+  the config), never in the main table, so it cannot replace the WAN's
+  default route. The backend steers every network of the LAN zone into that
+  table, as described under *Steered*, including its kill switch and IPv6
+  `prohibit` rules. Networks in other zones and the router itself keep the
+  WAN. (Older versions put the default route in the main table, where it
+  also captured networks outside the LAN zone; such a tunnel moves into its
+  table on the next save, without reconnecting.) Only one enabled instance can route
   all LAN traffic: the checkbox is locked on the others, and if the config
   sets it on several anyway, the first one (main first) wins and the rest
   log a note and fall back to their steering. The kill switch and IPv6 rules
@@ -563,12 +584,19 @@ On every apply the backend first works out which routing mode applies:
     - This needs `dnsmasq-full`; without it nothing is created and the page
       warns. It's IPv4 only, at most 64 domains per instance, and only works
       for clients that use the router's DNS (DNS-over-HTTPS bypasses it).
-    - A firewall reload empties the set. The backend restarts dnsmasq after
-      its own changes; otherwise the set refills as clients look the names up
-      again.
+    - A firewall reload empties the set. After its own changes the backend
+      puts the addresses back (unless a domain was removed from the list)
+      and reloads dnsmasq, which only restarts it when its config changed;
+      after anyone else's reload the set refills as clients look the names
+      up again.
 
-  - **NordVPN DNS:** `to <resolver>/32 lookup <table>` at priority 19500, so
-    the router's own lookups to NordVPN's resolvers use the tunnel too.
+  - **NordVPN DNS:** an fw4 DNAT per steered device (by MAC) and per local
+    subnet of each steered network sends their port-53 traffic to the
+    resolver; excluded devices are left out. The router's own resolver is
+    not changed, so other clients keep their normal DNS. With *Route all LAN
+    traffic* the router's resolver uses NordVPN instead, and
+    `iif lo to <resolver>/32 lookup <table>` at priority 19500 sends the
+    router's own lookups through the tunnel.
 
   Prohibit rules (priority 21000) act as the kill switch and IPv6 block.
   They only fire when the tunnel's table can't serve the traffic. Every local
@@ -578,10 +606,9 @@ On every apply the backend first works out which routing mode applies:
   table's id, `0xfe000000`, as their mark. One `mark … lookup main` rule per
   family at priority 18000 comes before every steering and prohibit rule,
   so excluded traffic skips the tunnel and the kill switch and keeps its
-  IPv6. With *Route all LAN traffic*, exceptions need the LAN-zone steering
-  described under *Automatic*, because the REJECT kill switch would block
-  excluded devices too. If no table is set, the backend uses one named after
-  the interface, which isn't written to the config.
+  IPv6. With *Route all LAN traffic* they rely on its LAN-zone steering
+  described under *Automatic*: its kill switch is a set of `prohibit` rules
+  that the exception rule comes before.
 
 Everything the app creates is tagged `nordvpn_managed`. Turning a toggle off
 removes exactly those objects. User zones, forwardings, routes, rules and
@@ -647,6 +674,10 @@ installing them needs `--allow-untrusted`. Only install packages you built
 yourself or downloaded from this repository over HTTPS.
 
 ## Upgrading
+
+*Route all LAN traffic* now always runs on the tunnel's own routing table.
+A tunnel set up by an older version keeps working as before until the next
+**Save and apply**, which moves it onto its table without reconnecting.
 
 Upgrading from the legacy Lua `luci-app-nordvpn` runs a one-time migration.
 It copies your settings, keeps the existing key and tunnel, and removes any

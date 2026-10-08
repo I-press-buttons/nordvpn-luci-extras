@@ -71,6 +71,45 @@ eq('locations memo answers the same', m.locations.call(), loc);
 	write_cache(cache, cdir + '/nordvpn_servers_cache.json');
 	eq('locations follow it back', length(m.locations.call().countries), 3);
 }
+// servers answers are memoized per cache file and request, and follow a
+// rewritten cache like the tree does.
+eq('servers memo answers the same', m.servers.call({ args: { locations: [ 'ee', 'us' ], hop_mode: 'single' } }), srv_union);
+{
+	let fewer = normalize(filter(json(readfile(fixture)), function(sv) {
+		return sv.locations && sv.locations[0] && sv.locations[0].country &&
+			sv.locations[0].country.code == 'EE';
+	}));
+	write_cache(fewer, cdir + '/nordvpn_servers_cache.json');
+	eq('servers follow a rewritten cache',
+		length(m.servers.call({ args: { locations: [ 'ee', 'us' ], hop_mode: 'single' } }).relays), 1);
+	write_cache(cache, cdir + '/nordvpn_servers_cache.json');
+}
+
+// On the router rpcd asks the nordvpn-cache-query helper, so the parsed list
+// never lands in rpcd's own heap. The helper answers exactly what the
+// in-place fallback above did.
+{
+	let helper = replace(RPCD, /\/share\/rpcd\/ucode\/nordvpn\.uc$/, '/bin/nordvpn-cache-query');
+	let libdir = replace(RPCD, /\/rpcd\/ucode\/nordvpn\.uc$/, '/ucode');
+	let mocks = replace(fixture, /\/fixtures\/[^/]+$/, '/mocks');
+	let argv = [ getenv('UCODE') || 'ucode', '-L', mocks + '/*.uc', '-L', libdir + '/*.uc' ];
+	if (getenv('UCODE_EXTRA_L'))
+		push(argv, '-L', getenv('UCODE_EXTRA_L'));
+	push(argv, '-S', helper);
+	let q = function(args) {
+		let r = _common.run([ ...argv, ...args ]);
+		return (r.code == 0) ? json(r.stdout) : { exit: r.code };
+	};
+	let hl = q([ 'locations', cdir + '/nordvpn_servers_cache.json' ]);
+	eq('cache helper: the same location tree', hl.countries, loc.countries);
+	eq('cache helper: the same union', q([ 'servers', cdir + '/nordvpn_servers_cache.json',
+		sprintf('%J', { locations: [ 'ee', 'us' ], hop_mode: 'single' }) ]).relays, srv_union.relays);
+	eq('cache helper: the same city list', q([ 'servers', cdir + '/nordvpn_servers_cache.json',
+		sprintf('%J', { country: 'ee', city: 'ee-tallinn', hop_mode: 'single' }) ]).relays, srv_legacy.relays);
+	eq('cache helper: no cache reads as missing', q([ 'locations', cdir + '/none.json' ]), { missing: true });
+	eq('cache helper: a bad request selects nothing', q([ 'servers', cdir + '/nordvpn_servers_cache.json', '[1' ]).relays, []);
+	eq('cache helper: refuses a relative path', q([ 'locations', 'x.json' ]).exit, 2);
+}
 eq('rotate_start rejects unknown instance', m.rotate_start.call({ args: { instance: 'nope' } }).error, 'no such instance');
 
 // refresh_status idle when no job file
@@ -219,18 +258,21 @@ ok('clear_credentials removes the key', global.MOCK_UCI.network.nordvpn.private_
 		{ protected: false, ip: '203.0.113.9', isp: 'Home ISP' });
 	eq('external_ip: only NordVPN is asked', uniq(urls), [ _common.IP_INSIGHTS_URL ]);
 
-	// With a table the LAN is steered into it; the router's own request would
-	// take the WAN and raise a false alarm, so no LAN-path probe.
+	// With the tunnel in a table the LAN is steered into it; the router's own
+	// request would take the WAN and raise a false alarm, so no LAN-path
+	// probe. The live interface decides: a tunnel applied by an older version
+	// runs on the main table (above) until the next save moves it.
 	urls = [];
+	global.MOCK_UCI.network.nordvpn.ip4table = 'nordvpn';
+	r = m.external_ip.call({});
+	ok('external_ip: all-LAN on its table skips the LAN-path probe', r.lan_path == null && length(urls) == 1);
+	urls = [];
+	global.MOCK_UCI.network.nordvpn.ip4table = '100';
 	global.MOCK_UCI.nordvpn.main.routing_table = '100';
 	r = m.external_ip.call({});
-	ok('external_ip: all-LAN with a table skips the LAN-path probe', r.lan_path == null && length(urls) == 1);
-	urls = [];
+	ok('external_ip: ... also on a table that was set by hand', r.lan_path == null && length(urls) == 1);
+	delete global.MOCK_UCI.network.nordvpn.ip4table;
 	delete global.MOCK_UCI.nordvpn.main.routing_table;
-	global.MOCK_UCI.nordvpn.main.bypass_device = 'aa:bb:cc:dd:ee:01';
-	r = m.external_ip.call({});
-	ok('external_ip: ... also with the implicit table of exceptions', r.lan_path == null && length(urls) == 1);
-	delete global.MOCK_UCI.nordvpn.main.bypass_device;
 
 	urls = [];
 	global.MOCK_UCI.nordvpn.main.auto_routing = '0';

@@ -1052,10 +1052,14 @@ write_cache(cache, cpath);
 		length(count('firewall', 'device_mark')) == 0 && length(count('network', 'dev_lookup')) == 0);
 }
 
-// 8d. NordVPN DNS through the tunnel: in steered mode the tunnel's routes live
-//     in the instance table, so the router's own queries to the NordVPN
-//     resolvers get stamped `dest` rules into that table.
+// 8d. NordVPN DNS. The router's resolver serves every client, so only the
+//     instance routing all LAN traffic points it at the VPN's resolvers (with
+//     policy rules that send the router's own queries into the table). A
+//     steered instance leaves it alone and DNATs the DNS of its steered
+//     devices and networks instead, so clients that are not on the VPN keep
+//     their normal DNS.
 {
+	let D1 = 'aa:bb:cc:dd:ee:01', D2 = 'aa:bb:cc:dd:ee:02';
 	let count = function(conf, role) {
 		let n = [];
 		for (let k in global.MOCK_UCI[conf])
@@ -1073,45 +1077,92 @@ write_cache(cache, cpath);
 	};
 	global.MOCK_UCI = { nordvpn: { main: { '.type': 'instance', interface: 'nordvpn', enabled: '1' } },
 		network: {
+			loopback: { '.type': 'interface', device: 'lo', proto: 'static', ipaddr: '127.0.0.1', netmask: '255.0.0.0' },
 			nordvpn: { '.type': 'interface', proto: 'wireguard', private_key: KEY, vpn_type: 'nordvpn' },
-			lan: { '.type': 'interface', proto: 'static', ipaddr: '192.168.1.1/24' } },
+			lan: { '.type': 'interface', proto: 'static', ipaddr: '192.168.1.1/24' },
+			guest: { '.type': 'interface', proto: 'static', ipaddr: '192.168.3.1/24' } },
 		firewall: {
 			zlan: { '.type': 'zone', name: 'lan', network: [ 'lan' ] },
-			zwan: { '.type': 'zone', name: 'wan', masq: '1', network: [ 'wan' ] } } };
+			zguest: { '.type': 'zone', name: 'guest', network: [ 'guest' ] },
+			zwan: { '.type': 'zone', name: 'wan', masq: '1', network: [ 'wan' ] } },
+		dhcp: { dm: { '.type': 'dnsmasq' } } };
 	let uci = cursor();
-	let shape = (l) => map(l, (r) => [ r.dest, r.lookup, r.priority ]);
+	let shape = (l) => map(l, (r) => [ r['in'], r.dest, r.lookup, r.priority ]);
+	let redirs = () => map(count('firewall', 'steer_dns_redirect'), (r) =>
+		[ r.src, r.src_ip, r.src_mac, r.dest_ip, r.dest_port, r.target ]);
 
+	// Steered networks: the router's resolver is untouched; the network's own
+	// clients are redirected to the VPN resolver.
 	enforce_routing(uci, sd({}));
-	eq('dns: a rule per standard resolver, into the table', shape(count('network', 'dns_lookup')),
-		[ [ '103.86.96.100/32', '100', '19500' ], [ '103.86.99.100/32', '100', '19500' ] ]);
-	eq('dns: the interface carries the resolvers', global.MOCK_UCI.network.nordvpn.dns,
-		[ '103.86.96.100', '103.86.99.100' ]);
-	eq('dns: the rules are stamped, not user rules', _routing.count_user_routes(uci, 'nordvpn', ''), 0);
+	eq('dns: steering leaves the router\'s resolver alone', global.MOCK_UCI.network.nordvpn.dns, null);
+	eq('dns: steering needs no router lookup rules', length(count('network', 'dns_lookup')), 0);
+	eq('dns: steering does not lock dnsmasq', global.MOCK_UCI.dhcp.dm.noresolv, null);
+	eq('dns: the steered network\'s DNS is redirected', redirs(),
+		[ [ 'lan', '192.168.1.0/24', null, '103.86.96.100', '53', 'DNAT' ] ]);
+	ok('dns: nothing redirects the guest network', index(sprintf('%J', redirs()), 'guest') < 0 &&
+		index(sprintf('%J', redirs()), '192.168.3') < 0);
 	eq('dns: still steered, not manual', detect_routing(uci, sd({}), false).mode, 'steered');
-	ok('dns: idempotent', !enforce_routing(uci, sd({})).changed_network);
+	ok('dns: idempotent', !enforce_routing(uci, sd({})).changed_firewall);
 
 	enforce_routing(uci, sd({ vpn_dns: 'threat' }));
-	eq('dns: Threat Protection swaps the resolvers', shape(count('network', 'dns_lookup')),
-		[ [ '103.86.96.96/32', '100', '19500' ], [ '103.86.99.99/32', '100', '19500' ] ]);
+	eq('dns: Threat Protection swaps the redirect target', map(redirs(), (r) => r[3]), [ '103.86.96.96' ]);
 
-	enforce_routing(uci, sd({ vpn_dns: 'threat', routing_table: '101' }));
-	eq('dns: a table change re-points the rules', map(count('network', 'dns_lookup'), (r) => r.lookup),
-		[ '101', '101' ]);
+	// Steered devices; excluded devices on a steered network keep the router.
+	enforce_routing(uci, sd({ source_networks: [], source_devices: [ D2 ] }));
+	eq('dns: a steered device\'s DNS is redirected', redirs(),
+		[ [ 'lan', null, D2, '103.86.96.100', '53', 'DNAT' ] ]);
+	enforce_routing(uci, sd({ bypass_devices: [ D1 ] }));
+	eq('dns: an excluded device is left out of its network\'s redirect', map(redirs(), (r) => r[2]),
+		[ [ '!' + D1 ] ]);
+	eq('dns: and needs no DNS of its own (the router\'s is the normal one)',
+		length(count('dhcp', 'bypass_dhcp_dns')) + length(count('firewall', 'bypass_dns_redirect')), 0);
 
 	enforce_routing(uci, sd({ vpn_dns: 'off' }));
-	eq('dns: off removes the rules', length(count('network', 'dns_lookup')), 0);
+	eq('dns: off removes the redirects', length(redirs()), 0);
 
+	// A pre-upgrade steered instance that wrote the resolvers onto the
+	// interface and router lookup rules without `in`: both are cleaned up.
+	global.MOCK_UCI.network.nordvpn.dns = [ '103.86.96.100', '103.86.99.100' ];
+	global.MOCK_UCI.network.nordvpn.nordvpn_managed_dns = 'standard';
+	global.MOCK_UCI.network.olddns = { '.type': 'rule', dest: '103.86.96.100/32', lookup: '100', priority: '19500',
+		nordvpn_managed: '1', nordvpn_role: 'dns_lookup', nordvpn_iface: 'nordvpn', nordvpn_key: '103.86.96.100/32 100' };
 	enforce_routing(uci, sd({}));
+	eq('dns: upgrade drops the router-wide resolvers', global.MOCK_UCI.network.nordvpn.dns, null);
+	eq('dns: upgrade drops the old lookup rule', length(count('network', 'dns_lookup')), 0);
+
+	// All-LAN: the router's resolver goes to NordVPN, and only the router's
+	// own queries (in loopback) are steered into the table and blocked when
+	// the tunnel is down; a client off the VPN using the same resolver is not.
+	enforce_routing(uci, sd({ auto_routing: true, source_networks: [] }));
+	eq('dns: all-LAN gives the interface the resolvers', global.MOCK_UCI.network.nordvpn.dns,
+		[ '103.86.96.100', '103.86.99.100' ]);
+	eq('dns: all-LAN steers only the router\'s own queries', shape(count('network', 'dns_lookup')),
+		[ [ 'loopback', '103.86.96.100/32', '100', '19500' ], [ 'loopback', '103.86.99.100/32', '100', '19500' ] ]);
+	eq('dns: the rules are stamped, not user rules', _routing.count_user_routes(uci, 'nordvpn', ''), 0);
+	eq('dns: all-LAN redirects nothing (the router\'s resolver is the VPN\'s)', length(redirs()), 0);
+	enforce_routing(uci, sd({ auto_routing: true, source_networks: [], routing_table: '101' }));
+	eq('dns: a table change re-points the rules', map(count('network', 'dns_lookup'), (r) => r.lookup),
+		[ '101', '101' ]);
+	let r = enforce_routing(uci, sd({ auto_routing: true, source_networks: [], custom_dns: [ '9.9.9.9' ],
+		vpn_dns: 'custom' }), { wan_dns: [ '192.0.2.53' ] });
+	eq('dns: the lock\'s kill switch is the router\'s too', map(count('network', 'dns_ks'), (x) => [ x['in'], x.dest ]),
+		[ [ 'loopback', '9.9.9.9/32' ] ]);
+	ok('dns: locked', r.dns_locked);
+	// A rule from before the `in` restriction is corrected in place.
+	for (let k, v in global.MOCK_UCI.network)
+		if (v.nordvpn_role == 'dns_ks')
+			delete v['in'];
+	ok('dns: an old rule without `in` is a change', enforce_routing(uci, sd({ auto_routing: true, source_networks: [],
+		custom_dns: [ '9.9.9.9' ], vpn_dns: 'custom' }), { wan_dns: [ '192.0.2.53' ] }).changed_network);
+	eq('dns: ... and gets it', map(count('network', 'dns_ks'), (x) => x['in']), [ 'loopback' ]);
 	enforce_routing(uci, sd({ auto_routing: true, source_networks: [], routing_table: '' }));
 	eq('dns: automatic mode needs none (the main table carries the tunnel)',
 		length(count('network', 'dns_lookup')), 0);
-	enforce_routing(uci, sd({ auto_routing: true, source_networks: [] }));
-	eq('dns: all-LAN with a table keeps them (the tunnel lives in the table)',
-		length(count('network', 'dns_lookup')), 2);
 
 	enforce_routing(uci, sd({}));
 	enforce_routing(uci, sd({ enabled: false }));
-	eq('dns: a disabled instance releases them', length(count('network', 'dns_lookup')), 0);
+	eq('dns: a disabled instance releases them', length(count('network', 'dns_lookup')) + length(redirs()), 0);
+	eq('dns: ... and the lock', global.MOCK_UCI.dhcp.dm.noresolv, null);
 }
 
 // 8e. Exceptions: excluded devices and domains always take the main table,
@@ -1151,7 +1202,7 @@ write_cache(cache, cpath);
 	global.MOCK_UCI.nordvpn.main.auto_routing = '1';
 	delete global.MOCK_UCI.nordvpn.main.bypass_device;
 	delete global.MOCK_UCI.nordvpn.main.bypass_domain;
-	eq('exceptions: removing them drops the implicit table', load_settings(cursor()).routing_table, '');
+	eq('all-LAN keeps the implicit table without exceptions too', load_settings(cursor()).routing_table, 'nordvpn');
 
 	let count = function(conf, role) {
 		let n = [];
@@ -1467,11 +1518,24 @@ write_cache(cache, cpath);
 
 	res = enforce_routing(uci, msteer({}), yes);
 	ok('domain steering is idempotent', !res.changed_network && !res.changed_firewall && !res.changed_dhcp);
+	eq('an unchanged domain list keeps its set across a reload', res.keep_sets, [ 'nv_nordvpn_rs_dom' ]);
+	res = enforce_routing(uci, msteer({ source_domains: [ 'example.com', 'b.org', 'c.net' ] }), yes);
+	eq('an added domain keeps it too', res.keep_sets, [ 'nv_nordvpn_rs_dom' ]);
 
 	res = enforce_routing(uci, msteer({ source_domains: [ 'b.org' ] }), yes);
 	dd = count('dhcp', 'domain_dns');
 	ok('editing domains rewrites the one section', res.changed_dhcp && !res.changed_firewall &&
 		length(dd) == 1 && sprintf('%J', dd[0].domain) == sprintf('%J', [ 'b.org' ]));
+	eq('a removed domain lets its set refill instead', res.keep_sets, []);
+
+	// The set elements read back from `nft list set` (plain output).
+	let _ap = require('nordvpn.apply');
+	eq('nft: elements parsed', _ap.parse_nft_elements('table inet fw4 {\n\tset nv_x_dom {\n\t\ttype ipv4_addr\n' +
+		'\t\telements = { 93.184.216.34, 203.0.113.7,\n\t\t\t     198.51.100.1 }\n\t}\n}\n'),
+		[ '93.184.216.34', '203.0.113.7', '198.51.100.1' ]);
+	eq('nft: an empty set has none', _ap.parse_nft_elements('table inet fw4 {\n\tset nv_x_dom {\n\t\ttype ipv4_addr\n\t}\n}\n'), []);
+	eq('nft: junk is ignored', _ap.parse_nft_elements('elements = { 1.2.3.4, 999.1.1.1, x; rm }'), [ '1.2.3.4' ]);
+	eq('nft: nothing read off-device', _ap.nft_set_elements([ 'nv_nordvpn_rs_dom' ]), {});
 
 	res = enforce_routing(uci, msteer({ source_devices: [ 'aa:bb:cc:dd:ee:01' ] }), yes);
 	ok('devices and domains share one lookup rule', length(count('network', 'dev_lookup')) == 1 &&
@@ -1717,7 +1781,11 @@ write_cache(cache, cpath);
 				push(out, v.nordvpn_iface || '-');
 		return out;
 	};
-	let S = function(n) { return load_settings(cursor(), n); };
+	// These pin the main-table variant of "Route all LAN traffic" (REJECT
+	// rules), which enforce() still falls back to when the LAN networks are
+	// unknown and which tunnels applied by older versions run on until their
+	// next save: its rules must keep their owner until then.
+	let S = function(n) { let x = load_settings(cursor(), n); x.routing_table = ''; return x; };
 
 	// Main routes all LAN with a kill switch; media only tunnels.
 	global.MOCK_UCI = mkmulti(true, false);
@@ -1763,6 +1831,55 @@ write_cache(cache, cpath);
 	global.MOCK_UCI.firewall.oldks = { '.type': 'rule', nordvpn_managed: '1', nordvpn_role: 'killswitch', src: 'lan', dest: 'wan', target: 'REJECT' };
 	enforce_routing(cursor(), S('media'));
 	eq('legacy: dropped once no instance routes all LAN', rules('killswitch'), []);
+}
+
+// "Route all LAN traffic" from load_settings() always runs on the policy
+// table: only the LAN zone's networks are routed into the tunnel. A network
+// in another zone (a guest network) and the router itself keep the WAN, so a
+// guest is never sent into a tunnel its zone has no forwarding to, and a dead
+// tunnel cannot take the whole router offline.
+{
+	global.MOCK_UCI = {
+		nordvpn: { main: { '.type': 'instance', interface: 'nordvpn', enabled: '1', auto_routing: '1',
+			killswitch: '1', block_ipv6: '1' } },
+		network: {
+			lan: { '.type': 'interface', proto: 'static', ipaddr: '192.168.1.1/24' },
+			guest: { '.type': 'interface', proto: 'static', ipaddr: '192.168.3.1/24' },
+			nordvpn: { '.type': 'interface', proto: 'wireguard', private_key: KEY, vpn_type: 'nordvpn' },
+			p1: { '.type': 'wireguard_nordvpn', interface: 'nordvpn', endpoint_host: 'x.nordvpn.com' }
+		},
+		firewall: {
+			zlan: { '.type': 'zone', name: 'lan', network: [ 'lan' ] },
+			zguest: { '.type': 'zone', name: 'guest', network: [ 'guest' ] },
+			zwan: { '.type': 'zone', name: 'wan', masq: '1', network: [ 'wan' ] },
+			fguest: { '.type': 'forwarding', src: 'guest', dest: 'wan' }
+		}
+	};
+	let s = load_settings(cursor());
+	eq('isolation: all-LAN gets its own table', s.routing_table, 'nordvpn');
+	eq('isolation: still reported as all-LAN', detect_routing(cursor(), s, false).mode, 'auto');
+	enforce_routing(cursor(), s);
+	let roles = function(conf, role) {
+		let out = [];
+		for (let k, v in global.MOCK_UCI[conf])
+			if (v.nordvpn_role == role)
+				push(out, v);
+		return out;
+	};
+	eq('isolation: only the LAN is looked up in the table',
+		map(roles('network', 'steer_lookup'), (r) => [ r['in'], r.lookup ]), [ [ 'lan', 'nordvpn' ] ]);
+	eq('isolation: the kill switch covers the LAN only', map(roles('network', 'steer_ks'), (r) => r['in']), [ 'lan' ]);
+	eq('isolation: so does the IPv6 block', map(roles('network', 'steer_v6'), (r) => r['in']), [ 'lan' ]);
+	eq('isolation: no LAN-to-WAN REJECT rule', length(roles('firewall', 'killswitch')) +
+		length(roles('firewall', 'ipv6block')), 0);
+	eq('isolation: only the LAN zone forwards into the VPN', map(roles('firewall', 'forwarding'), (f) => f.src), [ 'lan' ]);
+	eq('isolation: the guest forwarding is untouched', global.MOCK_UCI.firewall.fguest,
+		{ '.type': 'forwarding', src: 'guest', dest: 'wan' });
+	ok('isolation: nothing mentions the guest network',
+		index(sprintf('%J', [ roles('network', 'steer_lookup'), roles('network', 'steer_ks'),
+			roles('network', 'steer_v6') ]), 'guest') < 0);
+	ok('isolation: the guest subnet stays local to steered clients',
+		length(filter(roles('network', 'steer_local'), (r) => r.target == '192.168.3.0/24')) == 1);
 }
 
 // MARK rules must land in fw4's mangle_prerouting: fw4 only puts a MARK rule

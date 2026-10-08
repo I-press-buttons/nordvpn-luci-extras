@@ -72,6 +72,8 @@ let last_cache = null;
 let cache_path = null;
 let refresh_fails = 0;
 let refreshing = 0;
+// Start of the child reading the cache's age to seed that clock (0 = none).
+let seeding = 0;
 // Instances with a probe child in flight, by start epoch: a slow probe (every
 // target timing out) must not pile up a second one behind it.
 let probing = {};
@@ -124,12 +126,39 @@ function refresh_step(uci, now) {
 	// it every 30 s cost a small router seconds of CPU and tens of MB each
 	// time. Seeding from the file's own write time is also what keeps a
 	// restart (procd restarts the daemon on every config save) from
-	// refetching a list that is still fresh.
+	// refetching a list that is still fresh. Even once, the parse would grow
+	// this long-lived process's heap by tens of MB for good, so a child reads
+	// the file and hands back only its age; the step runs again with it.
 	if (last_cache == null || path != cache_path) {
-		let c = read_cache(path);
-		last_cache = refresh_seed(c ? c.cached_at : null, is_stale(c, now), now);
-		cache_path = path;
-		refresh_fails = 0;
+		if (in_flight(seeding, now, PROBE_STUCK))
+			return;
+		seeding = now;
+		uloop.task(
+			function() {
+				try {
+					let c = read_cache(path);
+					return { cached_at: c ? c.cached_at : null, stale: is_stale(c, time()) };
+				} catch (e) {
+					return null;
+				}
+			},
+			function(res) {
+				seeding = 0;
+				// No answer: the next tick tries again.
+				if (type(res) != 'object')
+					return;
+				let t = time();
+				last_cache = refresh_seed(res.cached_at, res.stale, t);
+				cache_path = path;
+				refresh_fails = 0;
+				try {
+					refresh_step(cursor(), t);
+				} catch (e) {
+					log('scheduler: server list refresh: ' + errmsg(e));
+				}
+			}
+		);
+		return;
 	} else {
 		// Between seeds, follow the file with a stat: a refresh from the UI
 		// (written by rename, so its mtime is its write time) restarts the

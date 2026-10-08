@@ -192,11 +192,11 @@ function extract_public_key(server) {
 	if (type(techs) != 'array')
 		return null;
 	for (let tech in techs) {
-		if (tech.identifier == 'wireguard_udp') {
+		if (type(tech) == 'object' && tech.identifier == 'wireguard_udp') {
 			let md = tech.metadata;
 			if (type(md) == 'array')
 				for (let meta in md)
-					if (meta.name == 'public_key')
+					if (type(meta) == 'object' && meta.name == 'public_key')
 						return meta.value;
 			return null;
 		}
@@ -204,16 +204,21 @@ function extract_public_key(server) {
 	return null;
 }
 
-// Add one raw API server object to the accumulator.
+// Add one raw API server object to the accumulator. The list is external
+// data, and ucode throws on reading a field of anything but an object, so a
+// single malformed entry would otherwise abort the whole refresh: such
+// entries are skipped.
 function add_server(acc, server) {
 	acc.stats.servers_seen++;
 
+	if (type(server) != 'object')
+		return;
 	let locs = server.locations;
-	if (type(locs) != 'array' || length(locs) == 0)
+	if (type(locs) != 'array' || length(locs) == 0 || type(locs[0]) != 'object')
 		return;
 	let loc = locs[0];
 	let cinfo = loc.country;
-	if (!cinfo)
+	if (type(cinfo) != 'object')
 		return;
 
 	// Everything below ends up in /etc/config/network (endpoint, key) or in
@@ -222,7 +227,7 @@ function add_server(acc, server) {
 	if (!country_code)
 		return;
 	let country_name = clean_label(cinfo.name, uc(country_code));
-	let city_name = clean_label(cinfo.city ? cinfo.city.name : null, 'Unknown');
+	let city_name = clean_label((type(cinfo.city) == 'object') ? cinfo.city.name : null, 'Unknown');
 	let location_code = country_code + '-' + replace(lc(city_name), /[^a-z0-9]/g, '');
 
 	let public_key = validate_wg_key(extract_public_key(server));
